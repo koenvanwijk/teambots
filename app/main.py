@@ -31,3 +31,10 @@ app.mount("/static", StaticFiles(directory=STATIC), name="static")
 @app.get("/")
 def index():
     return FileResponse(os.path.join(STATIC, "index.html"))
+
+
+@app.get("/sw.js")
+def service_worker():
+    """Served from the root so the service worker may control the whole app (installable PWA)."""
+    return FileResponse(os.path.join(STATIC, "sw.js"), media_type="text/javascript",
+                        headers={"Cache-Control": "no-cache"})

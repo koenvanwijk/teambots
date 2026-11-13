@@ -103,7 +103,8 @@ input[type=checkbox] { width:16px; height:16px; accent-color:var(--btn); flex:no
 #stage { flex:1; min-height:0; display:flex; flex-direction:column; }
 #view { flex:1; overflow-y:auto; min-height:0; scroll-behavior:auto; }
 #col { max-width:780px; margin:0 auto; padding:8px 20px 28px; }
-#dock { flex:none; padding:0 20px 18px; position:relative; }
+#dock { flex:none; padding:0 20px max(18px, env(safe-area-inset-bottom)); position:relative; }
+#main { padding-top:env(safe-area-inset-top); }
 #dock > * { max-width:780px; margin-left:auto; margin-right:auto; }
 #stage.hero { justify-content:center; padding-bottom:9vh; }
 #stage.hero #view { flex:none; overflow:visible; }

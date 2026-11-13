@@ -40,7 +40,15 @@ function icon(name, size = 18) {
 }
 const ib = (name, title, onclick, size) => $('button', { className: 'ib', type: 'button', title, ariaLabel: title, onclick }, icon(name, size));
 const avatar = (name, cls = '') => $('span', { className: 'av ' + cls, textContent: (name || '?').trim().charAt(0) || '?' });
-const logo = () => $('span', { className: 'logo' }, icon('bot', 18));
+/** The TeamBots mark (same shapes as icon.svg), drawn in the colours of the place it sits in. */
+function logo() {
+  const ns = 'http://www.w3.org/2000/svg', mk = (tag, attrs) => { const n = document.createElementNS(ns, tag); for (const [k, v] of Object.entries(attrs)) n.setAttribute(k, v); return n; };
+  const s = mk('svg', { viewBox: '86 94 340 324', width: 22, height: 22, 'aria-hidden': 'true' });
+  s.append(mk('rect', { x: 196, y: 120, width: 204, height: 168, rx: 48, fill: 'none', stroke: 'currentColor', 'stroke-opacity': '.45', 'stroke-width': 26 }),
+    mk('rect', { x: 98, y: 164, width: 280, height: 208, rx: 62, fill: 'var(--btn)' }), mk('path', { d: 'M141 330v66a8 8 0 0 0 13 6l62-46z', fill: 'currentColor' }),
+    mk('rect', { x: 112, y: 178, width: 252, height: 180, rx: 48, fill: 'currentColor' }), mk('circle', { cx: 196, cy: 268, r: 21, fill: 'var(--btn)' }), mk('circle', { cx: 280, cy: 268, r: 21, fill: 'var(--btn)' }));
+  return $('span', { className: 'logo' }, s);
+}
 const ts = s => new Date(/[zZ]$|[+-]\d\d:\d\d$/.test(s) ? s : s + 'Z');
 const clock = d => d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
 const dayName = d => { const t = new Date(), y = new Date(Date.now() - 864e5); return d.toDateString() === t.toDateString() ? 'Today' : d.toDateString() === y.toDateString() ? 'Yesterday' : d.toLocaleDateString([], { weekday: 'long', day: 'numeric', month: 'long' }); };
@@ -221,6 +229,7 @@ function userMenu(anchor) {
   popmenu(anchor, [{ head: 'Signed in as ' + S.me.username }, { head: 'Theme' },
     ...['system', 'dark', 'light'].map(v => ({ icon: 'sun', label: v[0].toUpperCase() + v.slice(1), checked: cur === v, onclick: set(v) })),
     { sep: true }, { icon: 'term', label: 'Show what bots do in detail', hint: S.details ? 'on' : 'off', checked: S.details, onclick: () => { S.details = !S.details; store.set('tb_details', S.details ? '1' : null); for (const d of document.querySelectorAll('#col details[data-user]')) delete d.dataset.user; if (S.conv) renderConv(); } },
+    S.install && { icon: 'down', label: 'Install TeamBots as an app', onclick: async () => { const ev = S.install; S.install = null; ev.prompt(); await ev.userChoice.catch(() => null); } },
     { sep: true }, { icon: 'out', label: 'Sign out', onclick: signOut }]);
 }
 // ---------- renaming
@@ -852,5 +861,10 @@ document.addEventListener('keydown', e => {
   else if (e.key === 'Escape' && !document.querySelector('dialog[open]')) { if (S.pop) closePop(); else if (el('drawer') && el('drawer').classList.contains('open')) closeDrawer(); }
 });
 matchMedia('(max-width: 860px)').addEventListener('change', () => { if (el('app')) { el('app').classList.remove('sideopen'); renderTop(); } });
+
+// Installable app: the browser offers it once the service worker is in place (needs https or localhost).
+addEventListener('beforeinstallprompt', e => { e.preventDefault(); S.install = e; });
+addEventListener('appinstalled', () => { S.install = null; toast('TeamBots is installed'); });
+if ('serviceWorker' in navigator) addEventListener('load', () => navigator.serviceWorker.register('/sw.js').catch(() => {}));
 
 boot().catch(e => { document.body.replaceChildren($('div', { id: 'auth' }, $('div', { className: 'authbox' }, $('h1', { textContent: 'TeamBots is not reachable' }), $('p', { textContent: e.message }), $('button', { className: 'btn primary', textContent: 'Try again', onclick: () => location.reload() })))); });

@@ -24,6 +24,7 @@ capabilities that every teammate or client talks to in private.
 | Handoff, MCP | `ask_bot` delegates to another bot; streamable-HTTP MCP servers per bot |
 | While a bot works | You can keep typing. A new message steers the running turn (the bot reads it at its next step), waits in the queue behind it, or interrupts it. "Auto" decides: a short stop word interrupts, otherwise the bot's model classifies the message, and steering is the fallback. A Stop button ends the turn. Only the person the bot works for can steer or interrupt; messages from others queue |
 | Web UI | Dark and light theme. `@` in the message box lists what you can add: bots (in a channel also bots and people you can add on the spot), skills (`@skill:name`), files on the project computer (`@file:path`), people and secrets. What a bot does is folded into one line per turn; commands and file contents open on click, approval cards always show. Search with Ctrl K. Bots, channels, projects and endpoints can be renamed |
+| Install as an app | The web UI is a PWA: on https or localhost the browser offers to install it (also under the user menu), and it opens in its own window with the TeamBots icon. The service worker caches only the app shell, never anything under `/api` |
 
 Not built: Slack / Discord / Microsoft Teams, meeting bots, voice, SSO, token streaming,
 event-triggered routines.
