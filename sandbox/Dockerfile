@@ -4,6 +4,8 @@
 # (set TB_BROWSER=chromium). Chrome runs as the unprivileged user `bot` and needs --no-sandbox
 # in this image (capabilities are dropped). The profile lives on the project volume:
 # /workspace/.screens/bot<id>
+# Official gh (GitHub CLI) is installed from cli.github.com/packages; git is included too.
+# No GitHub credentials are baked in — auth is per project (`gh auth login`).
 # Add the tools your bots need here.
 FROM python:3.12-slim
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -23,6 +25,21 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && command -v google-chrome >/dev/null \
     && command -v x11vnc >/dev/null \
     && command -v websockify >/dev/null
+# Official GitHub CLI from cli.github.com/packages. No credentials are baked in;
+# `gh auth login` is per project. Config lives on the project volume so it survives
+# container recreate (TeamBots secrets never enter the sandbox).
+RUN mkdir -p -m 755 /etc/apt/keyrings /etc/apt/sources.list.d \
+    && curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
+         -o /etc/apt/keyrings/githubcli-archive-keyring.gpg \
+    && chmod go+r /etc/apt/keyrings/githubcli-archive-keyring.gpg \
+    && echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
+         > /etc/apt/sources.list.d/github-cli.list \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends gh \
+    && rm -rf /var/lib/apt/lists/* \
+    && command -v gh >/dev/null \
+    && command -v git >/dev/null
+ENV GH_CONFIG_DIR=/workspace/.config/gh
 RUN useradd -m -u 1000 bot && mkdir /workspace && chown bot:bot /workspace
 USER bot
 WORKDIR /workspace

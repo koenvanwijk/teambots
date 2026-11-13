@@ -16,7 +16,7 @@ capabilities that every teammate or client talks to in private.
 | Activity feed | Per Team Bot a shared feed: after a task in a private chat the bot posts a summary of at most three sentences. Only turns that used a tool count; a person can switch it off per chat |
 | Memory | Personal memory per user, shared team memory, learnings from collaborators wait for review |
 | Skills, routines | Saved by owner or manager; cron-scheduled prompts per user and conversation |
-| Computer | One sandbox per project, shared by its people and bots: shell and files |
+| Computer | One sandbox per project, shared by its people and bots: shell and files. The image includes git and the official GitHub CLI (`gh`); no credentials are baked in, so sign in per project with `gh auth login` |
 | Screen | With "computer use" on, a bot has its own virtual screen with a browser, screenshot / click / type / key / scroll tools, and a live view in the UI. "Open scherm" attaches noVNC to that same Xvfb so you can use mouse and keyboard (e.g. to sign in to Chromium). Needs a model with image input |
 | Secrets | Never in the sandbox or the model's context. The bot writes `{{secret:NAME}}` in an `http_request`; the app fills it in outside the sandbox, only for the hosts the secret is bound to, never follows redirects, and masks secret values in everything returned to the model |
 | Approvals | Risky tools pause for an approval card (Allow once / Always allow / Deny); only the requester can answer |
@@ -80,7 +80,7 @@ safe: it encrypts the stored API keys and secrets, and losing it makes them unre
 2. Add an endpoint and click it to run the connection test. "tool calling: true" is required.
 3. Create a bot. For a Team Bot: write instructions, add secrets / MCP servers / skills, then
    tick Published under Sharing.
-4. Chat. Create a channel and all project bots join it automatically and reply to every message; remove a bot or set it to mention-only if you do not want that. On a bot with computer use, **Open scherm** opens the interactive screen (sign in to Chromium there; the profile is kept in the project's Docker volume).
+4. Chat. Create a channel and all project bots join it automatically and reply to every message; remove a bot or set it to mention-only if you do not want that. On a bot with computer use, **Open scherm** opens the interactive screen (sign in to Chromium there; the profile is kept in the project's Docker volume). To use `gh` in the sandbox, run `gh auth login` there (config is stored on the project volume); TeamBots secrets never enter the sandbox, so a `GH_TOKEN` secret cannot be used as an environment variable inside it.
 
 ## Configuration
 
