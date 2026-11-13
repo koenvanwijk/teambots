@@ -18,7 +18,7 @@ capabilities that every teammate or client talks to in private.
 | Skills, routines | Saved by owner or manager; cron-scheduled prompts per user and conversation |
 | Computer | One sandbox per project, shared by its people and bots: shell and files. The image includes git and the official GitHub CLI (`gh`); no credentials are baked in, so sign in per project with `gh auth login` |
 | Screen | With "computer use" on, a bot has its own virtual screen with a browser, screenshot / click / type / key / scroll tools, and a live view in the UI. "Open scherm" attaches noVNC to that same Xvfb so you can use mouse and keyboard (e.g. to sign in to Chromium). Needs a model with image input |
-| Secrets | Never in the sandbox or the model's context. The bot writes `{{secret:NAME}}` in an `http_request`; the app fills it in outside the sandbox, only for the hosts the secret is bound to, never follows redirects, and masks secret values in everything returned to the model |
+| Secrets | Never in the sandbox or the model's context. The bot writes `{{secret:NAME}}` in an `http_request`; the app fills it in outside the sandbox, only for the hosts the secret is bound to, never follows redirects, and masks secret values in everything returned to the model. A message that seems to contain a credential (a known token format, `password is ...`, or the value of a stored secret) is held back before it is stored: the person saves it as a secret and sends the placeholder, edits the message, or sends it anyway |
 | Approvals | Risky tools pause for an approval card (Allow once / Always allow / Deny); only the requester can answer |
 | Channels | Several people and bots; every project bot is added when a channel or a bot is created and replies to every message by default (or only on `@handle` if set to mention-only). Removing a bot sticks. No personal memory in channels |
 | Handoff, MCP | `ask_bot` delegates to another bot; streamable-HTTP MCP servers per bot |
@@ -28,7 +28,7 @@ capabilities that every teammate or client talks to in private.
 Not built: Slack / Discord / Microsoft Teams, meeting bots, voice, SSO, token streaming,
 event-triggered routines.
 
-What has and has not been tested: `pytest -q` runs 18 end-to-end tests against a scripted model,
+What has and has not been tested: `pytest -q` runs 19 end-to-end tests against a scripted model,
 including the screen tools with a real Xvfb and Chromium on the local backend. Not tested: the
 Docker sandbox backend, a real model, and anything on Windows or Hetzner.
 

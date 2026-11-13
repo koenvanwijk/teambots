@@ -54,7 +54,7 @@ async function api(method, path, body) {
   const r = await fetch('/api' + path, { method, headers: { 'Content-Type': 'application/json', ...(S.token ? { Authorization: 'Bearer ' + S.token } : {}) }, body: body ? JSON.stringify(body) : undefined });
   const data = await r.json().catch(() => ({}));
   if (r.status === 401 && S.me) { signOut(); throw new Error('Your session ended. Sign in again.'); }
-  if (!r.ok) throw new Error(typeof data.detail === 'string' ? data.detail : r.statusText || 'Request failed');
+  if (!r.ok) throw Object.assign(new Error(typeof data.detail === 'string' ? data.detail : (data.detail && data.detail.message) || r.statusText || 'Request failed'), { detail: data.detail });
   return data;
 }
 const withToken = path => '/api' + path + (path.includes('?') ? '&' : '?') + 'token=' + encodeURIComponent(S.token);
@@ -679,10 +679,16 @@ function renderDock() {
   };
   const mark = () => { if (!menu) return; for (const r of menu.querySelectorAll('.mrow')) { const on = +r.dataset.n === sel; r.classList.toggle('sel', on); r.ariaSelected = on; if (on) r.scrollIntoView({ block: 'nearest' }); } };
   const atButton = () => { ta.focus(); if (menu) return closeMenu(); const p = ta.selectionStart, before = ta.value.slice(0, p), ins = (before && !/\s$/.test(before) ? ' ' : '') + '@'; ta.setRangeText(ins, p, ta.selectionEnd, 'end'); dismissed = -1; sync(); drawMenu(); };
-  const submit = guard(async () => {
+  const submit = guard(async allow => {
     const text = ta.value.trim(); if (!text) return;
     ta.value = ''; closeMenu(); sync(); S.first = true;
-    try { await api('POST', `/conversations/${c.id}/messages`, { content: text, mode }); refresh(); } catch (e) { if (!ta.value) { ta.value = text; sync(); } throw e; }
+    try { await api('POST', `/conversations/${c.id}/messages`, { content: text, mode, allow_secret: allow === true }); refresh(); }
+    catch (e) {
+      if (!ta.value) { ta.value = text; sync(); }
+      if (!e.detail || e.detail.code !== 'secret') throw e;
+      // The server held the message back. Nothing was stored; the person decides what happens with it.
+      secretGuard(e.detail.found, { swap: (value, placeholder) => { ta.value = ta.value.split(value).join(placeholder); sync(); }, send: yes => submit(yes), focus: () => ta.focus() });
+    }
   });
   ta.addEventListener('input', () => { sel = 0; sync(); drawMenu(); });
   ta.addEventListener('scroll', () => { hl.scrollTop = ta.scrollTop; });
@@ -707,6 +713,32 @@ function renderDock() {
   dock.replaceChildren($('button', { id: 'jump', title: 'Jump to the latest message', ariaLabel: 'Jump to the latest message', onclick: () => { el('view').scrollTop = el('view').scrollHeight; } }, icon('down', 16)), box, chips,
     $('div', { className: 'foot', textContent: c.kind === 'dm' ? 'Bots can be wrong. Check what matters before you allow or use it.' : 'Everyone in this channel reads what is said here.' }));
   sync(); S.dockSync(); if (!isNarrow()) ta.focus();
+}
+
+/** A message that seems to hold a credential: keep it out of the chat and give the bot a placeholder instead. */
+function secretGuard(found, { swap, send, focus }) {
+  const c = S.conv, b = S.bot, canSave = c.kind === 'dm' && b && b.role !== 'collaborator';
+  const veil = v => v.startsWith('-----') ? 'key block' : v.length > 12 ? v.slice(0, 4) + '…' + v.slice(-2) : '•'.repeat(6);
+  let open = found.length;
+  const done = (row, name) => { row.querySelector('.act').replaceChildren($('span', { className: 'tag ok', textContent: `{{secret:${name}}}` })); if (--open === 0) { d.close(); send(false); } };
+  const rows = found.map(f => {
+    const row = $('div', { className: 'li' }, $('div', { className: 'tx' }, f.kind[0].toUpperCase() + f.kind.slice(1), $('small', { className: 'mono', textContent: veil(f.value) })), $('span', { className: 'act' }));
+    const act = row.lastChild;
+    if (f.name) act.append($('button', { className: 'btn sm primary', textContent: 'Use placeholder', title: `This is the stored secret ${f.name}`, onclick: () => { swap(f.value, `{{secret:${f.name}}}`); done(row, f.name); } }));
+    else if (canSave) act.append($('button', { className: 'btn sm primary', textContent: 'Save as secret', onclick: guard(async () => {
+      const v = await form({ title: 'Save as secret', intro: 'The value is stored encrypted outside the sandbox. The bot only gets the placeholder; the app fills in the real value when the bot sends a request to one of these hosts.', ok: 'Save secret',
+        fields: [{ name: 'name', label: 'Name', required: true, mono: true, value: f.suggest, hint: 'Capitals, digits and underscores.' }, { name: 'hosts', label: 'Hosts it may be sent to', mono: true, value: f.hosts, placeholder: 'api.example.com', hint: 'Comma-separated. Without a host the secret cannot be used.' }],
+        onSubmit: async x => { x.name = x.name.toUpperCase(); await api('POST', `/bots/${b.id}/secrets`, { ...x, value: f.value }); } });
+      if (!v) return;
+      swap(f.value, `{{secret:${v.name}}}`); await loadCtx(c); done(row, v.name); }) }));
+    else act.append($('span', { className: 'tag warn', textContent: 'remove it' }));
+    return row;
+  });
+  const d = openDialog('', $('div', { className: 'pad' }, $('h2', { textContent: 'This looks like a secret' }),
+    $('p', { className: 'intro', textContent: 'Your message was not sent. A secret in the chat is stored with the conversation and read by the model. ' + (canSave ? 'Save it as a secret instead: the bot gets a placeholder, and the real value is filled in outside the sandbox.' : found.some(f => f.name) ? 'Use the placeholder instead of the value.' : 'Take it out of the message. An owner or manager of the bot can add it under Secrets, and then you use the placeholder.') }),
+    rows, $('div', { className: 'dfoot', style: 'margin-top:16px' }, $('button', { className: 'btn danger', textContent: 'Send anyway', title: 'It is not a secret, or you accept that it ends up in the chat', onclick: () => { d.close(); send(true); } }),
+      $('button', { className: 'btn primary', textContent: 'Edit message', onclick: () => d.close() }))));
+  d.addEventListener('close', focus);
 }
 
 // ---------------------------------------------------------------- bot settings

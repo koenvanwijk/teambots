@@ -35,6 +35,46 @@ def mask(text: str, bot_id: int) -> str:
     return text
 
 
+# What a pasted credential looks like: (kind, suggested secret name, suggested host, pattern).
+# When a pattern has a group, the group is the value; otherwise the whole match is.
+LEAKS = [(kind, name, host, re.compile(rx)) for kind, name, host, rx in [
+    ("private key", "PRIVATE_KEY", "", r"-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?(?:-----END [A-Z ]*PRIVATE KEY-----|\Z)"),
+    ("GitHub token", "GITHUB_TOKEN", "api.github.com", r"\b(?:gh[pousr]_[A-Za-z0-9]{30,}|github_pat_[A-Za-z0-9_]{30,})"),
+    ("GitLab token", "GITLAB_TOKEN", "gitlab.com", r"\bglpat-[A-Za-z0-9_-]{20,}"),
+    ("Slack token", "SLACK_TOKEN", "slack.com", r"\bxox[abeprs]-[A-Za-z0-9-]{10,}"),
+    ("AWS access key", "AWS_ACCESS_KEY_ID", "", r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b"),
+    ("Google API key", "GOOGLE_API_KEY", "googleapis.com", r"\bAIza[0-9A-Za-z_-]{35}"),
+    ("API key", "API_KEY", "", r"\b(?:sk|pk|rk)-[A-Za-z0-9_-]{20,}"),
+    ("JSON web token", "ACCESS_TOKEN", "", r"\beyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}"),
+    ("bearer token", "ACCESS_TOKEN", "", r"(?i)\bbearer\s+([A-Za-z0-9._~+/-]{20,}=*)"),
+    ("password", "PASSWORD", "", r"(?i)\b(?:password|passwd|pwd|wachtwoord)\b\s*(?:is|[:=])\s*[\"']?([^\s\"'{}]{6,})"),
+    ("token", "API_TOKEN", "", r"(?i)\b(?:token|secret|api[_-]?key)\b\s*(?:is|[:=])\s*[\"']?"
+                               r"((?=[^\s\"'{}]*\d)(?=[^\s\"'{}]*[A-Za-z])[^\s\"'{}]{12,})"),
+]]
+
+
+def find_leaks(text: str, bot_ids: list[int]) -> list[dict]:
+    """Credentials a person typed into a message: values of stored secrets of these bots, and
+    strings that look like a token, key or password. A secret in the chat is stored with the
+    conversation and read by the model, which is what this module exists to prevent."""
+    spans: list[tuple[int, int, dict]] = []
+    for bot_id in bot_ids:
+        for name, (value, _) in load(bot_id).items():
+            at = text.find(value) if len(value) >= 6 else -1
+            if at >= 0:
+                spans.append((at, at + len(value), {"kind": "stored secret", "value": value, "name": name}))
+    for kind, name, host, rx in LEAKS:
+        for m in rx.finditer(text):
+            g = 1 if m.groups() else 0
+            spans.append((m.start(g), m.end(g), {"kind": kind, "value": m.group(g), "suggest": name, "hosts": host}))
+    found, end = [], -1
+    for start, stop, item in sorted(spans, key=lambda x: (x[0], -x[1])):
+        if start >= end:  # first and longest wins where two patterns overlap
+            found.append(item)
+            end = stop
+    return found
+
+
 def _host_allowed(host: str, bound: list[str]) -> bool:
     return any(host == b or host.endswith("." + b) for b in bound)
 

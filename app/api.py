@@ -13,7 +13,7 @@ from pydantic import BaseModel
 import httpx
 import websockets
 
-from . import agent, config, events, llm, mcp_client, routines, sandbox, screen
+from . import agent, config, events, llm, mcp_client, routines, sandbox, screen, secrets_http
 from .access import bot_role, can_manage, can_read_conversation, team_role
 from .db import (Approval, AuthToken, Bot, BotAccess, ChannelMember, Conversation, Endpoint, McpServer, Memory,
                  Message, Routine, Secret, Skill, Team, TeamMember, User, select, session)
@@ -1017,6 +1017,7 @@ def list_messages(conv_id: int, after: int = 0, user: User = Depends(current_use
 class MessageIn(BaseModel):
     content: str
     mode: str = "auto"  # what to do when the bot is busy: auto | steer | queue | interrupt
+    allow_secret: bool = False  # the person looked at the warning and sends it anyway
 
 
 @router.post("/conversations/{conv_id}/messages")
@@ -1024,7 +1025,17 @@ async def send_message(conv_id: int, body: MessageIn, user: User = Depends(curre
     _need(body.content.strip(), 400, "empty message")
     _need(body.mode in agent.MODES, 400, "mode: " + " | ".join(agent.MODES))
     with session() as s:
-        _need(_conv(s, conv_id, user).kind != "feed", 400, "the activity feed is written by the bot only")
+        conv = _conv(s, conv_id, user)
+        _need(conv.kind != "feed", 400, "the activity feed is written by the bot only")
+        # Only someone who manages a bot may learn that a typed value equals one of its secrets.
+        bot_ids = [conv.bot_id] if conv.kind == "dm" else [m.bot_id for m in s.exec(select(ChannelMember).where(
+            ChannelMember.conversation_id == conv_id, ChannelMember.bot_id != None)).all()]  # noqa: E711
+        managed = [i for i in bot_ids if (b := s.get(Bot, i)) and can_manage(s, user.id, b)]
+    if not body.allow_secret:
+        found = secrets_http.find_leaks(body.content, managed)
+        if found:  # nothing is stored; the person decides what to do with it
+            raise HTTPException(409, {"code": "secret", "found": found,
+                                      "message": "this message seems to contain a secret"})
     m = agent.handle_user_message(conv_id, user.id, body.content.strip(), body.mode)
     return {"id": m.id}
 

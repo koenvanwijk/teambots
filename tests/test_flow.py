@@ -416,6 +416,30 @@ def test_at_menu_sources(c):
     assert c.get(f"/api/teams/{S['team']}/files", headers={"Authorization": f"Bearer {outsider['token']}"}).status_code == 403
 
 
+def test_secret_in_chat_is_held_back(c):
+    dm, before = S["dm_bob"], len(c.get(f"/api/conversations/{S['dm_bob']}/messages", headers=H("bob")).json())
+    send = lambda who, conv, text, **kw: c.post(f"/api/conversations/{conv}/messages",  # noqa: E731
+                                                json={"content": text, **kw}, headers=H(who))
+    token = "ghp_" + "a1B2" * 9
+    r = send("bob", dm, f"push with {token} please")
+    assert r.status_code == 409 and r.json()["detail"]["code"] == "secret"
+    hit = r.json()["detail"]["found"][0]
+    assert (hit["kind"], hit["value"], hit["suggest"], hit["hosts"]) == ("GitHub token", token, "GITHUB_TOKEN", "api.github.com")
+    assert send("bob", dm, "my password is Hunter22!").json()["detail"]["found"][0]["value"] == "Hunter22!"
+    assert len(c.get(f"/api/conversations/{dm}/messages", headers=H("bob")).json()) == before  # nothing was stored
+    # ordinary text, placeholders and commit hashes pass
+    for ok in ("the token is required for this", "use {{secret:API_TOKEN}} here", "see commit 4ceeefdedfb5e28842f2987bc0fe13105904c72b"):
+        assert send("bob", dm, ok).status_code == 200, ok
+    # a stored secret's value is recognised by name, but only for someone who manages the bot
+    c.post(f"/api/bots/{S['bot']}/secrets", headers=H("alice"), json={"name": "DOOR_CODE", "value": "open-sesame", "hosts": "x.test"})
+    assert send("alice", S["dm_alice"], "it is open-sesame").json()["detail"]["found"][0]["name"] == "DOOR_CODE"
+    assert send("bob", dm, "it is open-sesame").status_code == 200
+    # the person can still decide to send it
+    assert send("bob", dm, f"dummy {token}", allow_secret=True).status_code == 200
+    agent_idle = lambda: not c.get(f"/api/conversations/{dm}/state", headers=H("bob")).json()["running"]  # noqa: E731
+    wait_for(agent_idle)
+
+
 def test_renaming(c):
     team, bot = S["team"], S["bot"]
     assert c.patch(f"/api/conversations/{S['ch']}", json={"name": "lobby"}, headers=H("carol")).status_code == 404
