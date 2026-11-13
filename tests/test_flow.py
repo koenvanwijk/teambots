@@ -321,6 +321,82 @@ def test_own_screen_and_computer_use(c):
         subprocess.run(["pkill", "-f", f"user-data-dir=.screens/bot{b['id']}"], check=False)
 
 
+def test_messages_while_the_bot_is_busy(c):
+    dm = S["dm_alice"]  # Alice has "always allow" for run_command, so a slow command keeps the bot busy
+    msgs = lambda: c.get(f"/api/conversations/{dm}/messages", headers=H("alice")).json()  # noqa: E731
+    state = lambda: c.get(f"/api/conversations/{dm}/state", headers=H("alice")).json()  # noqa: E731
+
+    def post(text, mode="auto"):
+        r = c.post(f"/api/conversations/{dm}/messages", json={"content": text, "mode": mode}, headers=H("alice"))
+        assert r.status_code == 200, r.text
+        return r.json()["id"]
+
+    def busy_with(marker, seconds):
+        post(tool("run_command", command=f"sleep {seconds}; echo {marker}"))
+        assert wait_for(lambda: state()["running"])[0]["mine"]
+
+    def settled():
+        m = msgs()
+        return m if not state()["running"] and m[-1]["role"] == "assistant" and not m[-1]["tool_calls"] else None
+
+    # queue (decided by the model): answered as its own turn, after the running one
+    busy_with("one-done", 1.5)
+    q = post("do this later please")
+    assert q in state()["queued"]
+    done = wait_for(lambda: (m := settled()) and m[-1]["content"].endswith("later please") and m)
+    texts = [m["content"] for m in done]
+    first = next(i for i, t in enumerate(texts) if t.startswith("RESULT:") and "one-done" in t)
+    assert first < texts.index("ECHO[mock-1]: do this later please")
+    assert state()["queued"] == [] and state()["delivery"][str(q)] == "queue"
+
+    # steer: the running turn reads it at its next step and answers it, instead of a second turn
+    busy_with("two-done", 1.5)
+    before = len(msgs())
+    st = post("use blue instead", "steer")
+    new = wait_for(lambda: settled() and msgs()[before - 1:])
+    assert new[-1]["content"] == "ECHO[mock-1]: use blue instead" and state()["delivery"][str(st)] == "steer"
+    assert sum(1 for m in new if m["role"] == "assistant" and not m["tool_calls"]) == 1
+
+    # interrupt: a stop word ends the turn at once, and the stop button does the same without a message
+    busy_with("three-done", 20)
+    started = time.time()
+    post("stop")
+    assert wait_for(settled)[-1]["content"] == "ECHO[mock-1]: stop" and time.time() - started < 10
+    busy_with("four-done", 20)
+    assert c.post(f"/api/conversations/{dm}/stop", headers=H("bob")).status_code == 404  # not Bob's chat
+    assert c.post(f"/api/conversations/{dm}/stop", headers=H("alice")).json() == {"stopped": 1}
+    assert state()["running"] == [] and not any(m["role"] == "tool" and "four-done" in m["content"] for m in msgs())
+    assert c.post(f"/api/conversations/{dm}/messages", json={"content": "x", "mode": "nope"},
+                  headers=H("alice")).status_code == 400
+
+
+def test_at_menu_sources(c):
+    files = c.get(f"/api/teams/{S['team']}/files", headers=H("bob")).json()
+    assert "note.txt" in files and all(not f.startswith(".") for f in files)
+    people = c.get(f"/api/teams/{S['team']}/members", headers=H("bob")).json()
+    assert {"alice", "bob", "carol"} == {p["username"] for p in people}
+    outsider = c.post("/api/register", json={"username": "dave", "password": "password123"}).json()
+    assert c.get(f"/api/teams/{S['team']}/files", headers={"Authorization": f"Bearer {outsider['token']}"}).status_code == 403
+
+
+def test_renaming(c):
+    team, bot = S["team"], S["bot"]
+    assert c.patch(f"/api/conversations/{S['ch']}", json={"name": "lobby"}, headers=H("carol")).status_code == 404
+    assert c.patch(f"/api/conversations/{S['ch']}", json={"name": "lobby"}, headers=H("bob")).json()["name"] == "lobby"
+    assert c.patch(f"/api/conversations/{S['dm_bob']}", json={"name": "x"}, headers=H("bob")).status_code == 400
+    assert c.patch(f"/api/teams/{team}", json={"name": "Project Y"}, headers=H("bob")).status_code == 403
+    assert c.patch(f"/api/teams/{team}", json={"name": "Project Y", "client": "Acme BV"}, headers=H("alice")).status_code == 200
+    assert [(t["name"], t["client"]) for t in c.get("/api/teams", headers=H("bob")).json()] == [("Project Y", "Acme BV")]
+    assert c.patch(f"/api/bots/{bot}", json={"name": "Buddy", "handle": "Bad Handle"}, headers=H("alice")).status_code == 400
+    assert c.patch(f"/api/bots/{bot}", json={"name": "Buddy", "handle": "buddy"}, headers=H("alice")).json()["handle"] == "buddy"
+    assert c.post(f"/api/bots/{bot}/dm", headers=H("bob")).json()["name"] == "Buddy"  # chats follow the new name
+    assert say(c, "bob", S["ch"], "@buddy hello")[-1]["content"].endswith("hello")
+    assert c.patch(f"/api/endpoints/{S['ep']}", json={"name": "mock-2"}, headers=H("bob")).status_code == 404
+    ep = c.patch(f"/api/endpoints/{S['ep']}", json={"name": "mock-2"}, headers=H("alice")).json()
+    assert ep["name"] == "mock-2" and ep["has_key"]  # the stored key is kept
+    assert c.post(f"/api/endpoints/{S['ep']}/test", headers=H("alice")).json()["tool_calling"]
+
+
 def test_endpoint_failure_is_reported(c):
     ep = c.post(f"/api/teams/{S['team']}/endpoints", headers=H("alice"), json={
         "name": "down", "base_url": "http://127.0.0.1:9", "default_model": "m"}).json()

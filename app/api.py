@@ -11,7 +11,7 @@ from fastapi import APIRouter, Depends, Header, HTTPException, Query
 from fastapi.responses import FileResponse, Response, StreamingResponse
 from pydantic import BaseModel
 
-from . import agent, config, events, llm, mcp_client, routines, screen
+from . import agent, config, events, llm, mcp_client, routines, sandbox, screen
 from .access import bot_role, can_manage, can_read_conversation, team_role
 from .db import (Approval, AuthToken, Bot, BotAccess, ChannelMember, Conversation, Endpoint, McpServer, Memory,
                  Message, Routine, Secret, Skill, Team, TeamMember, User, select, session)
@@ -161,21 +161,41 @@ def team_members(team_id: int, user: User = Depends(current_user)):
     with session() as s:
         _need(team_role(s, user.id, team_id))
         rows = s.exec(select(TeamMember).where(TeamMember.team_id == team_id)).all()
-        return [{"user_id": m.user_id, "role": m.role, "display_name": s.get(User, m.user_id).display_name}
-                for m in rows]
+        users = {m.user_id: s.get(User, m.user_id) for m in rows}
+        return [{"user_id": m.user_id, "role": m.role, "display_name": users[m.user_id].display_name,
+                 "username": users[m.user_id].username} for m in rows]
+
+
+@router.get("/teams/{team_id}/files")
+async def team_files(team_id: int, user: User = Depends(current_user)):
+    """Files on the project computer, for the '@' menu. Empty when the computer cannot be reached."""
+    with session() as s:
+        _need(team_role(s, user.id, team_id))
+    try:
+        return await sandbox.list_files(f"p{team_id}")
+    except Exception:  # noqa: BLE001 - the menu simply shows no files
+        return []
 
 
 class TeamPatch(BaseModel):
-    bot_sharing: str
+    bot_sharing: Optional[str] = None
+    name: Optional[str] = None
+    client: Optional[str] = None
 
 
 @router.patch("/teams/{team_id}")
 def patch_team(team_id: int, body: TeamPatch, user: User = Depends(current_user)):
-    _need(body.bot_sharing in ("everyone", "admins"), 400, "bot_sharing: everyone | admins")
+    _need(body.bot_sharing in (None, "everyone", "admins"), 400, "bot_sharing: everyone | admins")
+    _need(body.name is None or body.name.strip(), 400, "the project needs a name")
     with session() as s:
         _need(team_role(s, user.id, team_id) == "admin")
         t = s.get(Team, team_id)
-        t.bot_sharing = body.bot_sharing
+        if body.bot_sharing is not None:
+            t.bot_sharing = body.bot_sharing
+        if body.name is not None:
+            t.name = body.name.strip()
+        if body.client is not None:
+            t.client = body.client.strip()
         s.add(t)
         s.commit()
     return {"ok": True}
@@ -211,6 +231,35 @@ def create_endpoint(team_id: int, body: EndpointIn, user: User = Depends(current
         _need(team_role(s, user.id, team_id))
         e = Endpoint(team_id=team_id, owner_id=user.id, name=body.name, base_url=body.base_url.rstrip("/"),
                      api_key_enc=config.encrypt(body.api_key), default_model=body.default_model, shared=body.shared)
+        s.add(e)
+        s.commit()
+    return _ep_out(e)
+
+
+class EndpointPatch(BaseModel):
+    name: Optional[str] = None
+    base_url: Optional[str] = None
+    api_key: Optional[str] = None  # left out = keep the stored key
+    default_model: Optional[str] = None
+    shared: Optional[bool] = None
+
+
+@router.patch("/endpoints/{endpoint_id}")
+def patch_endpoint(endpoint_id: int, body: EndpointPatch, user: User = Depends(current_user)):
+    data = body.model_dump(exclude_none=True)
+    _need(all(str(data[k]).strip() for k in ("name", "base_url", "default_model") if k in data), 400,
+          "name, base URL and default model cannot be empty")
+    _need(data.get("base_url", "http://").startswith(("http://", "https://")), 400,
+          "base_url must start with http:// or https://")
+    with session() as s:
+        e = s.get(Endpoint, endpoint_id)
+        _need(e and e.owner_id == user.id, 404, "endpoint not found")
+        if "api_key" in data:
+            e.api_key_enc = config.encrypt(data.pop("api_key"))
+        if "base_url" in data:
+            data["base_url"] = data["base_url"].strip().rstrip("/")
+        for k, v in data.items():
+            setattr(e, k, v.strip() if isinstance(v, str) else v)
         s.add(e)
         s.commit()
     return _ep_out(e)
@@ -259,6 +308,7 @@ class BotIn(BaseModel):
 class BotPatch(BaseModel):
     computer_use: Optional[bool] = None
     name: Optional[str] = None
+    handle: Optional[str] = None
     instructions: Optional[str] = None
     endpoint_id: Optional[int] = None
     model: Optional[str] = None
@@ -301,9 +351,19 @@ def patch_bot(bot_id: int, body: BotPatch, user: User = Depends(current_user)):
         if "endpoint_id" in data:
             _usable_endpoint(s, data["endpoint_id"], b.team_id, user)
         _need(data.get("approval_mode", "ask") in ("ask", "auto"), 400, "approval_mode: ask | auto")
+        _need(data.get("name", "x").strip(), 400, "the bot needs a name")
+        if data.get("handle", b.handle) != b.handle:
+            _need(re.fullmatch(r"[a-z0-9_-]{2,32}", data["handle"]), 400, "handle: 2-32 chars of a-z 0-9 _ -")
+            _need(not s.exec(select(Bot).where(Bot.team_id == b.team_id, Bot.handle == data["handle"])).first(),
+                  409, "handle is taken")
+        renamed = "name" in data and data["name"].strip() != b.name
         for k, v in data.items():
-            setattr(b, k, v)
+            setattr(b, k, v.strip() if k == "name" else v)
         s.add(b)
+        if renamed:  # the bot's chats and its activity feed carry its name
+            for c in s.exec(select(Conversation).where(Conversation.bot_id == b.id)).all():
+                c.name = f"{b.name} activity" if c.kind == "feed" else b.name
+                s.add(c)
         s.commit()
         return _bot_out(s, b, user)
 
@@ -658,16 +718,24 @@ def open_feed(bot_id: int, user: User = Depends(current_user)):
 
 
 class ConversationPatch(BaseModel):
-    share_activity: bool
+    share_activity: Optional[bool] = None
+    name: Optional[str] = None
 
 
 @router.patch("/conversations/{conv_id}")
 def patch_conversation(conv_id: int, body: ConversationPatch, user: User = Depends(current_user)):
-    """A person decides per private chat whether summaries of it go to the shared feed."""
+    """A person decides per private chat whether summaries of it go to the shared feed.
+    A channel can be renamed by its members."""
     with session() as s:
         c = s.get(Conversation, conv_id)
-        _need(c and c.kind == "dm" and c.user_id == user.id, 404, "conversation not found")
-        c.share_activity = body.share_activity
+        _need(c and can_read_conversation(s, user.id, c), 404, "conversation not found")
+        if body.share_activity is not None:
+            _need(c.kind == "dm", 400, "only a private chat has this setting")
+            c.share_activity = body.share_activity
+        if body.name is not None:
+            _need(c.kind == "channel", 400, "only a channel can be renamed here")
+            _need(body.name.strip(), 400, "the channel needs a name")
+            c.name = body.name.strip()
         s.add(c)
         s.commit()
     return c.model_dump()
@@ -776,21 +844,44 @@ def list_messages(conv_id: int, after: int = 0, user: User = Depends(current_use
         bots = {b.id: b.name for b in s.exec(select(Bot)).all()}
     return [{"id": m.id, "role": m.role, "content": m.content, "created_at": m.created_at.isoformat(),
              "author": users.get(m.author_user_id) if m.role == "user" else bots.get(m.author_bot_id, "bot"),
+             "author_user_id": m.author_user_id, "author_bot_id": m.author_bot_id,
              "is_bot": m.role != "user", "tool_calls": json.loads(m.tool_calls) if m.tool_calls else [],
              "tool_call_id": m.tool_call_id, "has_image": bool(m.image_path)} for m in rows]
 
 
 class MessageIn(BaseModel):
     content: str
+    mode: str = "auto"  # what to do when the bot is busy: auto | steer | queue | interrupt
 
 
 @router.post("/conversations/{conv_id}/messages")
 async def send_message(conv_id: int, body: MessageIn, user: User = Depends(current_user)):
     _need(body.content.strip(), 400, "empty message")
+    _need(body.mode in agent.MODES, 400, "mode: " + " | ".join(agent.MODES))
     with session() as s:
         _need(_conv(s, conv_id, user).kind != "feed", 400, "the activity feed is written by the bot only")
-    m = agent.handle_user_message(conv_id, user.id, body.content.strip())
+    m = agent.handle_user_message(conv_id, user.id, body.content.strip(), body.mode)
     return {"id": m.id}
+
+
+@router.get("/conversations/{conv_id}/state")
+def conversation_state(conv_id: int, user: User = Depends(current_user)):
+    """Which bots are working right now, and what happened to messages sent meanwhile."""
+    with session() as s:
+        _conv(s, conv_id, user)
+        st = agent.state(conv_id)
+        for r in st["running"]:
+            bot = s.get(Bot, r["bot_id"])
+            r.update(bot=bot.name if bot else "bot", mine=r.pop("requester_id") == user.id)
+    return st
+
+
+@router.post("/conversations/{conv_id}/stop")
+async def stop_bots(conv_id: int, user: User = Depends(current_user)):
+    """The stop button: ends the turns that work for this person in this conversation."""
+    with session() as s:
+        _conv(s, conv_id, user)
+    return {"stopped": agent.stop(conv_id, user.id)}
 
 
 @router.get("/conversations/{conv_id}/approvals")
@@ -800,6 +891,7 @@ def list_approvals(conv_id: int, user: User = Depends(current_user)):
         rows = s.exec(select(Approval).where(Approval.conversation_id == conv_id,
                                              Approval.status == "pending")).all()
         return [{"id": a.id, "tool_name": a.tool_name, "arguments": json.loads(a.arguments),
+                 "tool_call_id": a.tool_call_id,
                  "bot": s.get(Bot, a.bot_id).name, "requester": s.get(User, a.requester_id).display_name,
                  "mine": a.requester_id == user.id} for a in rows]
 

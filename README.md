@@ -22,11 +22,13 @@ capabilities that every teammate or client talks to in private.
 | Approvals | Risky tools pause for an approval card (Allow once / Always allow / Deny); only the requester can answer |
 | Channels | Several people and bots, bots answer on `@handle`, no personal memory in channels |
 | Handoff, MCP | `ask_bot` delegates to another bot; streamable-HTTP MCP servers per bot |
+| While a bot works | You can keep typing. A new message steers the running turn (the bot reads it at its next step), waits in the queue behind it, or interrupts it. "Auto" decides: a short stop word interrupts, otherwise the bot's model classifies the message, and steering is the fallback. A Stop button ends the turn. Only the person the bot works for can steer or interrupt; messages from others queue |
+| Web UI | Dark and light theme. `@` in the message box lists what you can add: bots (in a channel also bots and people you can add on the spot), skills (`@skill:name`), files on the project computer (`@file:path`), people and secrets. What a bot does is folded into one line per turn; commands and file contents open on click, approval cards always show. Search with Ctrl K. Bots, channels, projects and endpoints can be renamed |
 
 Not built: Slack / Discord / Microsoft Teams, meeting bots, voice, SSO, token streaming,
 event-triggered routines.
 
-What has and has not been tested: `pytest -q` runs 14 end-to-end tests against a scripted model,
+What has and has not been tested: `pytest -q` runs 17 end-to-end tests against a scripted model,
 including the screen tools with a real Xvfb and Chromium on the local backend. Not tested: the
 Docker sandbox backend, a real model, and anything on Windows or Hetzner.
 
@@ -59,6 +61,8 @@ only and gives no isolation.
 To try it without a real model: `uvicorn tests.mock_llm:app --port 8791`, then add the endpoint
 `http://localhost:8791/v1` with key `sk-test-key`. The mock answers `TOOL:{"name": "run_command",
 "arguments": {"command": "ls"}}` with that tool call, which is enough to see the approval flow.
+A message with `SLOW 20` in it makes the mock wait 20 seconds, so you can try typing while the bot
+is busy.
 
 ## Run it on a VPS or DGX Spark
 
@@ -107,7 +111,7 @@ app/secrets_http.py  secrets filled in outside the sandbox, masking
 app/mcp_client.py  MCP tool discovery and calls
 app/routines.py    cron scheduler
 app/api.py         REST API + SSE
-app/static/        single-file web UI
+app/static/        web UI without a build step: index.html, app.css, app.js
 tests/             end-to-end tests against a scripted model (pytest -q)
 ```
 
