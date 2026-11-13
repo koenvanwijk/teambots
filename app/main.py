@@ -6,6 +6,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
+from uvicorn.middleware.proxy_headers import ProxyHeadersMiddleware
 
 from . import routines
 from .api import router
@@ -25,6 +26,8 @@ async def lifespan(_: FastAPI):
 
 
 app = FastAPI(title="TeamBots", lifespan=lifespan)
+# Honour X-Forwarded-Proto / X-Forwarded-Host when sitting behind Caddy, Brev, cloudflared, etc.
+app.add_middleware(ProxyHeadersMiddleware, trusted_hosts="*")
 app.include_router(router)
 app.include_router(tokens_router)
 app.include_router(home_router)

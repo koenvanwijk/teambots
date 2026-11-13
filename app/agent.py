@@ -15,7 +15,6 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
-from apscheduler.triggers.cron import CronTrigger
 
 from . import config, llm, mcp_client, sandbox, screen, secrets_http
 from .access import bot_role
@@ -150,6 +149,17 @@ HOME_TOOLS = [
         "Channel bots may reply in the channel. Pass project if the channel name exists more than once.",
         {"channel": {"type": "string"}, "content": {"type": "string"}, "project": {"type": "string"}},
         ["channel", "content"]),
+    _fn("list_routines", "List every routine the person owns, across projects: name, bot, project, "
+        "conversation, schedule in words and as cron, next and last run, enabled state and id.",
+        {}, []),
+    _fn("update_routine", "Change a routine the person owns. Pass routine_id from list_routines, and any "
+        "of name, cron (5-field crontab), prompt, enabled (false pauses, true resumes).",
+        {"routine_id": {"type": "integer"}, "name": {"type": "string"}, "cron": {"type": "string"},
+         "prompt": {"type": "string"}, "enabled": {"type": "boolean"}}, ["routine_id"]),
+    _fn("delete_routine", "Permanently delete a routine the person owns. Pass routine_id from list_routines.",
+        {"routine_id": {"type": "integer"}}, ["routine_id"]),
+    _fn("run_routine", "Run a routine the person owns now, without waiting for the next scheduled time.",
+        {"routine_id": {"type": "integer"}}, ["routine_id"]),
 ]
 
 
@@ -240,7 +250,7 @@ async def _execute(ctx: Ctx, name: str, args: dict, mcp_map: dict) -> str:
     if name == "http_request":
         return await secrets_http.http_request(ctx.bot_id, args["method"], args["url"], args.get("headers"),
                                                args.get("body") or "")
-    if name in ("list_workspace", "get_overview", "read_messages", "post_to_channel"):
+    if name in {t["function"]["name"] for t in HOME_TOOLS}:
         from . import home as home_mod
         return home_mod.execute_home_tool(ctx.requester_id, name, args)
     if name == "run_command":
@@ -291,12 +301,12 @@ async def _execute(ctx: Ctx, name: str, args: dict, mcp_map: dict) -> str:
             sk = s.exec(select(Skill).where(Skill.bot_id == bot.id, Skill.name == args["name"])).first()
             return sk.instructions if sk else "error: no such skill"
         if name == "create_routine":
-            CronTrigger.from_crontab(args["cron"])  # raises ValueError on a bad expression
+            from . import routines
+            routines.cron_trigger(args["cron"])  # raises ValueError on a bad expression
             r = Routine(bot_id=bot.id, owner_id=ctx.requester_id, conversation_id=ctx.conv_id,
                         name=args["name"], cron=args["cron"], prompt=args["prompt"])
             s.add(r)
             s.commit()
-            from . import routines
             routines.sync(r)
             return f"routine '{r.name}' scheduled ({r.cron})"
         if name == "ask_bot":

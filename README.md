@@ -29,7 +29,7 @@ capabilities that every teammate or client talks to in private.
 Not built: Slack / Discord / Microsoft Teams, meeting bots, voice, SSO, token streaming,
 event-triggered routines.
 
-What has and has not been tested: `pytest -q` runs 21 end-to-end tests against a scripted model,
+What has and has not been tested: `pytest -q` runs 24 end-to-end tests against a scripted model,
 including the screen tools with a real Xvfb and Chromium on the local backend. Not tested: the
 Docker sandbox backend, a real model, and anything on Windows or Hetzner.
 
@@ -84,6 +84,7 @@ safe: it encrypts the stored API keys and secrets, and losing it makes them unre
 4. Chat. Create a channel and all project bots join it automatically and reply to every message; remove a bot or set it to mention-only if you do not want that. On a bot with computer use, **Open scherm** opens the interactive screen (sign in to Chromium there; the profile is kept in the project's Docker volume). To use `gh` in the sandbox, run `gh auth login` there (config is stored on the project volume); TeamBots secrets never enter the sandbox, so a `GH_TOKEN` secret cannot be used as an environment variable inside it.
 
 5. **Overview** at the top of the sidebar is your personal bot: it sees every project, bot and channel you can access, can ask a project bot a question and relay the answer, and has its own computer (**Open scherm**). It uses the first model endpoint it finds in your projects; change that under the Overview bot's settings.
+6. **Routines** in the sidebar lists every routine you own, across projects: name, bot, project, conversation, the schedule in words and as cron, the next and last run in Europe/Amsterdam, and whether it is enabled. Pause, resume, edit (name, cron, prompt), delete, or run one now. A bot's settings still have a Routines tab to create one in the conversation you have open. The Overview bot can list and manage the same routines.
 
 ## Voice and external access
 
@@ -116,6 +117,12 @@ Also: `GET /api/v1/home/status` (a text overview), `GET /api/v1/home/openapi` (t
 The Python hook a later adapter should call is `run_home_turn` in `app/home.py` (message in, final reply out, no UI). The HTTP routes above are thin wrappers around it.
 
 **Reachability.** On the LAN the app is at `http://192.168.86.25:18080` (and on Tailscale at this machine's Tailscale IP, same port). A Tesla or Grok Bot voice running outside the house cannot use a plain HTTP LAN address. For that you need HTTPS reachability, for example [Tailscale Funnel](https://tailscale.com/kb/1223/funnel) or a [cloudflared](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/) tunnel in front of port 18080. Do not open a public tunnel until you have chosen one of those and are happy with it being on the internet.
+
+There is also an HTTPS front door at
+<https://teamsbot-extnode-3ez6v0lng26hyupqse5n0kb61n9.gobrev.dev>
+(NVIDIA Brev). That URL is behind a Pomerium SSO login: a browser that has signed in can use the UI, but a voice assistant that only sends a TeamBots API token gets a 302 to `auth.apps.run.brev.nvidia.com` and never reaches `/api/v1/home` or `/v1/chat/completions`. For voice, put those paths on a listener that does not require the Brev SSO (a Brev public port, or a cloudflared / Tailscale Funnel tunnel to port 18080). Do not open that tunnel until you have chosen one.
+
+TeamBots is meant to sit behind a TLS reverse proxy. It honours `X-Forwarded-Proto` and `X-Forwarded-Host` (`ProxyHeadersMiddleware`, and `uvicorn --proxy-headers` in Docker and `start-local.sh`). Redirects, the Secure cookie used by the interactive screen, WebSockets for noVNC (`wss`) and the event stream, and the PWA manifest and service worker (relative URLs, `start_url` `/`) then use https and the public host. Keep the app itself on a private port; only the proxy should be public.
 
 
 ## Configuration

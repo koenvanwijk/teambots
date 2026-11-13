@@ -6,7 +6,6 @@ import re
 import secrets
 from typing import Optional
 
-from apscheduler.triggers.cron import CronTrigger
 from fastapi import APIRouter, Cookie, Depends, Header, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, RedirectResponse, Response, StreamingResponse
 from pydantic import BaseModel
@@ -687,7 +686,10 @@ class RoutineIn(BaseModel):
 
 
 class RoutinePatch(BaseModel):
-    enabled: bool
+    enabled: Optional[bool] = None
+    name: Optional[str] = None
+    cron: Optional[str] = None
+    prompt: Optional[str] = None
 
 
 def _routine(s, routine_id: int, user: User) -> Routine:
@@ -696,18 +698,30 @@ def _routine(s, routine_id: int, user: User) -> Routine:
     return r
 
 
+@router.get("/routines")
+def list_all_routines(user: User = Depends(current_user)):
+    """Every routine the caller owns, across projects, with next/last run in the server timezone."""
+    with session() as s:
+        rows = s.exec(select(Routine).where(Routine.owner_id == user.id)).all()
+        views = [routines.view(s, r) for r in rows]
+    views.sort(key=lambda v: (not v["enabled"], v["next_run"] or "z", v["name"].lower(), v["id"]))
+    return views
+
+
 @router.get("/bots/{bot_id}/routines")
 def list_routines(bot_id: int, user: User = Depends(current_user)):
     with session() as s:
         _bot(s, bot_id, user)
         rows = s.exec(select(Routine).where(Routine.bot_id == bot_id, Routine.owner_id == user.id)).all()
-        return [r.model_dump(mode="json") for r in rows]
+        views = [routines.view(s, r) for r in rows]
+    views.sort(key=lambda v: (not v["enabled"], v["next_run"] or "z", v["name"].lower(), v["id"]))
+    return views
 
 
 @router.post("/bots/{bot_id}/routines")
 async def add_routine(bot_id: int, body: RoutineIn, user: User = Depends(current_user)):
     try:
-        CronTrigger.from_crontab(body.cron)
+        routines.cron_trigger(body.cron)
     except ValueError as e:
         raise HTTPException(400, f"invalid cron expression: {e}") from e
     with session() as s:
@@ -723,13 +737,21 @@ async def add_routine(bot_id: int, body: RoutineIn, user: User = Depends(current
 
 @router.patch("/routines/{routine_id}")
 async def patch_routine(routine_id: int, body: RoutinePatch, user: User = Depends(current_user)):
+    data = body.model_dump(exclude_unset=True)
+    if "cron" in data:
+        try:
+            routines.cron_trigger(data["cron"])
+        except ValueError as e:
+            raise HTTPException(400, f"invalid cron expression: {e}") from e
     with session() as s:
         r = _routine(s, routine_id, user)
-        r.enabled = body.enabled
+        for key, value in data.items():
+            setattr(r, key, value)
         s.add(r)
         s.commit()
+        out = routines.view(s, r)
     routines.sync(r)
-    return {"ok": True}
+    return out
 
 
 @router.delete("/routines/{routine_id}")
@@ -746,7 +768,7 @@ async def delete_routine(routine_id: int, user: User = Depends(current_user)):
 async def run_routine(routine_id: int, user: User = Depends(current_user)):
     with session() as s:
         _routine(s, routine_id, user)
-    agent.spawn(routines.fire(routine_id))
+    agent.spawn(routines.fire(routine_id, force=True))
     return {"ok": True}
 
 
@@ -818,16 +840,25 @@ async def bot_screen(bot_id: int, user: User = Depends(current_user)):
     return Response(data, media_type="image/jpeg", headers={"Cache-Control": "no-store"})
 
 
-def _vnc_cookie(response: Response, token: str) -> None:
+def _cookie_flags(request: Request | None) -> dict:
+    """Secure cookies when the original request was HTTPS, including behind a reverse proxy."""
+    scheme = ""
+    if request is not None:
+        proto = (request.headers.get("x-forwarded-proto") or "").split(",")[0].strip()
+        scheme = proto or request.url.scheme
+    return {"httponly": True, "samesite": "lax", "secure": scheme == "https"}
+
+
+def _vnc_cookie(response: Response, token: str, request: Request | None = None) -> None:
     # Lets noVNC's own JS/CSS and the websocket reuse the session without putting the token in every URL.
     if token:
-        response.set_cookie("tb_token", token, httponly=True, samesite="lax",
-                            path="/api/bots/", max_age=60 * 60 * 24 * 30)
+        response.set_cookie("tb_token", token, path="/api/bots/", max_age=60 * 60 * 24 * 30,
+                            **_cookie_flags(request))
 
 
 @router.get("/bots/{bot_id}/screen/vnc")
 @router.get("/bots/{bot_id}/screen/vnc/")
-async def vnc_index(bot_id: int, user: User = Depends(current_user),
+async def vnc_index(bot_id: int, request: Request, user: User = Depends(current_user),
                     authorization: str = Header(default=""), token: str = Query(default=""),
                     tb_token: str = Cookie(default="")):
     """Open the interactive screen (noVNC) behind TeamBots auth; no extra LAN port."""
@@ -838,7 +869,7 @@ async def vnc_index(bot_id: int, user: User = Depends(current_user),
         raise HTTPException(503, f"interactive screen not available: {e}") from e
     dest = f"/api/bots/{bot_id}/screen/vnc/vnc.html?autoconnect=1&resize=scale&reconnect=1&path=ws"
     resp = RedirectResponse(dest, status_code=302)
-    _vnc_cookie(resp, authorization.removeprefix("Bearer ").strip() or token or tb_token)
+    _vnc_cookie(resp, authorization.removeprefix("Bearer ").strip() or token or tb_token, request)
     return resp
 
 

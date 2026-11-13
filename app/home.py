@@ -13,8 +13,8 @@ import json
 from typing import Optional
 
 from .access import bot_role, can_read_conversation, team_role
-from .db import (AppSetting, Approval, Bot, ChannelMember, Conversation, Endpoint, Session, Team,
-                 TeamMember, User, engine, select, session)
+from .db import (AppSetting, Approval, Bot, ChannelMember, Conversation, Endpoint, Routine, Session,
+                 Team, TeamMember, User, engine, select, session)
 
 
 HOME_HANDLE = "home"
@@ -35,8 +35,10 @@ DEFAULT_INSTRUCTIONS = (
     "is going on. Use read_messages to look at a specific chat. Use ask_bot to "
     "ask a project bot a question and relay its answer (if the same @handle "
     "exists in more than one project, pass project as well). Use post_to_channel "
-    "only when they ask you to post in a channel. Be concise. Do not reveal "
-    "chats or approvals that are not theirs."
+    "only when they ask you to post in a channel. Use list_routines to see "
+    "their scheduled routines across projects, and update_routine, run_routine "
+    "or delete_routine when they ask you to change, run or remove one. Be "
+    "concise. Do not reveal chats, routines or approvals that are not theirs."
 )
 
 
@@ -386,6 +388,103 @@ def post_to_channel(user_id: int, content: str, project: str | None, channel: st
     return f"posted to #{name} in {team_name}. Channel bots may reply there."
 
 
+
+def _routine_for(s, user: User, args: dict) -> Routine | str:
+    rid = args.get("routine_id") if args.get("routine_id") is not None else args.get("id")
+    if rid is None:
+        return "error: routine_id is required"
+    try:
+        rid = int(rid)
+    except (TypeError, ValueError):
+        return "error: routine_id must be a number"
+    r = s.get(Routine, rid)
+    if not r or r.owner_id != user.id:
+        return "error: routine not found"
+    return r
+
+
+def list_routines_for(user_id: int) -> str:
+    from . import routines as routines_mod
+    with session() as s:
+        user = s.get(User, user_id)
+        rows = s.exec(select(Routine).where(Routine.owner_id == user.id)).all()
+        if not rows:
+            return "You have no routines."
+        views = [routines_mod.view(s, r) for r in rows]
+    views.sort(key=lambda v: (not v["enabled"], v["next_run"] or "z", v["name"].lower(), v["id"]))
+    lines = []
+    for v in views:
+        state = "enabled" if v["enabled"] else "paused"
+        nxt = v["next_run_text"] or "not scheduled"
+        last = v["last_run_text"] or "never"
+        lines.append(
+            f"#{v['id']} {v['name']} ({state}) — @{v['bot_handle']} in {v['project']}, "
+            f"{v['conversation_name']}. {v['cron_text']} ({v['cron']}). "
+            f"Next: {nxt}. Last: {last}."
+        )
+    return "\n".join(lines)
+
+
+def update_routine_for(user_id: int, args: dict) -> str:
+    from . import routines as routines_mod
+    with session() as s:
+        user = s.get(User, user_id)
+        r = _routine_for(s, user, args)
+        if isinstance(r, str):
+            return r
+        changes = []
+        if args.get("name"):
+            r.name = str(args["name"]).strip()
+            changes.append(f"name={r.name}")
+        if args.get("cron"):
+            try:
+                routines_mod.cron_trigger(args["cron"])
+            except ValueError as e:
+                return f"error: invalid cron expression: {e}"
+            r.cron = args["cron"]
+            changes.append(f"cron={r.cron} ({routines_mod.describe_cron(r.cron)})")
+        if args.get("prompt"):
+            r.prompt = str(args["prompt"])
+            changes.append("prompt updated")
+        if "enabled" in args and args["enabled"] is not None:
+            r.enabled = bool(args["enabled"])
+            changes.append("resumed" if r.enabled else "paused")
+        if not changes:
+            return "error: pass name, cron, prompt and/or enabled"
+        s.add(r)
+        s.commit()
+        summary = routines_mod.view(s, r)
+    routines_mod.sync(r)
+    return (f"Updated routine #{summary['id']} {summary['name']}: " + ", ".join(changes) +
+            f". Next run: {summary['next_run_text'] or 'not scheduled'}.")
+
+
+def delete_routine_for(user_id: int, args: dict) -> str:
+    from . import routines as routines_mod
+    with session() as s:
+        user = s.get(User, user_id)
+        r = _routine_for(s, user, args)
+        if isinstance(r, str):
+            return r
+        name, rid = r.name, r.id
+        s.delete(r)
+        s.commit()
+    routines_mod.remove(rid)
+    return f"Deleted routine #{rid} {name}."
+
+
+def run_routine_for(user_id: int, args: dict) -> str:
+    from . import agent, routines as routines_mod
+    with session() as s:
+        user = s.get(User, user_id)
+        r = _routine_for(s, user, args)
+        if isinstance(r, str):
+            return r
+        rid, name, conv = r.id, r.name, r.conversation_id
+    agent.spawn(routines_mod.fire(rid, force=True))
+    return f"Started routine #{rid} {name}. It is running in conversation {conv}."
+
+
 def execute_home_tool(user_id: int, name: str, args: dict) -> str:
     with session() as s:
         user = s.get(User, user_id)
@@ -400,6 +499,14 @@ def execute_home_tool(user_id: int, name: str, args: dict) -> str:
     if name == "post_to_channel":
         return post_to_channel(user_id, args.get("content") or "", args.get("project"),
                                args.get("channel") or "")
+    if name == "list_routines":
+        return list_routines_for(user_id)
+    if name == "update_routine":
+        return update_routine_for(user_id, args)
+    if name == "delete_routine":
+        return delete_routine_for(user_id, args)
+    if name == "run_routine":
+        return run_routine_for(user_id, args)
     return f"error: unknown tool {name}"
 
 

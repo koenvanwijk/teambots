@@ -240,6 +240,23 @@ def test_skills(c):
     assert "1. collect" in say(c, "bob", S["dm_bob"], tool("use_skill", name="weekly-report"))[-1]["content"]
 
 
+def test_cron_in_plain_words():
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+    from app.routines import describe_cron, next_run_at
+    assert describe_cron("30 8 * * 1-5") == "08:30 on weekdays"
+    assert describe_cron("0 16 * * 5") == "16:00 on Friday"
+    assert describe_cron("0 9 1 * *") == "09:00 on day 1"
+    assert describe_cron("0 0 1 1 *") == "00:00 on day 1 in January"
+    assert describe_cron("*/15 * * * *") == "every 15 minutes"
+    assert describe_cron("0 0 * * *") == "every day at 00:00"
+    assert describe_cron("nope") == "nope"
+    tz = ZoneInfo("Europe/Amsterdam")
+    after = datetime(2026, 11, 13, 18, 0, tzinfo=tz)  # Friday evening
+    nxt = next_run_at("30 8 * * 1-5", after=after)
+    assert nxt is not None and nxt.strftime("%Y-%m-%d %H:%M %a") == "2026-11-16 08:30 Mon"
+
+
 def test_routines(c):
     r = c.post(f"/api/bots/{S['bot']}/routines", headers=H("bob"), json={
         "name": "standup", "cron": "30 8 * * 1-5", "prompt": "summarise yesterday", "conversation_id": S["dm_bob"]})
@@ -247,9 +264,10 @@ def test_routines(c):
     assert c.post(f"/api/bots/{S['bot']}/routines", headers=H("bob"), json={
         "name": "bad", "cron": "nope", "prompt": "x", "conversation_id": S["dm_bob"]}).status_code == 400
     from app.routines import scheduler
-    assert scheduler.get_job(f"routine-{r.json()['id']}") is not None
-    assert c.post(f"/api/routines/{r.json()['id']}/run", headers=H("alice")).status_code == 404
-    assert c.post(f"/api/routines/{r.json()['id']}/run", headers=H("bob")).status_code == 200
+    rid = r.json()["id"]
+    assert scheduler.get_job(f"routine-{rid}") is not None
+    assert c.post(f"/api/routines/{rid}/run", headers=H("alice")).status_code == 404
+    assert c.post(f"/api/routines/{rid}/run", headers=H("bob")).status_code == 200
 
     def fired():
         msgs = c.get(f"/api/conversations/{S['dm_bob']}/messages", headers=H("bob")).json()
@@ -260,6 +278,28 @@ def test_routines(c):
     assert "scheduled" in approve(c, "bob", S["dm_bob"])[-1]["content"]
     assert len(c.get(f"/api/bots/{S['bot']}/routines", headers=H("bob")).json()) == 2
     assert c.get(f"/api/bots/{S['bot']}/routines", headers=H("alice")).json() == []
+
+    # Cross-project list enriches the row; only the owner sees it; name/cron/prompt can be edited
+    rows = c.get("/api/routines", headers=H("bob")).json()
+    assert {x["name"] for x in rows} == {"standup", "friday"}
+    standup = next(x for x in rows if x["name"] == "standup")
+    assert standup["id"] == rid
+    assert standup["cron_text"] == "08:30 on weekdays" and standup["cron"] == "30 8 * * 1-5"
+    assert standup["timezone"] == "Europe/Amsterdam"
+    assert standup["next_run"] and "08:30" in (standup["next_run_text"] or "")
+    assert standup["bot_handle"] == "helper" and "Project" in standup["project"]
+    assert "private chat" in standup["conversation_name"] and "@helper" in standup["conversation_name"]
+    assert c.get("/api/routines", headers=H("alice")).json() == []
+    assert c.patch(f"/api/routines/{rid}", headers=H("alice"), json={"name": "x"}).status_code == 404
+    edited = c.patch(f"/api/routines/{rid}", headers=H("bob"),
+                     json={"name": "morning standup", "cron": "0 9 * * 1-5", "prompt": "hello"})
+    assert edited.status_code == 200, edited.text
+    assert edited.json()["name"] == "morning standup" and edited.json()["cron_text"] == "09:00 on weekdays"
+    assert c.patch(f"/api/routines/{rid}", headers=H("bob"), json={"cron": "nope"}).status_code == 400
+    paused = c.patch(f"/api/routines/{rid}", headers=H("bob"), json={"enabled": False})
+    assert paused.status_code == 200 and paused.json()["enabled"] is False and paused.json()["next_run"] is None
+    resumed = c.patch(f"/api/routines/{rid}", headers=H("bob"), json={"enabled": True})
+    assert resumed.status_code == 200 and resumed.json()["enabled"] is True and resumed.json()["next_run"]
 
 
 def test_bot_to_bot_handoff(c):
@@ -504,6 +544,66 @@ def test_home_overview_bot(c):
     proj_file = os.path.join(TMP, "workspaces", f"p{S['team']}", "marker-home.txt")
     assert open(home_file).read().strip() == "home-only"
     assert not os.path.exists(proj_file)
+    S["home_bob"] = bob_home["conversation"]["id"]
+
+
+def test_home_manages_routines(c):
+    """The overview bot can list and manage the caller's routines across projects; not anyone else's."""
+    rows = c.get("/api/routines", headers=H("bob")).json()
+    assert rows, "expected Bob's routines from the earlier test"
+    standup = next(x for x in rows if "standup" in x["name"])
+    friday = next(x for x in rows if x["name"] == "friday")
+    tools = lambda msgs: " ".join(m["content"] for m in msgs if m["role"] == "tool")  # noqa: E731
+    listed = say(c, "bob", S["home_bob"], tool("list_routines"))
+    text = tools(listed)
+    assert f"#{standup['id']}" in text and "morning standup" in text
+    assert "09:00 on weekdays" in text
+    assert "@helper" in text or "@buddy" in text
+    paused = say(c, "bob", S["home_bob"], tool("update_routine", routine_id=standup["id"], enabled=False))
+    assert "paused" in tools(paused).lower()
+    assert next(x["enabled"] for x in c.get("/api/routines", headers=H("bob")).json() if x["id"] == standup["id"]) is False
+    # Alice cannot see or change Bob's routine through her overview bot
+    alice_list = tools(say(c, "alice", S["home"], tool("list_routines")))
+    assert f"#{standup['id']}" not in alice_list and "You have no routines" in alice_list
+    denied = say(c, "alice", S["home"], tool("delete_routine", routine_id=standup["id"]))
+    assert "not found" in tools(denied).lower()
+    assert any(x["id"] == standup["id"] for x in c.get("/api/routines", headers=H("bob")).json())
+    deleted = say(c, "bob", S["home_bob"], tool("delete_routine", routine_id=friday["id"]))
+    assert "Deleted" in tools(deleted) and "friday" in tools(deleted)
+    left = c.get("/api/routines", headers=H("bob")).json()
+    assert all(x["id"] != friday["id"] for x in left) and any(x["id"] == standup["id"] for x in left)
+    ran = say(c, "bob", S["home_bob"], tool("run_routine", routine_id=standup["id"]))
+    assert "Started" in tools(ran)
+
+
+def test_behind_reverse_proxy(c):
+    """X-Forwarded-Proto/Host is honoured so cookies get the Secure flag on HTTPS front doors."""
+    from app.api import _cookie_flags
+    from app.main import app
+    from starlette.requests import Request
+    assert any(getattr(m, "cls", type(None)).__name__ == "ProxyHeadersMiddleware" for m in app.user_middleware)
+
+    def req(scheme, headers=None):
+        hdrs = []
+        for k, v in (headers or {}).items():
+            hdrs.append((k.lower().encode(), v.encode()))
+        return Request({"type": "http", "asgi": {"version": "3.0"}, "http_version": "1.1", "method": "GET",
+                        "scheme": scheme, "path": "/", "raw_path": b"/", "query_string": b"",
+                        "headers": hdrs, "client": ("127.0.0.1", 1), "server": ("test", 80)})
+
+    assert _cookie_flags(req("http"))["secure"] is False
+    assert _cookie_flags(req("https"))["secure"] is True
+    assert _cookie_flags(req("http", {"x-forwarded-proto": "https"}))["secure"] is True
+    assert _cookie_flags(None)["secure"] is False
+
+    # The real app, wrapped in ProxyHeadersMiddleware, reports https from the forwarded header.
+    host = "teamsbot-extnode-3ez6v0lng26hyupqse5n0kb61n9.gobrev.dev"
+    r = c.get("/", headers={"X-Forwarded-Proto": "https", "X-Forwarded-Host": host, "Host": host})
+    assert r.status_code == 200
+    # computer use is off on the team bot, so this stays a 400 — but auth and routing still work over the forwarded host
+    vnc = c.get(f"/api/bots/{S['bot']}/screen/vnc", headers={**H("alice"), "X-Forwarded-Proto": "https",
+                                                             "X-Forwarded-Host": host}, follow_redirects=False)
+    assert vnc.status_code == 400
 
 
 def test_home_voice_api_tokens(c):

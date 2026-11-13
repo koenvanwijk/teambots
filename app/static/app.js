@@ -57,7 +57,7 @@ const store = { get: k => { try { return localStorage.getItem(k); } catch { retu
 
 const IDLE = { running: [], queued: [], delivery: {} };
 const S = { state: IDLE, details: store.get('tb_details') === '1', token: store.get('tb_token'), me: null, teams: [], team: null, bots: [], channels: [], members: [], endpoints: [],
-  conv: null, bot: null, msgs: [], approvals: [], ctx: { skills: [], secrets: [], mem: null }, files: { team: 0, at: 0, list: [] }, drafts: {}, es: null };
+  conv: null, bot: null, page: 'projects', msgs: [], approvals: [], ctx: { skills: [], secrets: [], mem: null }, files: { team: 0, at: 0, list: [] }, drafts: {}, es: null };
 
 async function api(method, path, body) {
   const r = await fetch('/api' + path, { method, headers: { 'Content-Type': 'application/json', ...(S.token ? { Authorization: 'Bearer ' + S.token } : {}) }, body: body ? JSON.stringify(body) : undefined });
@@ -215,7 +215,8 @@ function renderSide() {
     $('div', { className: 'brand' }, logo(), $('strong', { textContent: 'TeamBots' }), ib('side', 'Hide sidebar', toggleSide)),
     $('button', { className: 'nav', onclick: openPalette }, icon('search'), $('span', { className: 'grow', textContent: 'Search' }), $('kbd', { textContent: 'Ctrl K' })),
     $('button', { className: 'nav' + (c && c.kind === 'home' ? ' on' : ''), onclick: guard(openOverview) }, icon('home'), $('span', { className: 'grow', textContent: 'Overview' })),
-    $('button', { className: 'nav' + (!c ? ' on' : ''), onclick: guard(showHome) }, icon('grid'), $('span', { className: 'grow', textContent: 'Projects' })),
+    $('button', { className: 'nav' + (!c && S.page !== 'routines' ? ' on' : ''), onclick: guard(showHome) }, icon('grid'), $('span', { className: 'grow', textContent: 'Projects' })),
+    $('button', { className: 'nav' + (!c && S.page === 'routines' ? ' on' : ''), onclick: guard(showRoutines) }, icon('clock'), $('span', { className: 'grow', textContent: 'Routines' })),
     $('button', { className: 'project', title: 'Switch project', onclick: e => projectMenu(e.currentTarget) }, $('span', { className: 'pname' }, $('small', { textContent: t ? (t.client || 'Project') : 'No project yet' }), $('b', { textContent: t ? t.name : 'Create a project' })), icon('chev', 16)),
     list,
     $('button', { className: 'me', onclick: e => userMenu(e.currentTarget) }, avatar(S.me.display_name), $('span', { className: 'grow', textContent: S.me.display_name }), icon('dots', 16)));
@@ -320,7 +321,7 @@ function projectDialog() {
 const topLead = () => sideHidden() ? [ib('menu', 'Show sidebar', toggleSide)] : [];
 async function showHome() {
   store.set('tb_last_home', null);
-  stopConv(); closeDrawer(); S.conv = null; S.bot = null; if (S.team) store.set('tb_last_' + S.team.id, null);
+  stopConv(); closeDrawer(); S.conv = null; S.bot = null; S.page = 'projects'; if (S.team) store.set('tb_last_' + S.team.id, null);
   renderSide(); afterNav(); renderTop();
   const h = new Date().getHours(), col = el('col');
   const page = $('div', { className: 'home', data: { key: 'home' } }, $('h1', { textContent: `Good ${h < 12 ? 'morning' : h < 18 ? 'afternoon' : 'evening'}, ${S.me.display_name.split(' ')[0]}` }));
@@ -342,6 +343,52 @@ async function showHome() {
     $('div', { className: 'hd' }, $('span', { className: 'grow', textContent: p.name }), p.id === S.team.id && $('span', { className: 'tag ok', textContent: 'open' })),
     $('div', { className: 'ds', textContent: `${p.client || 'No client'} · ${p.people} ${p.people === 1 ? 'person' : 'people'} · ${p.bots.length ? p.bots.map(b => '@' + b.handle).join(' ') : 'no bots'}` }),
     p.activity.slice(0, 2).map(a => $('div', { className: 'act', textContent: `${a.bot}: ${a.content}` }))))));
+}
+
+
+function editRoutine(r, after) {
+  return form({ title: 'Edit routine', ok: 'Save', fields: [
+    { name: 'name', label: 'Name', required: true, value: r.name },
+    { name: 'cron', label: 'Schedule (crontab)', required: true, value: r.cron, mono: true, hint: (r.cron_text ? r.cron_text + '. ' : '') + 'minute hour day month weekday, in Europe/Amsterdam.' },
+    { name: 'prompt', label: 'What should the bot do each time?', type: 'textarea', required: true, value: r.prompt }],
+    onSubmit: v => api('PATCH', `/routines/${r.id}`, v) }).then(v => { if (v) { toast('Saved'); if (after) after(); } return v; });
+}
+async function showRoutines() {
+  store.set('tb_last_home', null);
+  stopConv(); closeDrawer(); S.conv = null; S.bot = null; S.page = 'routines'; if (S.team) store.set('tb_last_' + S.team.id, null);
+  renderSide(); afterNav(); renderTop();
+  const page = $('div', { className: 'home routines' }, $('h1', { textContent: 'Routines' }));
+  el('col').replaceChildren(page);
+  const rows = await api('GET', '/routines');
+  if (S.page !== 'routines' || S.conv) return;
+  if (!rows.length) {
+    put(page, $('p', { className: 'muted', textContent: 'You have no routines yet. Open a bot, go to Routines in its settings, and schedule one. They run as you, in the conversation where you created them.' }));
+    return;
+  }
+  const again = () => { if (S.page === 'routines' && !S.conv) showRoutines(); };
+  const groups = new Map();
+  for (const r of rows) { const key = r.project || 'Other'; if (!groups.has(key)) groups.set(key, []); groups.get(key).push(r); }
+  for (const [project, list] of groups) {
+    put(page, $('h2', { textContent: project }));
+    for (const r of list) {
+      const on = $('input', { type: 'checkbox', checked: r.enabled, onchange: guard(async () => { await api('PATCH', `/routines/${r.id}`, { enabled: on.checked }); again(); }) });
+      const where = ['@' + r.bot_handle, r.conversation_name].filter(Boolean).join(' · ');
+      put(page, $('div', { className: 'routine' + (r.enabled ? '' : ' off') },
+        $('div', { className: 'tx' }, r.name, $('small', { textContent: where })),
+        $('div', { className: 'meta' },
+          $('div', { textContent: `${r.cron_text || r.cron} (${r.cron})` }),
+          $('div', { textContent: `Next: ${r.enabled ? (r.next_run_text || '—') : 'paused'} · Last: ${r.last_run_text || 'never'}` }),
+          r.prompt && $('div', { className: 'prompt', textContent: r.prompt })),
+        $('div', { className: 'acts' },
+          $('label', { className: 'switch', title: r.enabled ? 'Enabled' : 'Paused' }, on),
+          ib('play', 'Run now', guard(async () => { await api('POST', `/routines/${r.id}/run`); toast('Started'); }), 15),
+          ib('edit', 'Edit', guard(() => editRoutine(r, again)), 15),
+          ib('trash', 'Remove', guard(async () => {
+            if (!await confirmBox({ title: 'Remove this routine?', text: 'This cannot be undone.', ok: 'Remove', danger: true })) return;
+            await api('DELETE', `/routines/${r.id}`); again();
+          }), 15))));
+    }
+  }
 }
 
 // ---------------------------------------------------------------- create things
@@ -403,7 +450,7 @@ async function openOverview() {
 }
 async function openConv(conv, bot) {
   stopConv(); closeDrawer(); afterNav();
-  Object.assign(S, { conv, bot: bot || null, msgs: [], approvals: [], state: IDLE, dockSync: null, ctx: { skills: [], secrets: [], mem: null }, first: true, chain: null });
+  Object.assign(S, { conv, bot: bot || null, page: null, msgs: [], approvals: [], state: IDLE, dockSync: null, ctx: { skills: [], secrets: [], mem: null }, first: true, chain: null });
   if (conv.kind === 'home') store.set('tb_last_home', '1');
   else {
     store.set('tb_last_home', null);
@@ -439,7 +486,7 @@ async function doRefresh() {
 function renderTop() {
   const top = el('top'); if (!top) return;
   const c = S.conv, lead = topLead();
-  if (!c) return fill(top, ...lead, $('span', { className: 'title', textContent: 'Projects' }), $('span', { className: 'grow' }), $('button', { className: 'btn sm', onclick: openPalette }, icon('search', 15), 'Search'));
+  if (!c) return fill(top, ...lead, $('span', { className: 'title', textContent: S.page === 'routines' ? 'Routines' : 'Projects' }), $('span', { className: 'grow' }), $('button', { className: 'btn sm', onclick: openPalette }, icon('search', 15), 'Search'));
   if (c.kind === 'feed') return fill(top, ...lead, icon('pulse'), $('span', { className: 'title', textContent: c.name }), $('span', { className: 'sub grow', textContent: 'Short summaries of finished tasks. The private chats stay private.' }));
   if (c.kind === 'dm' || c.kind === 'home') {
     const b = S.bot, shared = b && b.is_team && b.published && c.kind === 'dm';
@@ -482,7 +529,7 @@ async function channelMembers() {
 
 // ---------- messages
 const TOOLS = { run_command: ['term', 'Run command'], write_file: ['file', 'Write file'], read_file: ['file', 'Read file'], http_request: ['globe', 'HTTP request'], remember: ['book', 'Remember'], forget: ['book', 'Forget'],
-  save_skill: ['zap', 'Save skill'], use_skill: ['zap', 'Use skill'], ask_bot: ['bot', 'Ask another bot'], create_routine: ['clock', 'Create routine'], list_workspace: ['grid', 'List projects'], get_overview: ['home', 'Overview'], read_messages: ['book', 'Read messages'], post_to_channel: ['hash', 'Post to channel'] };
+  save_skill: ['zap', 'Save skill'], use_skill: ['zap', 'Use skill'], ask_bot: ['bot', 'Ask another bot'], create_routine: ['clock', 'Create routine'], list_workspace: ['grid', 'List projects'], get_overview: ['home', 'Overview'], read_messages: ['book', 'Read messages'], post_to_channel: ['hash', 'Post to channel'], list_routines: ['clock', 'List routines'], update_routine: ['edit', 'Update routine'], delete_routine: ['trash', 'Delete routine'], run_routine: ['play', 'Run routine'] };
 function toolInfo(name) {
   if (TOOLS[name]) return TOOLS[name];
   if (name.startsWith('screen_')) return ['screen', 'Screen: ' + name.slice(7)];
@@ -864,9 +911,10 @@ async function openDrawer(bot, tab = 'setup') {
   if (tab === 'routines') {
     const rs = await get('routines'), here = S.conv && S.conv.kind !== 'feed';
     put(body, head('My routines', here && 'Add', here && (async () => { if (await form({ title: 'New routine', intro: `Runs on a schedule in "${S.conv.kind === 'dm' ? S.conv.name : '# ' + S.conv.name}", the conversation that is open now.`, ok: 'Schedule', fields: [{ name: 'name', label: 'Name', required: true, placeholder: 'standup' }, { name: 'cron', label: 'Schedule (crontab)', required: true, value: '30 8 * * 1-5', mono: true, hint: 'minute hour day month weekday. The default is 08:30 on weekdays.' }, { name: 'prompt', label: 'What should the bot do each time?', type: 'textarea', required: true }], onSubmit: v => api('POST', `/bots/${bot.id}/routines`, { ...v, conversation_id: S.conv.id }) })) again(); })),
-      hint('A routine is yours: it runs as you, in the conversation where you created it.'),
-      rs.length ? rs.map(r => { const on = $('input', { type: 'checkbox', checked: r.enabled, onchange: guard(async () => { await api('PATCH', `/routines/${r.id}`, { enabled: on.checked }); }) });
-        return li(r.name, `${r.cron} · ${r.prompt}`, $('label', { className: 'switch', title: 'Enabled' }, on), ib('play', 'Run now', guard(async () => { await api('POST', `/routines/${r.id}/run`); toast('Started'); }), 15), del(`/routines/${r.id}`, 'this routine')); }) : none('No routines yet.'));
+      hint('A routine is yours: it runs as you, in the conversation where you created it. Times are Europe/Amsterdam.'),
+      rs.length ? rs.map(r => { const on = $('input', { type: 'checkbox', checked: r.enabled, onchange: guard(async () => { await api('PATCH', `/routines/${r.id}`, { enabled: on.checked }); again(); }) });
+        const sub = `${r.cron_text || r.cron} (${r.cron}) · ${r.enabled ? ('Next ' + (r.next_run_text || '—')) : 'paused'} · Last ${r.last_run_text || 'never'} · ${r.prompt}`;
+        return li(r.name, sub, $('label', { className: 'switch', title: r.enabled ? 'Enabled' : 'Paused' }, on), ib('play', 'Run now', guard(async () => { await api('POST', `/routines/${r.id}/run`); toast('Started'); }), 15), ib('edit', 'Edit', guard(() => editRoutine(r, again)), 15), del(`/routines/${r.id}`, 'this routine')); }) : none('No routines yet.'));
   }
   if (tab === 'connections') {
     const [secrets, mcp] = await Promise.all([get('secrets'), get('mcp')]);
@@ -896,6 +944,7 @@ function openPalette() {
     ...S.bots.filter(b => b.is_team && b.published).map(b => ({ g: 'Activity', icon: 'pulse', label: b.name + ' activity', run: () => openFeed(b) })),
     ...S.teams.filter(t => !S.team || t.id !== S.team.id).map(t => ({ g: 'Projects', icon: 'grid', label: (t.client ? t.client + ' / ' : '') + t.name, hint: 'Switch', run: () => switchTeam(t.id) })),
     { g: 'Actions', icon: 'grid', label: 'Home', run: showHome },
+    { g: 'Actions', icon: 'clock', label: 'Routines', run: showRoutines },
     ...(S.team ? [{ g: 'Actions', icon: 'plus', label: 'New bot', run: newBot }, { g: 'Actions', icon: 'plus', label: 'New channel', run: newChannel }, { g: 'Actions', icon: 'plug', label: 'New endpoint', run: newEndpoint }, { g: 'Actions', icon: 'users', label: 'People and invite code', run: projectDialog }] : []),
     { g: 'Actions', icon: 'plus', label: 'New project', run: newProject }, { g: 'Actions', icon: 'key', label: 'Join a project with an invite code', run: joinProject }, { g: 'Actions', icon: 'out', label: 'Sign out', run: signOut }];
   let shown = [], sel = 0;
