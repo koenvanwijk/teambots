@@ -88,7 +88,7 @@ safe: it encrypts the stored API keys and secrets, and losing it makes them unre
 | `TB_SANDBOX` | `local` | `docker` or `local` |
 | `TB_SANDBOX_IMAGE` | `teambots-sandbox:latest` | Image for the bots' computers |
 | `TB_SANDBOX_NETWORK` | `bridge` | Docker network for sandboxes (`none` = offline) |
-| `TB_BROWSER` | `chromium` | Browser binary inside the sandbox |
+| `TB_BROWSER` | `google-chrome` | Browser binary inside the sandbox (`google-chrome` by default; set `chromium` to use Debian Chromium). Runs as user `bot` with `--no-sandbox` because the container drops capabilities. The profile is stored on the project volume under `.screens/bot<id>` |
 | `TB_HTTP_ALLOW_PRIVATE` | `0` | `1` lets `http_request` reach private addresses and send secrets over http (development) |
 | `TB_BIND`, `TB_DOMAIN` | `127.0.0.1`, `localhost` | Compose: bind address of the app, domain for Caddy |
 | `TB_TIMEZONE` | `Europe/Amsterdam` | Time zone for cron expressions |

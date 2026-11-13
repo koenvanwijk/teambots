@@ -14,7 +14,7 @@ SANDBOX_BACKEND = os.environ.get("TB_SANDBOX", "local")
 SANDBOX_IMAGE = os.environ.get("TB_SANDBOX_IMAGE", "teambots-sandbox:latest")
 SANDBOX_NETWORK = os.environ.get("TB_SANDBOX_NETWORK", "bridge")
 TIMEZONE = os.environ.get("TB_TIMEZONE", "Europe/Amsterdam")
-SANDBOX_BROWSER = os.environ.get("TB_BROWSER", "chromium")
+SANDBOX_BROWSER = os.environ.get("TB_BROWSER", "google-chrome")
 # http_request may only reach public addresses unless this is set (development, internal APIs).
 HTTP_ALLOW_PRIVATE = os.environ.get("TB_HTTP_ALLOW_PRIVATE", "0") == "1"
 MAX_STEPS = int(os.environ.get("TB_MAX_STEPS", "12"))

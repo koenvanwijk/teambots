@@ -120,6 +120,8 @@ async def open_url(key: str, bot_id: int, url: str) -> str:
         raise ValueError("url must start with http:// or https://")
     env = await _env(key, bot_id)
     # A second start with the same profile opens the URL as a new tab in the running browser.
+    # --no-sandbox is required: the sandbox container runs as unprivileged `bot` with all
+    # capabilities dropped. The profile directory lives on the project's Docker volume.
     await sb_spawn(key, [config.SANDBOX_BROWSER, "--no-sandbox", "--no-first-run", "--disable-gpu",
                          "--disable-dev-shm-usage", f"--user-data-dir=.screens/bot{bot_id}",
                          f"--window-size={WIDTH},{HEIGHT}", "--window-position=0,0", url], env=env)
