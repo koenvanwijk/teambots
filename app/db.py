@@ -1,5 +1,6 @@
 """Data model. One SQLite/Postgres database; every table is a SQLModel class."""
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Optional
 
 from sqlmodel import Field, Session, SQLModel, create_engine, select
@@ -88,6 +89,13 @@ class ChannelMember(SQLModel, table=True):
     conversation_id: int = Field(index=True)
     user_id: Optional[int] = None
     bot_id: Optional[int] = None
+    # For bot members: False = reply to every message (the default); True = only on @handle.
+    mention_only: bool = False
+
+
+class AppSetting(SQLModel, table=True):
+    key: str = Field(primary_key=True)
+    value: str = ""
 
 
 class Message(SQLModel, table=True):
@@ -183,6 +191,63 @@ engine = create_engine(config.DB_URL, connect_args=_connect_args)
 
 def init_db() -> None:
     SQLModel.metadata.create_all(engine)
+    _ensure_channelmember_mention_only()
+    migrate_channel_bots()
+
+
+def _ensure_channelmember_mention_only() -> None:
+    """Add ChannelMember.mention_only on databases created before that column existed."""
+    if not config.DB_URL.startswith("sqlite"):
+        return
+    with engine.connect() as conn:
+        cols = [r[1] for r in conn.exec_driver_sql("PRAGMA table_info(channelmember)").fetchall()]
+        if "mention_only" not in cols:
+            conn.exec_driver_sql(
+                "ALTER TABLE channelmember ADD COLUMN mention_only BOOLEAN NOT NULL DEFAULT 0")
+            conn.commit()
+
+
+def _sqlite_path():
+    if not config.DB_URL.startswith("sqlite"):
+        return None
+    # sqlite:////abs or sqlite:///rel
+    return Path(config.DB_URL.split("sqlite:///", 1)[1])
+
+
+def migrate_channel_bots() -> dict:
+    """One-time: every project bot joins every project channel, and they reply by default.
+
+    Runs only once (flag in AppSetting). Does not re-add a bot that was later removed.
+    """
+    out = {"added": 0, "already": True}
+    with Session(engine) as s:
+        flag = s.get(AppSetting, "channel_bots_autojoin_v1")
+        if flag and flag.value == "done":
+            return out
+        path = _sqlite_path()
+        if path and path.exists():
+            bak = path.with_name(path.name + ".bak-channel-bots")
+            if not bak.exists():
+                import shutil
+                shutil.copy2(path, bak)
+        out["already"] = False
+        channels = s.exec(select(Conversation).where(Conversation.kind == "channel")).all()
+        added = 0
+        for ch in channels:
+            for bot in s.exec(select(Bot).where(Bot.team_id == ch.team_id)).all():
+                row = s.exec(select(ChannelMember).where(
+                    ChannelMember.conversation_id == ch.id, ChannelMember.bot_id == bot.id)).first()
+                if row:
+                    if row.mention_only:
+                        row.mention_only = False
+                        s.add(row)
+                else:
+                    s.add(ChannelMember(conversation_id=ch.id, bot_id=bot.id, mention_only=False))
+                    added += 1
+        s.add(AppSetting(key="channel_bots_autojoin_v1", value="done"))
+        s.commit()
+        out["added"] = added
+    return out
 
 
 def session() -> Session:

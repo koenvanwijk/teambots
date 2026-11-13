@@ -20,7 +20,7 @@ capabilities that every teammate or client talks to in private.
 | Screen | With "computer use" on, a bot has its own virtual screen with a browser, screenshot / click / type / key / scroll tools, and a live view in the UI. "Open scherm" attaches noVNC to that same Xvfb so you can use mouse and keyboard (e.g. to sign in to Chromium). Needs a model with image input |
 | Secrets | Never in the sandbox or the model's context. The bot writes `{{secret:NAME}}` in an `http_request`; the app fills it in outside the sandbox, only for the hosts the secret is bound to, never follows redirects, and masks secret values in everything returned to the model |
 | Approvals | Risky tools pause for an approval card (Allow once / Always allow / Deny); only the requester can answer |
-| Channels | Several people and bots, bots answer on `@handle`, no personal memory in channels |
+| Channels | Several people and bots; every project bot is added when a channel or a bot is created and replies to every message by default (or only on `@handle` if set to mention-only). Removing a bot sticks. No personal memory in channels |
 | Handoff, MCP | `ask_bot` delegates to another bot; streamable-HTTP MCP servers per bot |
 | While a bot works | You can keep typing. A new message steers the running turn (the bot reads it at its next step), waits in the queue behind it, or interrupts it. "Auto" decides: a short stop word interrupts, otherwise the bot's model classifies the message, and steering is the fallback. A Stop button ends the turn. Only the person the bot works for can steer or interrupt; messages from others queue |
 | Web UI | Dark and light theme. `@` in the message box lists what you can add: bots (in a channel also bots and people you can add on the spot), skills (`@skill:name`), files on the project computer (`@file:path`), people and secrets. What a bot does is folded into one line per turn; commands and file contents open on click, approval cards always show. Search with Ctrl K. Bots, channels, projects and endpoints can be renamed |
@@ -28,7 +28,7 @@ capabilities that every teammate or client talks to in private.
 Not built: Slack / Discord / Microsoft Teams, meeting bots, voice, SSO, token streaming,
 event-triggered routines.
 
-What has and has not been tested: `pytest -q` runs 17 end-to-end tests against a scripted model,
+What has and has not been tested: `pytest -q` runs 18 end-to-end tests against a scripted model,
 including the screen tools with a real Xvfb and Chromium on the local backend. Not tested: the
 Docker sandbox backend, a real model, and anything on Windows or Hetzner.
 
@@ -80,7 +80,7 @@ safe: it encrypts the stored API keys and secrets, and losing it makes them unre
 2. Add an endpoint and click it to run the connection test. "tool calling: true" is required.
 3. Create a bot. For a Team Bot: write instructions, add secrets / MCP servers / skills, then
    tick Published under Sharing.
-4. Chat. Create a channel and add people and bots to work together. On a bot with computer use, **Open scherm** opens the interactive screen (sign in to Chromium there; the profile is kept in the project's Docker volume).
+4. Chat. Create a channel and all project bots join it automatically and reply to every message; remove a bot or set it to mention-only if you do not want that. On a bot with computer use, **Open scherm** opens the interactive screen (sign in to Chromium there; the profile is kept in the project's Docker volume).
 
 ## Configuration
 

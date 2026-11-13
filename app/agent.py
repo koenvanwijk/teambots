@@ -759,6 +759,11 @@ def handle_user_message(conv_id: int, user_id: int, content: str, mode: str = "a
 
     A bot that is busy is not woken twice: the message steers its turn, waits in the queue behind it,
     or interrupts it (mode; 'auto' lets the app decide).
+
+    Only a person's (role=user) message is handled here; bot replies are stored as
+    role=assistant and never come through this function, so bots do not auto-reply
+    to each other. ask_bot remains a deliberate one-level handoff (depth>=1 cannot
+    call ask_bot again).
     """
     msg = _post(conv_id, role="user", content=content, author_user_id=user_id)
     with session() as s:
@@ -768,10 +773,15 @@ def handle_user_message(conv_id: int, user_id: int, content: str, mode: str = "a
         if conv.kind == "dm":
             targets = [s.get(Bot, conv.bot_id)]
         else:
-            handles = set(re.findall(r"@([A-Za-z0-9_-]+)", content))
-            member_ids = [m.bot_id for m in s.exec(select(ChannelMember).where(
-                ChannelMember.conversation_id == conv_id, ChannelMember.bot_id != None)).all()]  # noqa: E711
-            targets = [b for b in (s.get(Bot, i) for i in member_ids) if b and b.handle in handles]
+            handles = {h.lower() for h in re.findall(r"@([A-Za-z0-9_-]+)", content)}
+            rows = s.exec(select(ChannelMember).where(
+                ChannelMember.conversation_id == conv_id, ChannelMember.bot_id != None)).all()  # noqa: E711
+            members = [(m, s.get(Bot, m.bot_id)) for m in rows]
+            members = [(m, b) for m, b in members if b]
+            mentioned = [b for m, b in members if b.handle.lower() in handles]
+            # @mention of a member bot: only those bots reply (so you can address one).
+            # Otherwise every member bot replies, except those set to mention-only.
+            targets = mentioned if mentioned else [b for m, b in members if not m.mention_only]
         targets = [b for b in targets if b and bot_role(s, user_id, b)]
     for b in targets:
         key = (conv_id, b.id)

@@ -349,6 +349,7 @@ def create_bot(team_id: int, body: BotIn, user: User = Depends(current_user)):
         b = Bot(team_id=team_id, owner_id=user.id, **body.model_dump())
         s.add(b)
         s.commit()
+        _add_bot_to_team_channels(s, b)
         return _bot_out(s, b, user)
 
 
@@ -882,17 +883,30 @@ class ChannelIn(BaseModel):
     bot_ids: list[int] = []
 
 
-def _add_members(s, conv: Conversation, user: User, user_ids: list[int], bot_ids: list[int]) -> None:
+def _add_bot_to_team_channels(s, bot: Bot) -> None:
+    """Add a newly created bot to every existing channel in its project. Not used on startup."""
+    for ch in s.exec(select(Conversation).where(Conversation.team_id == bot.team_id,
+                                                Conversation.kind == "channel")).all():
+        if not s.exec(select(ChannelMember).where(ChannelMember.conversation_id == ch.id,
+                                                  ChannelMember.bot_id == bot.id)).first():
+            s.add(ChannelMember(conversation_id=ch.id, bot_id=bot.id, mention_only=False))
+    s.commit()
+
+
+def _add_members(s, conv: Conversation, user: User, user_ids: list[int], bot_ids: list[int],
+                 *, all_team_bots: bool = False) -> None:
     have_u = {m.user_id for m in s.exec(select(ChannelMember).where(ChannelMember.conversation_id == conv.id)).all()}
     have_b = {m.bot_id for m in s.exec(select(ChannelMember).where(ChannelMember.conversation_id == conv.id)).all()}
     for uid in set(user_ids) - have_u:
         if team_role(s, uid, conv.team_id):
             s.add(ChannelMember(conversation_id=conv.id, user_id=uid))
+    if all_team_bots:
+        bot_ids = list(bot_ids) + [b.id for b in s.exec(select(Bot).where(Bot.team_id == conv.team_id)).all()]
     for bid in set(bot_ids) - have_b:
         b = s.get(Bot, bid)
-        # a bot can be brought into a channel by someone who manages it
-        if b and b.team_id == conv.team_id and can_manage(s, user.id, b):
-            s.add(ChannelMember(conversation_id=conv.id, bot_id=bid))
+        # Auto-adding every project bot (channel create) skips the manage check; a manual add still needs it.
+        if b and b.team_id == conv.team_id and (all_team_bots or can_manage(s, user.id, b)):
+            s.add(ChannelMember(conversation_id=conv.id, bot_id=bid, mention_only=False))
     s.commit()
 
 
@@ -912,7 +926,7 @@ def create_channel(team_id: int, body: ChannelIn, user: User = Depends(current_u
         c = Conversation(team_id=team_id, kind="channel", name=body.name)
         s.add(c)
         s.commit()
-        _add_members(s, c, user, [user.id, *body.user_ids], body.bot_ids)
+        _add_members(s, c, user, [user.id, *body.user_ids], body.bot_ids, all_team_bots=True)
     return c.model_dump()
 
 
@@ -943,8 +957,46 @@ def channel_members(conv_id: int, user: User = Depends(current_user)):
         rows = s.exec(select(ChannelMember).where(ChannelMember.conversation_id == conv_id)).all()
         return {"users": [{"id": m.user_id, "display_name": s.get(User, m.user_id).display_name}
                           for m in rows if m.user_id],
-                "bots": [{"id": m.bot_id, "handle": s.get(Bot, m.bot_id).handle, "name": s.get(Bot, m.bot_id).name}
+                "bots": [{"id": m.bot_id, "handle": s.get(Bot, m.bot_id).handle, "name": s.get(Bot, m.bot_id).name,
+                           "mention_only": bool(m.mention_only)}
                          for m in rows if m.bot_id and s.get(Bot, m.bot_id)]}
+
+
+class BotMemberPatch(BaseModel):
+    mention_only: bool
+
+
+def _channel_bot_member(s, conv_id: int, bot_id: int, user: User) -> ChannelMember:
+    c = _conv(s, conv_id, user)
+    _need(c.kind == "channel", 400, "not a channel")
+    m = s.exec(select(ChannelMember).where(ChannelMember.conversation_id == conv_id,
+                                           ChannelMember.bot_id == bot_id)).first()
+    _need(m, 404, "bot is not in this channel")
+    bot = s.get(Bot, bot_id)
+    _need(bot and (can_manage(s, user.id, bot) or team_role(s, user.id, c.team_id) in ("admin", "owner")),
+          403, "not allowed")
+    return m
+
+
+@router.patch("/channels/{conv_id}/members/bots/{bot_id}")
+def patch_channel_bot(conv_id: int, bot_id: int, body: BotMemberPatch, user: User = Depends(current_user)):
+    """Set whether a bot replies to every message or only when @mentioned."""
+    with session() as s:
+        m = _channel_bot_member(s, conv_id, bot_id, user)
+        m.mention_only = body.mention_only
+        s.add(m)
+        s.commit()
+    return {"ok": True, "mention_only": body.mention_only}
+
+
+@router.delete("/channels/{conv_id}/members/bots/{bot_id}")
+def remove_channel_bot(conv_id: int, bot_id: int, user: User = Depends(current_user)):
+    """Remove a bot from a channel. It is not added back on restart."""
+    with session() as s:
+        m = _channel_bot_member(s, conv_id, bot_id, user)
+        s.delete(m)
+        s.commit()
+    return {"ok": True}
 
 
 @router.get("/conversations/{conv_id}/messages")

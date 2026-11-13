@@ -181,18 +181,55 @@ def test_computer_with_approval_gate(c):
 
 def test_channel_shared_computer_and_requester_only_approval(c):
     ch = c.post(f"/api/teams/{S['team']}/channels", headers=H("alice"), json={
-        "name": "general", "user_ids": [S["bob"]["user"]["id"]], "bot_ids": [S["bot"]]}).json()
+        "name": "general", "user_ids": [S["bob"]["user"]["id"]]}).json()  # no bot_ids: all project bots still join
     S["ch"] = ch["id"]
+    mem = c.get(f"/api/channels/{ch['id']}/members", headers=H("alice")).json()
+    assert any(b["id"] == S["bot"] and b["mention_only"] is False for b in mem["bots"])
     assert c.get(f"/api/conversations/{ch['id']}/messages", headers=H("carol")).status_code == 404
-    # without a mention the bot stays quiet
-    c.post(f"/api/conversations/{ch['id']}/messages", json={"content": "morning all"}, headers=H("bob"))
-    time.sleep(0.5)
-    assert len(c.get(f"/api/conversations/{ch['id']}/messages", headers=H("bob")).json()) == 1
+    # bots reply to every message by default, even without an @mention
+    assert say(c, "bob", ch["id"], "morning all")[-1]["content"] == "ECHO[mock-1]: Bob: morning all"
     assert say(c, "bob", ch["id"], "@helper RECALL bob prefers short answers")[-1]["content"] == "no"  # no personal memory
     assert say(c, "bob", ch["id"], "@helper RECALL deploys happen on tuesdays")[-1]["content"] == "yes"
     say(c, "bob", ch["id"], "@helper " + tool("run_command", command="cat note.txt"))
     approve(c, "alice", ch["id"], expect=403)  # only the requester can answer the card
     assert "hi-from-bob" in approve(c, "bob", ch["id"])[-1]["content"]  # same project computer
+
+
+def test_channel_new_bot_joins_remove_sticks_and_mention_only(c):
+    # a newly created bot is added to existing project channels
+    extra = c.post(f"/api/teams/{S['team']}/bots", headers=H("alice"), json={
+        "name": "Joiner", "handle": "joiner", "endpoint_id": S["ep"], "is_team": True}).json()
+    S["joiner"] = extra["id"]
+    mem = c.get(f"/api/channels/{S['ch']}/members", headers=H("alice")).json()
+    assert any(b["handle"] == "joiner" and b["mention_only"] is False for b in mem["bots"])
+    # mention of a member bot addresses only that bot (joiner stays quiet)
+    before = len(c.get(f"/api/conversations/{S['ch']}/messages", headers=H("alice")).json())
+    msgs = say(c, "alice", S["ch"], "@helper ping only helper")
+    new = msgs[before:]
+    bot_msgs = [m for m in new if m.get("is_bot") and m["content"]]
+    assert len(bot_msgs) == 1 and bot_msgs[0]["content"] == "ECHO[mock-1]: Alice: @helper ping only helper"
+    # mention-only: no reply unless @mentioned
+    assert c.patch(f"/api/channels/{S['ch']}/members/bots/{S['bot']}",
+                   json={"mention_only": True}, headers=H("alice")).status_code == 200
+    assert c.patch(f"/api/channels/{S['ch']}/members/bots/{S['joiner']}",
+                   json={"mention_only": True}, headers=H("alice")).status_code == 200
+    c.post(f"/api/conversations/{S['ch']}/messages", json={"content": "nobody should reply"}, headers=H("bob"))
+    time.sleep(0.5)
+    after = c.get(f"/api/conversations/{S['ch']}/messages", headers=H("bob")).json()
+    assert after[-1]["content"] == "nobody should reply" and after[-1]["role"] == "user"
+    assert say(c, "bob", S["ch"], "@helper you may speak")[-1]["content"] == "ECHO[mock-1]: Bob: @helper you may speak"
+    # restore Helper to reply-all so later tests that might post to the channel stay simple
+    assert c.patch(f"/api/channels/{S['ch']}/members/bots/{S['bot']}",
+                   json={"mention_only": False}, headers=H("alice")).status_code == 200
+    # removing a bot sticks: a later migrate does not add it back
+    assert c.delete(f"/api/channels/{S['ch']}/members/bots/{S['joiner']}", headers=H("alice")).status_code == 200
+    mem = c.get(f"/api/channels/{S['ch']}/members", headers=H("alice")).json()
+    assert not any(b["handle"] == "joiner" for b in mem["bots"])
+    from app.db import migrate_channel_bots
+    assert migrate_channel_bots() == {"added": 0, "already": True}
+    mem = c.get(f"/api/channels/{S['ch']}/members", headers=H("alice")).json()
+    assert not any(b["handle"] == "joiner" for b in mem["bots"])
+    assert c.delete(f"/api/bots/{S['joiner']}", headers=H("alice")).status_code == 200
 
 
 def test_skills(c):
