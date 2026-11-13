@@ -148,13 +148,29 @@ async function openConv(conv, bot) {
     const cb = $('input', { type: 'checkbox', checked: conv.share_activity, style: 'width:auto', onchange: guard(async () => { Object.assign(conv, await api('PATCH', `/conversations/${conv.id}`, { share_activity: cb.checked })); }) });
     head.append($('span', { className: 'hint', textContent: 'Private chat. Nobody else can read it.' }), shared ? $('label', { style: 'margin:0', title: 'When on, a short summary of each finished task is posted to the shared activity feed. The chat itself is never shared.' }, cb, ' Share task summaries') : null, $('button', { textContent: 'Bot settings', onclick: () => openPanel(bot) })); }
   else { const mem = await api('GET', `/channels/${conv.id}/members`);
-    head.append($('span', { className: 'hint', textContent: mem.users.map(u => u.display_name).join(', ') + (mem.bots.length ? ' · bots: ' + mem.bots.map(b => '@' + b.handle).join(' ') : '') }),
+    head.append($('span', { className: 'hint', textContent: mem.users.map(u => u.display_name).join(', ') + (mem.bots.length ? ' · bots: ' + mem.bots.map(b => '@' + b.handle + (b.mention_only ? ' (mention only)' : '')).join(' ') : '') }),
       $('button', { textContent: 'Add people or bots', onclick: guard(async () => {
         const who = ask('Names or @handles to add, comma-separated.\nPeople: ' + S.members.map(m => m.display_name).join(', ') + '\nBots you manage: ' + S.bots.filter(b => b.role !== 'collaborator').map(b => '@' + b.handle).join(' ')); if (!who) return;
         const parts = who.split(',').map(x => x.trim());
         await api('POST', `/channels/${conv.id}/members`, { user_ids: S.members.filter(m => parts.includes(m.display_name)).map(m => m.user_id), bot_ids: S.bots.filter(b => parts.includes('@' + b.handle)).map(b => b.id) });
+        openConv(conv, null); }) }),
+      $('button', { textContent: 'Manage bots', onclick: guard(async () => {
+        const mem2 = await api('GET', `/channels/${conv.id}/members`);
+        const list = mem2.bots.map(b => '@' + b.handle + (b.mention_only ? ' mention-only' : ' replies to all')).join(', ') || '(none)';
+        const who = ask('Bots in this channel: ' + list + '\nType -@handle to remove, mention @handle for mention-only, all @handle to reply to every message.');
+        if (!who) return;
+        const raw = who.trim();
+        const rm = raw.match(/^[-]\s*@?([A-Za-z0-9_-]+)$/i);
+        const mo = raw.match(/^mention\s+@?([A-Za-z0-9_-]+)$/i);
+        const all = raw.match(/^all\s+@?([A-Za-z0-9_-]+)$/i);
+        const handle = (rm || mo || all || [])[1];
+        const bot = mem2.bots.find(b => b.handle.toLowerCase() === (handle || '').toLowerCase());
+        if (!bot) { alert('Unknown bot or command. Use -@handle, mention @handle, or all @handle.'); return; }
+        if (rm) await api('DELETE', `/channels/${conv.id}/members/bots/${bot.id}`);
+        else if (mo) await api('PATCH', `/channels/${conv.id}/members/bots/${bot.id}`, { mention_only: true });
+        else await api('PATCH', `/channels/${conv.id}/members/bots/${bot.id}`, { mention_only: false });
         openConv(conv, null); }) })); }
-  const ta = $('textarea', { rows: 2, placeholder: conv.kind === 'dm' ? 'Message ' + conv.name : 'Message the channel. Mention a bot with @handle to ask it something.' });
+  const ta = $('textarea', { rows: 2, placeholder: conv.kind === 'dm' ? 'Message ' + conv.name : 'Message the channel. Bots reply to every message by default. Use @handle to talk to one bot.' });
   const send = guard(async () => { const t = ta.value.trim(); if (!t) return; ta.value = ''; await api('POST', `/conversations/${conv.id}/messages`, { content: t }); });
   ta.onkeydown = e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(); } };
   el('compose').replaceChildren(ta, $('button', { className: 'primary', textContent: 'Send', onclick: send }));
