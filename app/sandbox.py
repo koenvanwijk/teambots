@@ -35,6 +35,9 @@ async def _run(argv: list[str], stdin: bytes | None, timeout: float, cwd: str | 
         proc.kill()
         await proc.wait()
         return 124, (b"" if raw else f"[timed out after {int(timeout)}s]")
+    except asyncio.CancelledError:  # the turn was interrupted: do not leave the command running
+        proc.kill()
+        raise
     if raw:
         return proc.returncode or 0, out
     text = out.decode(errors="replace")
@@ -143,3 +146,27 @@ async def sandbox_addr(key: str) -> str:
             "sandbox has no network address; interactive screen needs TB_SANDBOX_NETWORK=bridge (the default)")
     return ip
 
+
+SKIP_DIRS = {"node_modules", "__pycache__"}
+
+
+async def list_files(key: str, limit: int = 300) -> list[str]:
+    """Workspace files as relative paths, for the '@' menu in the UI. Hidden folders are left out."""
+    key = _safe_key(key)
+    if config.SANDBOX_BACKEND != "docker":
+        root = os.path.abspath(os.path.join(config.DATA_DIR, "workspaces", key))
+        found: list[str] = []
+        for folder, dirs, names in os.walk(root):
+            dirs[:] = sorted(d for d in dirs if not d.startswith(".") and d not in SKIP_DIRS)
+            for n in sorted(names):
+                if not n.startswith("."):
+                    found.append(os.path.relpath(os.path.join(folder, n), root).replace(os.sep, "/"))
+                    if len(found) >= limit:
+                        return found
+        return found
+    prune = " -o ".join(f"-name {d}" for d in sorted(SKIP_DIRS))
+    code, out = await sb_exec(key, ["sh", "-c", f"find . \\( -name '.?*' -o {prune} \\) -prune -o -type f -print "
+                                                 f"| head -n {int(limit)}"], timeout=10)
+    if code != 0:
+        return []
+    return sorted(line[2:] for line in out.splitlines() if line.startswith("./"))
