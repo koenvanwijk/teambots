@@ -9,6 +9,7 @@ from fastapi.staticfiles import StaticFiles
 
 from . import routines
 from .api import router
+from .home_api import home_router, openai_router, tokens_router
 from .db import init_db
 
 logging.basicConfig(level=logging.INFO)
@@ -25,6 +26,9 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(title="TeamBots", lifespan=lifespan)
 app.include_router(router)
+app.include_router(tokens_router)
+app.include_router(home_router)
+app.include_router(openai_router)
 app.mount("/static", StaticFiles(directory=STATIC), name="static")
 
 

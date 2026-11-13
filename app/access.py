@@ -29,7 +29,7 @@ def can_manage(s: Session, user_id: int, bot: Bot) -> bool:
 
 def can_read_conversation(s: Session, user_id: int, conv: Conversation) -> bool:
     """DMs are private to their user: owners and managers of the bot cannot read them."""
-    if conv.kind == "dm":
+    if conv.kind in ("dm", "home"):
         return conv.user_id == user_id
     if conv.kind == "feed":  # everyone who can use the bot sees its activity summaries
         bot = s.get(Bot, conv.bot_id)

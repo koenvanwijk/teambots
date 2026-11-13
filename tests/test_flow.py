@@ -467,3 +467,78 @@ def test_endpoint_failure_is_reported(c):
     assert say(c, "alice", dm, "hi")[-1]["content"].startswith("Endpoint error:")
     assert c.delete(f"/api/bots/{b['id']}", headers=H("bob")).status_code == 404
     assert c.delete(f"/api/bots/{b['id']}", headers=H("alice")).status_code == 200
+
+
+def test_home_overview_bot(c):
+    """One overview bot per user, own sandbox, can list projects and ask a project bot."""
+    # no endpoint yet? Alice already has one. Created on first GET /home.
+    r = c.get("/api/home", headers=H("alice"))
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["bot"]["is_home"] and body["bot"]["handle"] == "home" and body["conversation"]["kind"] == "home"
+    S["home"] = body["conversation"]["id"]
+    S["home_bot"] = body["bot"]["id"]
+    assert body["endpoint_id"] == S["ep"]
+    # not a project bot, and cannot be deleted
+    assert all(b["id"] != S["home_bot"] for b in c.get(f"/api/teams/{S['team']}/bots", headers=H("alice")).json())
+    assert c.delete(f"/api/bots/{S['home_bot']}", headers=H("alice")).status_code == 400
+    # Bob has no endpoint of his own, so Overview is not created yet
+    assert c.get("/api/home", headers=H("bob")).status_code == 400
+    assert c.patch(f"/api/endpoints/{S['ep']}", json={"shared": True}, headers=H("alice")).status_code == 200
+    bob_home = c.get("/api/home", headers=H("bob")).json()
+    assert bob_home["conversation"]["id"] != S["home"] and bob_home["bot"]["id"] != S["home_bot"]
+    assert c.get(f"/api/conversations/{S['home']}/messages", headers=H("bob")).status_code == 404
+    # lists projects and the team bot (renamed to Buddy in an earlier test)
+    msgs = say(c, "alice", S["home"], tool("list_workspace"))
+    tools = " ".join(m["content"] for m in msgs if m["role"] == "tool")
+    assert "Project Y" in tools and "@buddy" in tools
+    # ask_bot reaches the project bot and keeps the one-level guard
+    msgs = say(c, "alice", S["home"], tool("ask_bot", handle="buddy", message="draft a title from overview"))
+    tools = " ".join(m["content"] for m in msgs if m["role"] == "tool")
+    assert "ECHO[mock-1]" in tools and "draft a title from overview" in tools
+    # own sandbox, not the project computer
+    assert c.patch(f"/api/bots/{S['home_bot']}", json={"approval_mode": "auto"}, headers=H("alice")).status_code == 200
+    say(c, "alice", S["home"], tool("run_command", command="echo home-only > marker-home.txt"))
+    uid = S["alice"]["user"]["id"]
+    home_file = os.path.join(TMP, "workspaces", f"home-u{uid}", "marker-home.txt")
+    proj_file = os.path.join(TMP, "workspaces", f"p{S['team']}", "marker-home.txt")
+    assert open(home_file).read().strip() == "home-only"
+    assert not os.path.exists(proj_file)
+
+
+def test_home_voice_api_tokens(c):
+    """Personal API tokens for voice: hashed, shown once, revoked tokens and session tokens are rejected."""
+    assert c.post("/api/v1/home/message", json={"text": "hi"}).status_code == 401
+    assert c.post("/api/v1/home/message", json={"text": "hi"}, headers=H("alice")).status_code == 401
+    r = c.post("/api/tokens", headers=H("alice"), json={"name": "test-voice", "scope": "home-bot"})
+    assert r.status_code == 200, r.text
+    raw, tid, prefix = r.json()["token"], r.json()["id"], r.json()["prefix"]
+    assert raw.startswith("tbh_") and prefix == raw[:11]
+    listed = c.get("/api/tokens", headers=H("alice")).json()
+    assert any(t["id"] == tid and "token" not in t and t["prefix"] == prefix for t in listed)
+    Hapi = {"Authorization": f"Bearer {raw}"}
+    r = c.post("/api/v1/home/message", json={"text": "hello from voice", "mode": "voice"}, headers=Hapi)
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["conversation_id"] == S["home"]
+    assert "ECHO[mock-1]" in body["reply"] and "hello from voice" in body["reply"]
+    # the same turn is visible in the Overview chat
+    chat = c.get(f"/api/conversations/{S['home']}/messages", headers=H("alice")).json()
+    assert any(m["role"] == "user" and m["content"] == "hello from voice" for m in chat)
+    assert any(m["role"] == "assistant" and "hello from voice" in (m["content"] or "") for m in chat)
+    st = c.get("/api/v1/home/status", headers=Hapi)
+    assert st.status_code == 200 and "Project Y" in st.json()["overview"] and st.json()["conversation_id"] == S["home"]
+    schema = c.get("/api/v1/home/openapi", headers=Hapi)
+    assert schema.status_code == 200 and schema.json()["openai"]["model"] == "teambots-home"
+    assert c.get("/api/v1/home/openapi").status_code == 401
+    oa = c.post("/v1/chat/completions", headers=Hapi, json={
+        "model": "teambots-home", "messages": [{"role": "user", "content": "ping the overview"}]})
+    assert oa.status_code == 200, oa.text
+    assert "ECHO[mock-1]" in oa.json()["choices"][0]["message"]["content"]
+    assert oa.json()["conversation_id"] == S["home"]
+    models = c.get("/v1/models", headers=Hapi)
+    assert models.status_code == 200 and {m["id"] for m in models.json()["data"]} >= {"teambots-home", "teambots-home-voice"}
+    assert c.delete(f"/api/tokens/{tid}", headers=H("alice")).status_code == 200
+    assert c.post("/api/v1/home/message", json={"text": "again"}, headers=Hapi).status_code == 401
+    # a already-revoked token stays rejected; a typo token is rejected
+    assert c.post("/api/v1/home/message", json={"text": "x"}, headers={"Authorization": "Bearer tbh_not-a-real-token"}).status_code == 401

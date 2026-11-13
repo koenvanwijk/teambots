@@ -13,7 +13,7 @@ from pydantic import BaseModel
 import httpx
 import websockets
 
-from . import agent, config, events, llm, mcp_client, routines, sandbox, screen, secrets_http
+from . import agent, config, events, home, llm, mcp_client, routines, sandbox, screen, secrets_http
 from .access import bot_role, can_manage, can_read_conversation, team_role
 from .db import (Approval, AuthToken, Bot, BotAccess, ChannelMember, Conversation, Endpoint, McpServer, Memory,
                  Message, Routine, Secret, Skill, Team, TeamMember, User, select, session)
@@ -96,6 +96,53 @@ def login(body: Credentials):
 @router.get("/me")
 def me(user: User = Depends(current_user)):
     return {"id": user.id, "username": user.username, "display_name": user.display_name}
+
+
+# ---------------------------------------------------------------- overview bot (per user, not tied to a project)
+
+@router.get("/home")
+def get_home(user: User = Depends(current_user)):
+    """The caller's overview bot and private chat. Created on first visit once a model endpoint exists."""
+    with session() as s:
+        try:
+            bot, conv = home.ensure_home(s, user)
+        except ValueError as e:
+            raise HTTPException(400, str(e)) from e
+        return home.home_out(s, user, bot, conv)
+
+
+class HomePatch(BaseModel):
+    endpoint_id: Optional[int] = None
+    model: Optional[str] = None
+    computer_use: Optional[bool] = None
+
+
+@router.patch("/home")
+def patch_home(body: HomePatch, user: User = Depends(current_user)):
+    """Choose the model endpoint (from any of your projects) and options for the overview bot."""
+    with session() as s:
+        try:
+            bot = home.apply_settings(s, user, endpoint_id=body.endpoint_id, model=body.model,
+                                      computer_use=body.computer_use)
+            conv = home._home_conv(s, bot)
+            if not conv:
+                bot, conv = home.ensure_home(s, user)
+        except ValueError as e:
+            raise HTTPException(400, str(e)) from e
+        return home.home_out(s, user, bot, conv)
+
+
+@router.get("/home/files")
+async def home_files(user: User = Depends(current_user)):
+    with session() as s:
+        try:
+            bot, _ = home.ensure_home(s, user)
+        except ValueError as e:
+            raise HTTPException(400, str(e)) from e
+        key = home.sandbox_key(bot)
+    return await sandbox.list_files(key)
+
+
 
 
 class TeamIn(BaseModel):
@@ -384,6 +431,7 @@ async def delete_bot(bot_id: int, user: User = Depends(current_user)):
     with session() as s:
         b = s.get(Bot, bot_id)
         _need(b and b.owner_id == user.id, 404, "bot not found")
+        _need(not b.is_home, 400, "the Overview bot cannot be deleted")
         for r in s.exec(select(Routine).where(Routine.bot_id == bot_id)).all():
             routines.remove(r.id)
         for conv in s.exec(select(Conversation).where(Conversation.bot_id == bot_id)).all():
@@ -764,7 +812,7 @@ async def bot_screen(bot_id: int, user: User = Depends(current_user)):
     """Live view of a bot's screen, for everyone in the project who can use the bot."""
     b = _screen_bot(bot_id, user)
     try:
-        data = await screen.screenshot(f"p{b.team_id}", b.id)
+        data = await screen.screenshot(home.sandbox_key(b), b.id)
     except Exception as e:  # noqa: BLE001
         raise HTTPException(503, f"screen not available: {e}") from e
     return Response(data, media_type="image/jpeg", headers={"Cache-Control": "no-store"})
@@ -785,7 +833,7 @@ async def vnc_index(bot_id: int, user: User = Depends(current_user),
     """Open the interactive screen (noVNC) behind TeamBots auth; no extra LAN port."""
     b = _screen_bot(bot_id, user)
     try:
-        await screen.ensure_vnc(f"p{b.team_id}", b.id)
+        await screen.ensure_vnc(home.sandbox_key(b), b.id)
     except Exception as e:  # noqa: BLE001
         raise HTTPException(503, f"interactive screen not available: {e}") from e
     dest = f"/api/bots/{bot_id}/screen/vnc/vnc.html?autoconnect=1&resize=scale&reconnect=1&path=ws"
@@ -804,7 +852,7 @@ async def vnc_ws(ws: WebSocket, bot_id: int, token: str = Query(default="")):
         return
     try:
         b = _screen_bot(bot_id, user)
-        host, port = await screen.ensure_vnc(f"p{b.team_id}", b.id)
+        host, port = await screen.ensure_vnc(home.sandbox_key(b), b.id)
     except HTTPException as e:
         await ws.close(code=4400 + (e.status_code % 100), reason=e.detail[:80])
         return
@@ -854,7 +902,7 @@ async def vnc_http(bot_id: int, path: str, user: User = Depends(current_user)):
         raise HTTPException(404, "use the websocket")
     b = _screen_bot(bot_id, user)
     try:
-        host, port = await screen.ensure_vnc(f"p{b.team_id}", b.id)
+        host, port = await screen.ensure_vnc(home.sandbox_key(b), b.id)
     except Exception as e:  # noqa: BLE001
         raise HTTPException(503, f"interactive screen not available: {e}") from e
     url = f"http://{host}:{port}/{path}"
@@ -885,6 +933,8 @@ class ChannelIn(BaseModel):
 
 def _add_bot_to_team_channels(s, bot: Bot) -> None:
     """Add a newly created bot to every existing channel in its project. Not used on startup."""
+    if bot.is_home or not bot.team_id:
+        return
     for ch in s.exec(select(Conversation).where(Conversation.team_id == bot.team_id,
                                                 Conversation.kind == "channel")).all():
         if not s.exec(select(ChannelMember).where(ChannelMember.conversation_id == ch.id,
@@ -901,7 +951,7 @@ def _add_members(s, conv: Conversation, user: User, user_ids: list[int], bot_ids
         if team_role(s, uid, conv.team_id):
             s.add(ChannelMember(conversation_id=conv.id, user_id=uid))
     if all_team_bots:
-        bot_ids = list(bot_ids) + [b.id for b in s.exec(select(Bot).where(Bot.team_id == conv.team_id)).all()]
+        bot_ids = list(bot_ids) + [b.id for b in s.exec(select(Bot).where(Bot.team_id == conv.team_id, Bot.is_home == False)).all()]  # noqa: E712
     for bid in set(bot_ids) - have_b:
         b = s.get(Bot, bid)
         # Auto-adding every project bot (channel create) skips the manage check; a manual add still needs it.
@@ -1028,7 +1078,7 @@ async def send_message(conv_id: int, body: MessageIn, user: User = Depends(curre
         conv = _conv(s, conv_id, user)
         _need(conv.kind != "feed", 400, "the activity feed is written by the bot only")
         # Only someone who manages a bot may learn that a typed value equals one of its secrets.
-        bot_ids = [conv.bot_id] if conv.kind == "dm" else [m.bot_id for m in s.exec(select(ChannelMember).where(
+        bot_ids = [conv.bot_id] if conv.kind in ("dm", "home") else [m.bot_id for m in s.exec(select(ChannelMember).where(
             ChannelMember.conversation_id == conv_id, ChannelMember.bot_id != None)).all()]  # noqa: E711
         managed = [i for i in bot_ids if (b := s.get(Bot, i)) and can_manage(s, user.id, b)]
     if not body.allow_secret:

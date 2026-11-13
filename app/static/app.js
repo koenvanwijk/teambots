@@ -27,7 +27,8 @@ const ICONS = {
   users: 'M9 11a3.5 3.5 0 1 0 0-7 3.5 3.5 0 0 0 0 7zM2.5 20a6.5 6.5 0 0 1 13 0M16 4.2a3.5 3.5 0 0 1 0 6.6M18 14.5a6.5 6.5 0 0 1 3.5 5.5',
   out: 'M9 4H5v16h4M15 8l4 4-4 4M19 12H9', sun: 'M12 16a4 4 0 1 0 0-8 4 4 0 0 0 0 8zM12 2v2M12 20v2M2 12h2M20 12h2M5 5l1.5 1.5M17.5 17.5L19 19M5 19l1.5-1.5M17.5 6.5L19 5',
   term: 'M4 5h16v14H4zM8 10l3 2.5L8 15M13 15h3', file: 'M7 3h7l4 4v14H7zM14 3v4h4', key: 'M8 15a4 4 0 1 0 0-8 4 4 0 0 0 0 8zM12 11h9M18 11v3M15 11v2',
-  zap: 'M13 3L5 13h6l-1 8 8-10h-6z', grid: 'M4 4h7v7H4zM13 4h7v7h-7zM4 13h7v7H4zM13 13h7v7h-7z', trash: 'M5 7h14M10 7V4h4v3M7 7l1 13h8l1-13',
+  zap: 'M13 3L5 13h6l-1 8 8-10h-6z', grid: 'M4 4h7v7H4zM13 4h7v7h-7zM4 13h7v7H4zM13 13h7v7h-7z',
+  home: 'M4 11l8-7 8 7v9H15v-6h-6v6H4z', trash: 'M5 7h14M10 7V4h4v3M7 7l1 13h8l1-13',
   play: 'M8 5l11 7-11 7z', clock: 'M12 21a9 9 0 1 0 0-18 9 9 0 0 0 0 18zM12 7v5l3 2', screen: 'M3 5h18v11H3zM9 20h6M12 16v4',
   globe: 'M12 21a9 9 0 1 0 0-18 9 9 0 0 0 0 18zM3 12h18M12 3c3 3 3 15 0 18M12 3c-3 3-3 15 0 18', book: 'M5 4h13v16H7a2 2 0 0 1-2-2zM5 18a2 2 0 0 1 2-2h11',
   lock: 'M6 11h12v9H6zM9 11V8a3 3 0 0 1 6 0v3', edit: 'M4 20h4L19 9l-4-4L4 16zM13 7l4 4', stop: 'M7 7h10v10H7z', menu: 'M4 7h16M4 12h16M4 17h16', dots: 'M5 12h.01M12 12h.01M19 12h.01', pause: 'M9 6v12M15 6v12',
@@ -169,9 +170,12 @@ async function boot() {
   el('view').addEventListener('scroll', updateJump, { passive: true });
   el('col').addEventListener('click', e => { const s = e.target.closest('summary'); if (s) s.parentElement.dataset.user = s.parentElement.open ? '0' : '1'; });
   await loadTeam();
+  if (store.get('tb_last_home') === '1') {
+    try { return await openOverview(); } catch { /* fall through */ }
+  }
   const last = S.team && store.get('tb_last_' + S.team.id), [kind, id] = (last || '').split(':');
   const bot = S.bots.find(b => b.id === +id), ch = S.channels.find(c => c.id === +id);
-  try { if (kind === 'dm' && bot) return await openBot(bot); if (kind === 'feed' && bot) return await openFeed(bot); if (kind === 'ch' && ch) return await openConv(ch, null); } catch { /* fall through to home */ }
+  try { if (kind === 'dm' && bot) return await openBot(bot); if (kind === 'feed' && bot) return await openFeed(bot); if (kind === 'ch' && ch) return await openConv(ch, null); } catch { /* fall through to projects */ }
   await showHome();
 }
 async function loadTeam() {
@@ -210,7 +214,8 @@ function renderSide() {
   side.replaceChildren(
     $('div', { className: 'brand' }, logo(), $('strong', { textContent: 'TeamBots' }), ib('side', 'Hide sidebar', toggleSide)),
     $('button', { className: 'nav', onclick: openPalette }, icon('search'), $('span', { className: 'grow', textContent: 'Search' }), $('kbd', { textContent: 'Ctrl K' })),
-    $('button', { className: 'nav' + (c ? '' : ' on'), onclick: guard(showHome) }, icon('grid'), $('span', { className: 'grow', textContent: 'Home' })),
+    $('button', { className: 'nav' + (c && c.kind === 'home' ? ' on' : ''), onclick: guard(openOverview) }, icon('home'), $('span', { className: 'grow', textContent: 'Overview' })),
+    $('button', { className: 'nav' + (!c ? ' on' : ''), onclick: guard(showHome) }, icon('grid'), $('span', { className: 'grow', textContent: 'Projects' })),
     $('button', { className: 'project', title: 'Switch project', onclick: e => projectMenu(e.currentTarget) }, $('span', { className: 'pname' }, $('small', { textContent: t ? (t.client || 'Project') : 'No project yet' }), $('b', { textContent: t ? t.name : 'Create a project' })), icon('chev', 16)),
     list,
     $('button', { className: 'me', onclick: e => userMenu(e.currentTarget) }, avatar(S.me.display_name), $('span', { className: 'grow', textContent: S.me.display_name }), icon('dots', 16)));
@@ -230,7 +235,36 @@ function userMenu(anchor) {
     ...['system', 'dark', 'light'].map(v => ({ icon: 'sun', label: v[0].toUpperCase() + v.slice(1), checked: cur === v, onclick: set(v) })),
     { sep: true }, { icon: 'term', label: 'Show what bots do in detail', hint: S.details ? 'on' : 'off', checked: S.details, onclick: () => { S.details = !S.details; store.set('tb_details', S.details ? '1' : null); for (const d of document.querySelectorAll('#col details[data-user]')) delete d.dataset.user; if (S.conv) renderConv(); } },
     S.install && { icon: 'down', label: 'Install TeamBots as an app', onclick: async () => { const ev = S.install; S.install = null; ev.prompt(); await ev.userChoice.catch(() => null); } },
+    { sep: true }, { icon: 'key', label: 'API tokens for voice', onclick: guard(tokenDialog) },
     { sep: true }, { icon: 'out', label: 'Sign out', onclick: signOut }]);
+}
+async function tokenDialog() {
+  let d;
+  const again = guard(async () => { if (d) d.close(); await tokenDialog(); });
+  const rows = await api('GET', '/tokens');
+  const item = r => {
+    const when = r.created_at ? new Date(r.created_at).toLocaleString() : '';
+    const used = r.last_used_at ? 'Last used ' + new Date(r.last_used_at).toLocaleString() : 'Not used yet';
+    return $('div', { className: 'field', style: 'margin:10px 0' },
+      $('span', {}, r.name + (r.revoked ? ' (revoked)' : ''), $('small', { textContent: r.prefix + '… · ' + r.scope + ' · created ' + when + ' · ' + used })),
+      r.revoked ? null : $('button', { className: 'btn sm danger', textContent: 'Revoke', onclick: guard(async () => {
+        if (!await confirmBox({ title: 'Revoke this token?', text: 'Anything using it (Grok Bot voice, a Tesla, a script) will stop working.', ok: 'Revoke', danger: true })) return;
+        await api('DELETE', '/tokens/' + r.id); again();
+      })}));
+  };
+  d = openDialog('wide', $('div', { className: 'pad' },
+    $('h2', { textContent: 'API tokens for voice' }),
+    $('p', { className: 'intro', textContent: 'Create a token after you have signed in, then paste it into Grok Bot voice or a Tesla voice agent as a Bearer token. It can only talk to your Overview bot. The secret is shown once.' }),
+    rows.length ? rows.map(item) : $('p', { className: 'intro', textContent: 'No tokens yet.' }),
+    $('div', { className: 'dfoot' },
+      $('button', { className: 'btn primary', textContent: 'New token', onclick: guard(async () => {
+        const r = await form({ title: 'New API token', ok: 'Create token', intro: 'Give it a name you will recognise, for example “Tesla” or “Grok voice”.', fields: [{ name: 'name', label: 'Name', required: true, value: 'Voice' }],
+          onSubmit: v => api('POST', '/tokens', { name: v.name, scope: 'home-bot' }) });
+        if (!r || !r.token) return;
+        await form({ title: 'Copy this token now', ok: 'I have copied it', intro: 'This is the only time the full token is shown. Store it in the voice assistant. If you lose it, revoke it and create a new one.', fields: [{ name: 'token', label: 'Token', value: r.token, mono: true }] });
+        again();
+      }) }),
+      $('button', { className: 'btn', textContent: 'Done', onclick: () => d.close() }))));
 }
 // ---------- renaming
 async function renameBot(b) {
@@ -285,6 +319,7 @@ function projectDialog() {
 // ---------------------------------------------------------------- home
 const topLead = () => sideHidden() ? [ib('menu', 'Show sidebar', toggleSide)] : [];
 async function showHome() {
+  store.set('tb_last_home', null);
   stopConv(); closeDrawer(); S.conv = null; S.bot = null; if (S.team) store.set('tb_last_' + S.team.id, null);
   renderSide(); afterNav(); renderTop();
   const h = new Date().getHours(), col = el('col');
@@ -361,10 +396,19 @@ async function newChannel() {
 function stopConv() { if (S.es) { S.es.close(); S.es = null; } S.dockSync = null; clearInterval(S.screenTimer); }
 const openBot = async b => openConv(await api('POST', `/bots/${b.id}/dm`), b);
 const openFeed = async b => openConv(await api('GET', `/bots/${b.id}/feed`), b);
+async function openOverview() {
+  const h = await api('GET', '/home');
+  S.home = h;
+  await openConv(h.conversation, h.bot);
+}
 async function openConv(conv, bot) {
   stopConv(); closeDrawer(); afterNav();
   Object.assign(S, { conv, bot: bot || null, msgs: [], approvals: [], state: IDLE, dockSync: null, ctx: { skills: [], secrets: [], mem: null }, first: true, chain: null });
-  store.set('tb_last_' + conv.team_id, (conv.kind === 'channel' ? 'ch:' + conv.id : conv.kind + ':' + conv.bot_id));
+  if (conv.kind === 'home') store.set('tb_last_home', '1');
+  else {
+    store.set('tb_last_home', null);
+    store.set('tb_last_' + conv.team_id, (conv.kind === 'channel' ? 'ch:' + conv.id : conv.kind + ':' + conv.bot_id));
+  }
   renderSide(); renderTop(); el('col').replaceChildren(); el('dock').replaceChildren(); el('stage').classList.remove('hero');
   await loadCtx(conv); if (S.conv !== conv) return;
   renderTop(); renderDock();
@@ -395,15 +439,16 @@ async function doRefresh() {
 function renderTop() {
   const top = el('top'); if (!top) return;
   const c = S.conv, lead = topLead();
-  if (!c) return fill(top, ...lead, $('span', { className: 'title', textContent: 'Home' }), $('span', { className: 'grow' }), $('button', { className: 'btn sm', onclick: openPalette }, icon('search', 15), 'Search'));
+  if (!c) return fill(top, ...lead, $('span', { className: 'title', textContent: 'Projects' }), $('span', { className: 'grow' }), $('button', { className: 'btn sm', onclick: openPalette }, icon('search', 15), 'Search'));
   if (c.kind === 'feed') return fill(top, ...lead, icon('pulse'), $('span', { className: 'title', textContent: c.name }), $('span', { className: 'sub grow', textContent: 'Short summaries of finished tasks. The private chats stay private.' }));
-  if (c.kind === 'dm') {
-    const b = S.bot, shared = b && b.is_team && b.published;
+  if (c.kind === 'dm' || c.kind === 'home') {
+    const b = S.bot, shared = b && b.is_team && b.published && c.kind === 'dm';
     const cb = $('input', { type: 'checkbox', checked: c.share_activity, onchange: guard(async () => { Object.assign(c, await api('PATCH', `/conversations/${c.id}`, { share_activity: cb.checked })); toast(cb.checked ? 'Task summaries go to the activity feed' : 'Nothing from this chat is shared'); }) });
     const canRename = b && b.role !== 'collaborator';
     return fill(top, ...lead, avatar(c.name, 'bot'), $(canRename ? 'button' : 'span', { className: 'title', textContent: c.name, title: canRename ? 'Rename' : '', onclick: canRename ? guard(() => renameBot(b)) : null }), b && $('span', { className: 'sub', textContent: '@' + b.handle }),
       $('span', { className: 'pill hidesm', title: 'Only you can read this chat. Not even the owner of the bot can.' }, icon('lock', 12), 'Private'), $('span', { className: 'grow' }),
       shared && $('label', { className: 'switch hidesm', title: 'When on, a short summary of each finished task is posted to the shared activity feed. The chat itself is never shared.' }, cb, 'Share summaries'),
+      b && b.computer_use && $('button', { className: 'btn sm', title: 'Interactive screen with mouse and keyboard', onclick: () => window.open(withToken(`/bots/${b.id}/screen/vnc/`), '_blank', 'noopener') }, icon('screen', 15), 'Open scherm'),
       b && ib('sliders', 'Bot settings', () => el('drawer').classList.contains('open') ? closeDrawer() : openDrawer(b)));
   }
   const m = S.ctx.mem, people = m ? m.users.map(u => u.display_name).join(', ') + (m.bots.length ? ' · ' + m.bots.map(b => '@' + b.handle + (b.mention_only ? ' (mention only)' : '')).join(' ') : '') : '';
@@ -437,7 +482,7 @@ async function channelMembers() {
 
 // ---------- messages
 const TOOLS = { run_command: ['term', 'Run command'], write_file: ['file', 'Write file'], read_file: ['file', 'Read file'], http_request: ['globe', 'HTTP request'], remember: ['book', 'Remember'], forget: ['book', 'Forget'],
-  save_skill: ['zap', 'Save skill'], use_skill: ['zap', 'Use skill'], ask_bot: ['bot', 'Ask another bot'], create_routine: ['clock', 'Create routine'] };
+  save_skill: ['zap', 'Save skill'], use_skill: ['zap', 'Use skill'], ask_bot: ['bot', 'Ask another bot'], create_routine: ['clock', 'Create routine'], list_workspace: ['grid', 'List projects'], get_overview: ['home', 'Overview'], read_messages: ['book', 'Read messages'], post_to_channel: ['hash', 'Post to channel'] };
 function toolInfo(name) {
   if (TOOLS[name]) return TOOLS[name];
   if (name.startsWith('screen_')) return ['screen', 'Screen: ' + name.slice(7)];
@@ -626,15 +671,18 @@ function mentionItems() {
   }
   for (const k of S.ctx.skills) add('Skills', 'zap', k.name, (k.of ? `@${k.of} · ` : '') + (k.description || 'Saved steps for a task'), '@skill:' + quote(k.name));
   if (!ch) for (const b of S.bots) if (b.id !== c.bot_id) add('Other bots', 'bot', b.name, 'Hand over part of the task', '@' + b.handle);
-  for (const f of S.files.team === c.team_id ? S.files.list : []) { const cut = f.lastIndexOf('/'); add('Files on the project computer', 'file', f.slice(cut + 1), cut > 0 ? f.slice(0, cut) : 'workspace', '@file:' + quote(f)); }
+  for (const f of S.files.team === c.team_id ? S.files.list : []) { const cut = f.lastIndexOf('/'); add(c.kind === 'home' ? 'Files on your Overview computer' : 'Files on the project computer', 'file', f.slice(cut + 1), cut > 0 ? f.slice(0, cut) : 'workspace', '@file:' + quote(f)); }
   if (!ch) for (const m of S.members) if (m.user_id !== S.me.id) add('People', 'user', m.display_name, 'Mention a teammate', '@' + m.username);
   for (const s of S.ctx.secrets) add('Secrets', 'key', s.name, s.hosts ? 'Only sent to ' + s.hosts : 'No host bound yet', `{{secret:${s.name}}}`);
   return items;
 }
 async function loadFiles(then) {
-  const team = S.conv.team_id; if (S.files.team === team && Date.now() - S.files.at < 20e3) return;
+  const team = S.conv.kind === 'home' ? 'home' : S.conv.team_id; if (S.files.team === team && Date.now() - S.files.at < 20e3) return;
   S.files = { team, at: Date.now(), list: S.files.team === team ? S.files.list : [] };
-  try { const list = await api('GET', `/teams/${team}/files`); if (S.files.team === team) { S.files.list = list; then(); } } catch { /* the menu works without files */ }
+  try {
+    const list = await api('GET', S.conv.kind === 'home' ? '/home/files' : `/teams/${team}/files`);
+    if (S.files.team === team) { S.files.list = list; then(); }
+  } catch { /* the menu works without files */ }
 }
 function renderDock() {
   const c = S.conv, dock = el('dock');
@@ -770,16 +818,24 @@ async function openDrawer(bot, tab = 'setup') {
   if (tab === 'setup') {
     if (!manage) { put(body, head('Instructions'), $('p', { className: 'hint', style: 'white-space:pre-wrap', textContent: bot.instructions || 'No instructions written.' }), hint('Only the owner and managers can change this bot.')); return; }
     const ins = $('textarea', { rows: 9, value: bot.instructions, placeholder: 'What this bot does and how it should behave.' }), model = $('input', { value: bot.model, placeholder: 'Empty = the default model of the endpoint', className: 'mono' });
-    const name = $('input', { value: bot.name }), ep = $('select', {}, S.endpoints.map(e => $('option', { value: e.id, textContent: `${e.name} · ${e.default_model}`, selected: e.id === bot.endpoint_id })));
-    if (!S.endpoints.some(e => e.id === bot.endpoint_id)) ep.prepend($('option', { value: bot.endpoint_id, textContent: 'Endpoint of another member', selected: true }));
+    const eps = (bot.is_home && S.home && S.home.endpoints) ? S.home.endpoints : S.endpoints;
+    const name = $('input', { value: bot.name }), ep = $('select', {}, (eps || []).map(e => $('option', { value: e.id, textContent: `${e.name}${e.project ? ' (' + e.project + ')' : ''} · ${e.default_model}`, selected: e.id === bot.endpoint_id })));
+    if (!(eps || []).some(e => e.id === bot.endpoint_id)) ep.prepend($('option', { value: bot.endpoint_id, textContent: 'Endpoint of another member', selected: true }));
     const mode = $('select', {}, $('option', { value: 'ask', textContent: 'Ask before risky actions', selected: bot.approval_mode === 'ask' }), $('option', { value: 'auto', textContent: 'Run everything without asking', selected: bot.approval_mode === 'auto' }));
     const cu = $('input', { type: 'checkbox', checked: bot.computer_use }), fld = (label, input, small) => $('label', { className: 'field' }, $('span', { textContent: label }), input, small && $('small', { textContent: small }));
     put(body, fld('Name', name), fld('Instructions', ins), fld('Model endpoint', ep), fld('Model override', model), fld('Approvals', mode, 'Risky: shell commands, writing files, HTTP requests, routines, untrusted MCP tools and acting on the screen.'),
       $('label', { className: 'check' }, cu, $('span', {}, 'Own screen and computer use', $('small', { textContent: 'A virtual screen with a browser. Needs a model with image input and the Docker sandbox.' }))),
       $('div', { className: 'rowbtns' }, $('button', { className: 'btn primary', textContent: 'Save', onclick: guard(async () => {
-        const data = { name: name.value.trim() || bot.name, instructions: ins.value, model: model.value.trim(), approval_mode: mode.value, computer_use: cu.checked }; if (+ep.value !== bot.endpoint_id) data.endpoint_id = +ep.value;
-        Object.assign(bot, await api('PATCH', `/bots/${bot.id}`, data)); if (S.conv && S.conv.kind === 'dm' && S.conv.bot_id === bot.id) S.conv.name = bot.name; renderSide(); renderTop(); toast('Saved'); again(); }) }),
-        bot.role === 'owner' && $('button', { className: 'btn danger', textContent: 'Delete bot', onclick: guard(async () => { if (!await confirmBox({ title: `Delete ${bot.name}?`, text: 'The bot is removed for everyone, with all its chats, memory, skills and routines. This cannot be undone.', ok: 'Delete bot', danger: true })) return; await api('DELETE', `/bots/${bot.id}`); store.set('tb_last_' + bot.team_id, null); await boot(); }) })));
+        if (bot.is_home) {
+          const body = { model: model.value.trim(), computer_use: cu.checked }; if (+ep.value !== bot.endpoint_id) body.endpoint_id = +ep.value;
+          const h = await api('PATCH', '/home', body); Object.assign(bot, h.bot); S.home = h;
+          Object.assign(bot, await api('PATCH', `/bots/${bot.id}`, { name: name.value.trim() || bot.name, instructions: ins.value, approval_mode: mode.value }));
+        } else {
+          const data = { name: name.value.trim() || bot.name, instructions: ins.value, model: model.value.trim(), approval_mode: mode.value, computer_use: cu.checked }; if (+ep.value !== bot.endpoint_id) data.endpoint_id = +ep.value;
+          Object.assign(bot, await api('PATCH', `/bots/${bot.id}`, data));
+        }
+        if (S.conv && (S.conv.kind === 'dm' || S.conv.kind === 'home') && S.conv.bot_id === bot.id) S.conv.name = bot.name; renderSide(); renderTop(); toast('Saved'); again(); }) }),
+        bot.role === 'owner' && !bot.is_home && $('button', { className: 'btn danger', textContent: 'Delete bot', onclick: guard(async () => { if (!await confirmBox({ title: `Delete ${bot.name}?`, text: 'The bot is removed for everyone, with all its chats, memory, skills and routines. This cannot be undone.', ok: 'Delete bot', danger: true })) return; await api('DELETE', `/bots/${bot.id}`); store.set('tb_last_' + bot.team_id, null); await boot(); }) })));
   }
   if (tab === 'sharing') {
     const sh = await get('share'), pub = $('input', { type: 'checkbox', checked: sh.published });

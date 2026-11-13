@@ -67,10 +67,13 @@ class Ctx:
     is_channel: bool
     depth: int = 0
     team_id: int = 0
+    is_home: bool = False
 
     @property
     def sandbox_key(self) -> str:
-        return f"p{self.team_id}"  # one computer per project
+        if self.is_home:
+            return f"home-u{self.requester_id}"
+        return f"p{self.team_id}"
 
 
 # ---------------------------------------------------------------- tool definitions
@@ -105,9 +108,12 @@ BUILTIN_TOOLS = [
     _fn("write_file", "Write a text file in the workspace (path relative to the workspace).",
         {"path": {"type": "string"}, "content": {"type": "string"}}, ["path", "content"]),
     _fn("read_file", "Read a text file from the workspace.", {"path": {"type": "string"}}, ["path"]),
-    _fn("ask_bot", "Hand a sub-task to another bot and get its answer back.",
+    _fn("ask_bot", "Hand a sub-task to another bot and get its answer back. If the same @handle "
+        "exists in more than one project, also pass project (the project name or id).",
         {"handle": {"type": "string", "description": "the other bot's @handle, without @"},
-         "message": {"type": "string"}}, ["handle", "message"]),
+         "message": {"type": "string"},
+         "project": {"type": "string", "description": "project name or id, if the handle is ambiguous"}},
+        ["handle", "message"]),
     _fn("create_routine", "Schedule a recurring task in this conversation. cron is a 5-field crontab "
         "expression in the server's time zone.", {"name": {"type": "string"}, "cron": {"type": "string"},
                                                   "prompt": {"type": "string"}}, ["name", "cron", "prompt"]),
@@ -128,6 +134,25 @@ SCREEN_TOOLS = [
 ]
 
 
+HOME_TOOLS = [
+    _fn("list_workspace", "List every project, bot and channel the person can access, with handles and ids.",
+        {}, []),
+    _fn("get_overview", "Summary of projects, pending approvals, bots that are working, and recent activity.",
+        {}, []),
+    _fn("read_messages", "Read recent messages in a chat the person can access: pass conversation_id, "
+        "or a channel name (and project if needed), or a bot @handle for their private chat with it.",
+        {"conversation_id": {"type": "integer"},
+         "project": {"type": "string"},
+         "channel": {"type": "string"},
+         "handle": {"type": "string"},
+         "limit": {"type": "integer"}}, []),
+    _fn("post_to_channel", "Post a message in a channel the person is a member of, as that person. "
+        "Channel bots may reply in the channel. Pass project if the channel name exists more than once.",
+        {"channel": {"type": "string"}, "content": {"type": "string"}, "project": {"type": "string"}},
+        ["channel", "content"]),
+]
+
+
 def rule_key(name: str) -> str:
     """Acting on the screen is approved as one group, so 'Always allow' covers click, type and keys."""
     return "screen" if name.startswith("screen_") else name
@@ -136,6 +161,8 @@ def rule_key(name: str) -> str:
 async def build_tools(bot: Bot, ctx: Ctx) -> tuple[list[dict], dict[str, tuple[McpServer, str]]]:
     """Built-in tools plus the tools of every MCP server attached to the bot."""
     specs = [t for t in BUILTIN_TOOLS if not (ctx.depth > 0 and t["function"]["name"] in ("ask_bot", "create_routine"))]
+    if bot.is_home and ctx.depth == 0:
+        specs = specs + HOME_TOOLS
     if bot.computer_use and ctx.depth == 0:
         specs = specs + SCREEN_TOOLS
     mcp_map: dict[str, tuple[McpServer, str]] = {}
@@ -213,6 +240,9 @@ async def _execute(ctx: Ctx, name: str, args: dict, mcp_map: dict) -> str:
     if name == "http_request":
         return await secrets_http.http_request(ctx.bot_id, args["method"], args["url"], args.get("headers"),
                                                args.get("body") or "")
+    if name in ("list_workspace", "get_overview", "read_messages", "post_to_channel"):
+        from . import home as home_mod
+        return home_mod.execute_home_tool(ctx.requester_id, name, args)
     if name == "run_command":
         return await sandbox.run_command(ctx.sandbox_key, args["command"], None, float(args.get("timeout") or 60))
     if name == "write_file":
@@ -272,17 +302,27 @@ async def _execute(ctx: Ctx, name: str, args: dict, mcp_map: dict) -> str:
         if name == "ask_bot":
             if ctx.depth >= 1:
                 return "error: a bot that was handed a task cannot hand it on again"
-            target = s.exec(select(Bot).where(Bot.team_id == bot.team_id,
-                                              Bot.handle == args["handle"].lstrip("@"))).first()
-            if not target or target.id == bot.id or bot_role(s, ctx.requester_id, target) is None:
+            handle = args["handle"].lstrip("@")
+            if bot.is_home:
+                from . import home as home_mod
+                user = s.get(User, ctx.requester_id)
+                resolved = home_mod.resolve_bot(s, user, handle, args.get("project"))
+                if isinstance(resolved, str):
+                    return resolved
+                target = resolved
+            else:
+                target = s.exec(select(Bot).where(Bot.team_id == bot.team_id, Bot.handle == handle)).first()
+                if not target or target.id == bot.id or bot_role(s, ctx.requester_id, target) is None:
+                    return "error: no such bot, or the person you are working for has no access to it"
+            if target.id == bot.id:
                 return "error: no such bot, or the person you are working for has no access to it"
             if ctx.is_channel and not s.exec(select(ChannelMember).where(
                     ChannelMember.conversation_id == ctx.conv_id, ChannelMember.bot_id == target.id)).first():
                 return "error: that bot is not a member of this channel"
-            target_id = target.id
+            target_id, target_team, target_home = target.id, target.team_id, bool(target.is_home)
     if name == "ask_bot":
         sub = Ctx(bot_id=target_id, requester_id=ctx.requester_id, conv_id=ctx.conv_id,
-                  is_channel=ctx.is_channel, depth=ctx.depth + 1, team_id=ctx.team_id)
+                  is_channel=ctx.is_channel, depth=ctx.depth + 1, team_id=target_team, is_home=target_home)
         return await run_subagent(sub, args["message"], asked_by=bot.name)
     return f"error: unknown tool {name}"
 
@@ -296,16 +336,38 @@ def system_prompt(bot: Bot, conv: Conversation, user: User, ctx: Ctx) -> str:
         personal = [] if ctx.is_channel else s.exec(select(Memory).where(
             Memory.bot_id == bot.id, Memory.scope == "personal", Memory.user_id == user.id)).all()
         skills = s.exec(select(Skill).where(Skill.bot_id == bot.id)).all()
-        others = [b for b in s.exec(select(Bot).where(Bot.team_id == bot.team_id)).all()
-                  if b.id != bot.id and bot_role(s, user.id, b)]
+        if bot.is_home:
+            from . import home as home_mod
+            others = []
+            other_lines = []
+            for b, team in home_mod.accessible_bots(s, user):
+                others.append(b)
+                first = b.instructions.strip().splitlines()[0][:120] if b.instructions.strip() else ""
+                other_lines.append(f"- @{b.handle} in {team.name}: {b.name}. {first}")
+        else:
+            others = [b for b in s.exec(select(Bot).where(Bot.team_id == bot.team_id)).all()
+                      if b.id != bot.id and bot_role(s, user.id, b)]
+            other_lines = [
+                f"- @{b.handle}: {b.name}. {b.instructions.strip().splitlines()[0][:120] if b.instructions.strip() else ''}"
+                for b in others]
     secret_rows = secrets_http.load(bot.id)
     when = datetime.now(ZoneInfo(config.TIMEZONE)).strftime("%A %Y-%m-%d %H:%M %Z")
     parts = [f"You are {bot.name} (@{bot.handle}), an AI teammate with your own computer.", bot.instructions.strip(),
              f"Current time: {when}."]
+    if bot.is_home:
+        parts.append("You are the overview assistant. Your computer is private to this person and is not a "
+                     "project workspace. Use list_workspace or get_overview for a picture of their projects, "
+                     "ask_bot to talk to a project bot (pass project if a handle is shared), "
+                     "read_messages to look at a chat, and post_to_channel only when asked to post.")
+        from . import home as home_mod
+        if home_mod.reply_style.get() == "voice":
+            parts.append(home_mod.VOICE_STYLE)
     if ctx.is_channel:
         parts.append(f"You are in the shared channel #{conv.name}. Messages are prefixed with the speaker's "
                      f"name. You were addressed by {user.display_name} and act on their behalf. Everyone in the "
                      "channel reads your reply, so do not reveal private information.")
+    elif bot.is_home:
+        parts.append(f"You are in a private overview chat with {user.display_name}.")
     else:
         parts.append(f"You are in a private chat with {user.display_name}.")
     parts.append("Work through tools rather than guessing. Use `remember` for durable facts and preferences, "
@@ -334,9 +396,7 @@ def system_prompt(bot: Bot, conv: Conversation, user: User, ctx: Ctx) -> str:
     if skills:
         parts.append("## Skills\n" + "\n".join(f"- {k.name}: {k.description}" for k in skills))
     if others and ctx.depth == 0:
-        parts.append("## Other bots (ask_bot)\n" + "\n".join(
-            f"- @{b.handle}: {b.name}. {b.instructions.strip().splitlines()[0][:120] if b.instructions.strip() else ''}"
-            for b in others))
+        parts.append("## Other bots (ask_bot)\n" + "\n".join(other_lines))
     return "\n\n".join(p for p in parts if p)
 
 
@@ -511,7 +571,7 @@ async def _run_locked(conv_id: int, bot_id: int, requester_id: int, run: Run | N
                             .order_by(Message.id.desc())).first() or 0
         if run:  # steering messages that came in since the last step are read from here on
             run.steers.update({i: newest for i, after in run.steers.items() if after is None})
-        ctx = Ctx(bot_id, requester_id, conv_id, conv.kind == "channel", team_id=conv.team_id)
+        ctx = Ctx(bot_id, requester_id, conv_id, conv.kind == "channel", team_id=bot.team_id, is_home=bot.is_home)
         specs, mcp_map = await build_tools(bot, ctx)
         messages = [{"role": "system", "content": system_prompt(bot, conv, user, ctx)}] + build_history(conv, bot, run=run)
         common = dict(author_bot_id=bot_id, requester_id=requester_id)
@@ -659,7 +719,7 @@ async def resolve_approval(approval_id: int, user_id: int, allow: bool, always: 
             run = _runs[key] = Run(a.requester_id, asyncio.current_task())
         publish(a.conversation_id, "approval", id=a.id)
         try:
-            ctx = Ctx(a.bot_id, a.requester_id, a.conversation_id, conv.kind == "channel", team_id=conv.team_id)
+            ctx = Ctx(a.bot_id, a.requester_id, a.conversation_id, conv.kind == "channel", team_id=bot.team_id, is_home=bot.is_home)
             if allow:
                 _, mcp_map = await build_tools(bot, ctx)
                 result = await execute_tool(ctx, a.tool_name, json.loads(a.arguments), mcp_map)
@@ -770,7 +830,7 @@ def handle_user_message(conv_id: int, user_id: int, content: str, mode: str = "a
         conv = s.get(Conversation, conv_id)
         if conv.kind == "feed":
             raise ValueError("the activity feed is written by the bot only")
-        if conv.kind == "dm":
+        if conv.kind in ("dm", "home"):
             targets = [s.get(Bot, conv.bot_id)]
         else:
             handles = {h.lower() for h in re.findall(r"@([A-Za-z0-9_-]+)", content)}

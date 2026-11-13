@@ -1,7 +1,8 @@
 """The bot's computer: a persistent workspace with a shell.
 
-Sandbox key: "p<project id>". Every project (team) has exactly one computer, shared by all of
-its people and bots; nothing is shared between projects.
+Sandbox key: "p<project id>" for a project computer, or "home-u<user id>" for a person's
+overview bot. Project computers are shared by that project's people and bots; the overview
+sandbox is private to that person and is never a project volume.
 
 Backends:
   docker - one long-lived container plus a named volume per key (use this in production)
@@ -19,7 +20,7 @@ _lock = asyncio.Lock()
 
 
 def _safe_key(key: str) -> str:
-    if not re.fullmatch(r"[a-z0-9]+", key):
+    if not re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", key):
         raise ValueError("bad sandbox key")
     return key
 

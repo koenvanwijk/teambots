@@ -17,11 +17,27 @@ class User(SQLModel, table=True):
     username: str = Field(index=True, unique=True)
     display_name: str
     password_hash: str
+    home_endpoint_id: Optional[int] = None  # model endpoint for the overview bot
+    home_model: str = ""  # empty = endpoint default
 
 
 class AuthToken(SQLModel, table=True):
     token: str = Field(primary_key=True)
     user_id: int = Field(index=True)
+
+
+class ApiToken(SQLModel, table=True):
+    """Personal API token for the overview bot (voice / external agents). The raw token is shown
+    once at creation and only a hash is stored."""
+    id: Optional[int] = Field(default=None, primary_key=True)
+    user_id: int = Field(index=True)
+    name: str = ""
+    scope: str = "home-bot"
+    token_hash: str = Field(index=True, unique=True)
+    prefix: str = ""
+    created_at: datetime = Field(default_factory=now)
+    last_used_at: Optional[datetime] = None
+    revoked_at: Optional[datetime] = None
 
 
 class Team(SQLModel, table=True):
@@ -65,6 +81,7 @@ class Bot(SQLModel, table=True):
     access: str = "team"  # team | selected
     approval_mode: str = "ask"  # ask | auto
     computer_use: bool = False  # own screen + mouse/keyboard tools; needs a model with image input
+    is_home: bool = False  # per-user overview bot; not tied to a project (team_id is 0)
 
 
 class BotAccess(SQLModel, table=True):
@@ -77,7 +94,7 @@ class BotAccess(SQLModel, table=True):
 class Conversation(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
     team_id: int = Field(index=True)
-    kind: str  # dm | channel | feed (shared activity feed of one Team Bot)
+    kind: str  # dm | channel | feed | home (the per-user overview chat)
     name: str = ""
     share_activity: bool = True  # dm only: summaries of finished tasks go to the bot's feed
     user_id: Optional[int] = Field(default=None, index=True)  # dm only
@@ -192,7 +209,10 @@ engine = create_engine(config.DB_URL, connect_args=_connect_args)
 def init_db() -> None:
     SQLModel.metadata.create_all(engine)
     _ensure_channelmember_mention_only()
+    _ensure_home_columns()
     migrate_channel_bots()
+    from .home import migrate_home_bots
+    migrate_home_bots()
 
 
 def _ensure_channelmember_mention_only() -> None:
@@ -205,6 +225,22 @@ def _ensure_channelmember_mention_only() -> None:
             conn.exec_driver_sql(
                 "ALTER TABLE channelmember ADD COLUMN mention_only BOOLEAN NOT NULL DEFAULT 0")
             conn.commit()
+
+
+def _ensure_home_columns() -> None:
+    """Add User.home_* and Bot.is_home on databases created before those columns existed."""
+    if not config.DB_URL.startswith("sqlite"):
+        return
+    with engine.connect() as conn:
+        user_cols = [r[1] for r in conn.exec_driver_sql("PRAGMA table_info(user)").fetchall()]
+        if "home_endpoint_id" not in user_cols:
+            conn.exec_driver_sql("ALTER TABLE user ADD COLUMN home_endpoint_id INTEGER")
+        if "home_model" not in user_cols:
+            conn.exec_driver_sql("ALTER TABLE user ADD COLUMN home_model VARCHAR DEFAULT ''")
+        bot_cols = [r[1] for r in conn.exec_driver_sql("PRAGMA table_info(bot)").fetchall()]
+        if "is_home" not in bot_cols:
+            conn.exec_driver_sql("ALTER TABLE bot ADD COLUMN is_home BOOLEAN NOT NULL DEFAULT 0")
+        conn.commit()
 
 
 def _sqlite_path():
