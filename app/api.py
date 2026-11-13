@@ -1,0 +1,842 @@
+"""REST API. Every route checks permissions through app.access."""
+import asyncio
+import hashlib
+import json
+import re
+import secrets
+from typing import Optional
+
+from apscheduler.triggers.cron import CronTrigger
+from fastapi import APIRouter, Depends, Header, HTTPException, Query
+from fastapi.responses import FileResponse, Response, StreamingResponse
+from pydantic import BaseModel
+
+from . import agent, config, events, llm, mcp_client, routines, screen
+from .access import bot_role, can_manage, can_read_conversation, team_role
+from .db import (Approval, AuthToken, Bot, BotAccess, ChannelMember, Conversation, Endpoint, McpServer, Memory,
+                 Message, Routine, Secret, Skill, Team, TeamMember, User, select, session)
+
+router = APIRouter(prefix="/api")
+
+
+def _hash(password: str, salt: str) -> str:
+    return hashlib.pbkdf2_hmac("sha256", password.encode(), salt.encode(), 200_000).hex()
+
+
+def current_user(authorization: str = Header(default=""), token: str = Query(default="")) -> User:
+    tok = authorization.removeprefix("Bearer ").strip() or token
+    with session() as s:
+        row = s.get(AuthToken, tok) if tok else None
+        user = s.get(User, row.user_id) if row else None
+    if not user:
+        raise HTTPException(401, "not signed in")
+    return user
+
+
+def _need(cond, code=403, msg="not allowed"):
+    if not cond:
+        raise HTTPException(code, msg)
+
+
+def _bot(s, bot_id: int, user: User, manage: bool = False) -> Bot:
+    bot = s.get(Bot, bot_id)
+    _need(bot and bot_role(s, user.id, bot), 404, "bot not found")
+    if manage:
+        _need(can_manage(s, user.id, bot))
+    return bot
+
+
+def _bot_out(s, bot: Bot, user: User) -> dict:
+    return {**bot.model_dump(), "role": bot_role(s, user.id, bot)}
+
+
+# ---------------------------------------------------------------- auth and teams
+
+class Credentials(BaseModel):
+    username: str
+    password: str
+    display_name: str = ""
+
+
+@router.post("/register")
+def register(body: Credentials):
+    _need(re.fullmatch(r"[a-z0-9_.-]{2,32}", body.username), 400, "username: 2-32 chars of a-z 0-9 _ . -")
+    _need(len(body.password) >= 8, 400, "password needs at least 8 characters")
+    with session() as s:
+        _need(not s.exec(select(User).where(User.username == body.username)).first(), 409, "username is taken")
+        salt = secrets.token_hex(8)
+        u = User(username=body.username, display_name=body.display_name or body.username,
+                 password_hash=f"{salt}${_hash(body.password, salt)}")
+        s.add(u)
+        s.commit()
+    return login(body)
+
+
+@router.post("/login")
+def login(body: Credentials):
+    with session() as s:
+        u = s.exec(select(User).where(User.username == body.username)).first()
+        salt, _, digest = (u.password_hash if u else "x$x").partition("$")
+        _need(u and secrets.compare_digest(_hash(body.password, salt), digest), 401, "wrong username or password")
+        tok = secrets.token_urlsafe(32)
+        s.add(AuthToken(token=tok, user_id=u.id))
+        s.commit()
+    return {"token": tok, "user": {"id": u.id, "username": u.username, "display_name": u.display_name}}
+
+
+@router.get("/me")
+def me(user: User = Depends(current_user)):
+    return {"id": user.id, "username": user.username, "display_name": user.display_name}
+
+
+class TeamIn(BaseModel):
+    name: str  # the project
+    client: str = ""  # optional customer the project belongs to
+
+
+@router.post("/teams")
+def create_team(body: TeamIn, user: User = Depends(current_user)):
+    with session() as s:
+        t = Team(name=body.name, client=body.client.strip(), invite_code=secrets.token_urlsafe(8))
+        s.add(t)
+        s.commit()
+        s.add(TeamMember(team_id=t.id, user_id=user.id, role="admin"))
+        s.commit()
+    return {**t.model_dump(), "role": "admin"}
+
+
+class JoinIn(BaseModel):
+    invite_code: str
+
+
+@router.post("/teams/join")
+def join_team(body: JoinIn, user: User = Depends(current_user)):
+    with session() as s:
+        t = s.exec(select(Team).where(Team.invite_code == body.invite_code)).first()
+        _need(t, 404, "invalid invite code")
+        if not team_role(s, user.id, t.id):
+            s.add(TeamMember(team_id=t.id, user_id=user.id))
+            s.commit()
+    return {"id": t.id, "name": t.name}
+
+
+@router.get("/teams")
+def my_teams(user: User = Depends(current_user)):
+    with session() as s:
+        out = []
+        for m in s.exec(select(TeamMember).where(TeamMember.user_id == user.id)).all():
+            t = s.get(Team, m.team_id)
+            d = {"id": t.id, "name": t.name, "client": t.client, "role": m.role, "bot_sharing": t.bot_sharing}
+            if m.role == "admin":
+                d["invite_code"] = t.invite_code
+            out.append(d)
+    return out
+
+
+@router.get("/overview")
+def overview(user: User = Depends(current_user)):
+    """The layer above projects: every project this person is in, grouped by client in the UI,
+    with its bots and the latest shared activity."""
+    out = []
+    with session() as s:
+        for m in s.exec(select(TeamMember).where(TeamMember.user_id == user.id)).all():
+            t = s.get(Team, m.team_id)
+            bots = [b for b in s.exec(select(Bot).where(Bot.team_id == t.id)).all() if bot_role(s, user.id, b)]
+            feeds = {c.id: c.bot_id for c in s.exec(select(Conversation).where(
+                Conversation.team_id == t.id, Conversation.kind == "feed")).all()
+                if c.bot_id in {b.id for b in bots}}
+            recent = s.exec(select(Message).where(Message.conversation_id.in_(list(feeds) or [0]))
+                            .order_by(Message.id.desc()).limit(5)).all()
+            names = {b.id: b.name for b in bots}
+            out.append({"id": t.id, "name": t.name, "client": t.client, "role": m.role,
+                        "people": len(s.exec(select(TeamMember).where(TeamMember.team_id == t.id)).all()),
+                        "bots": [{"id": b.id, "name": b.name, "handle": b.handle} for b in bots],
+                        "activity": [{"bot": names.get(x.author_bot_id, "bot"), "content": x.content,
+                                      "at": x.created_at.isoformat()} for x in recent]})
+    return sorted(out, key=lambda p: (p["client"].lower(), p["name"].lower()))
+
+
+@router.get("/teams/{team_id}/members")
+def team_members(team_id: int, user: User = Depends(current_user)):
+    with session() as s:
+        _need(team_role(s, user.id, team_id))
+        rows = s.exec(select(TeamMember).where(TeamMember.team_id == team_id)).all()
+        return [{"user_id": m.user_id, "role": m.role, "display_name": s.get(User, m.user_id).display_name}
+                for m in rows]
+
+
+class TeamPatch(BaseModel):
+    bot_sharing: str
+
+
+@router.patch("/teams/{team_id}")
+def patch_team(team_id: int, body: TeamPatch, user: User = Depends(current_user)):
+    _need(body.bot_sharing in ("everyone", "admins"), 400, "bot_sharing: everyone | admins")
+    with session() as s:
+        _need(team_role(s, user.id, team_id) == "admin")
+        t = s.get(Team, team_id)
+        t.bot_sharing = body.bot_sharing
+        s.add(t)
+        s.commit()
+    return {"ok": True}
+
+
+# ---------------------------------------------------------------- endpoints
+
+class EndpointIn(BaseModel):
+    name: str
+    base_url: str
+    api_key: str = ""
+    default_model: str
+    shared: bool = False
+
+
+def _ep_out(e: Endpoint) -> dict:  # the key never leaves the server
+    return {"id": e.id, "name": e.name, "base_url": e.base_url, "default_model": e.default_model,
+            "shared": e.shared, "owner_id": e.owner_id, "has_key": bool(e.api_key_enc)}
+
+
+@router.get("/teams/{team_id}/endpoints")
+def list_endpoints(team_id: int, user: User = Depends(current_user)):
+    with session() as s:
+        _need(team_role(s, user.id, team_id))
+        rows = s.exec(select(Endpoint).where(Endpoint.team_id == team_id)).all()
+    return [_ep_out(e) for e in rows if e.shared or e.owner_id == user.id]
+
+
+@router.post("/teams/{team_id}/endpoints")
+def create_endpoint(team_id: int, body: EndpointIn, user: User = Depends(current_user)):
+    _need(body.base_url.startswith(("http://", "https://")), 400, "base_url must start with http:// or https://")
+    with session() as s:
+        _need(team_role(s, user.id, team_id))
+        e = Endpoint(team_id=team_id, owner_id=user.id, name=body.name, base_url=body.base_url.rstrip("/"),
+                     api_key_enc=config.encrypt(body.api_key), default_model=body.default_model, shared=body.shared)
+        s.add(e)
+        s.commit()
+    return _ep_out(e)
+
+
+@router.delete("/endpoints/{endpoint_id}")
+def delete_endpoint(endpoint_id: int, user: User = Depends(current_user)):
+    with session() as s:
+        e = s.get(Endpoint, endpoint_id)
+        _need(e and e.owner_id == user.id, 404, "endpoint not found")
+        _need(not s.exec(select(Bot).where(Bot.endpoint_id == e.id)).first(), 409, "endpoint is still used by a bot")
+        s.delete(e)
+        s.commit()
+    return {"ok": True}
+
+
+@router.post("/endpoints/{endpoint_id}/test")
+async def test_endpoint(endpoint_id: int, user: User = Depends(current_user)):
+    """Checks reachability and whether the model answers with a tool call."""
+    with session() as s:
+        e = s.get(Endpoint, endpoint_id)
+        _need(e and e.owner_id == user.id, 404, "endpoint not found")
+    tool = {"type": "function", "function": {"name": "ping", "description": "Call this tool.", "parameters": {
+        "type": "object", "properties": {"ok": {"type": "boolean"}}, "required": ["ok"]}}}
+    try:
+        reply = await llm.chat(e, "", [{"role": "user", "content": "Call the ping tool with ok=true."}], [tool])
+    except llm.LLMError as err:
+        return {"reachable": False, "tool_calling": False, "detail": str(err)}
+    return {"reachable": True, "tool_calling": bool(reply["tool_calls"]),
+            "detail": "ok" if reply["tool_calls"] else "the model answered in text instead of calling the tool"}
+
+
+# ---------------------------------------------------------------- bots and sharing
+
+class BotIn(BaseModel):
+    name: str
+    handle: str
+    instructions: str = ""
+    endpoint_id: int
+    model: str = ""
+    is_team: bool = False
+    approval_mode: str = "ask"
+    computer_use: bool = False
+
+
+class BotPatch(BaseModel):
+    computer_use: Optional[bool] = None
+    name: Optional[str] = None
+    instructions: Optional[str] = None
+    endpoint_id: Optional[int] = None
+    model: Optional[str] = None
+    approval_mode: Optional[str] = None
+
+
+def _usable_endpoint(s, endpoint_id: int, team_id: int, user: User) -> None:
+    e = s.get(Endpoint, endpoint_id)
+    _need(e and e.team_id == team_id and (e.shared or e.owner_id == user.id), 400, "endpoint not available")
+
+
+@router.get("/teams/{team_id}/bots")
+def list_bots(team_id: int, user: User = Depends(current_user)):
+    with session() as s:
+        _need(team_role(s, user.id, team_id))
+        rows = s.exec(select(Bot).where(Bot.team_id == team_id)).all()
+        return [_bot_out(s, b, user) for b in rows if bot_role(s, user.id, b)]
+
+
+@router.post("/teams/{team_id}/bots")
+def create_bot(team_id: int, body: BotIn, user: User = Depends(current_user)):
+    _need(re.fullmatch(r"[a-z0-9_-]{2,32}", body.handle), 400, "handle: 2-32 chars of a-z 0-9 _ -")
+    _need(body.approval_mode in ("ask", "auto"), 400, "approval_mode: ask | auto")
+    with session() as s:
+        _need(team_role(s, user.id, team_id))
+        _usable_endpoint(s, body.endpoint_id, team_id, user)
+        _need(not s.exec(select(Bot).where(Bot.team_id == team_id, Bot.handle == body.handle)).first(),
+              409, "handle is taken")
+        b = Bot(team_id=team_id, owner_id=user.id, **body.model_dump())
+        s.add(b)
+        s.commit()
+        return _bot_out(s, b, user)
+
+
+@router.patch("/bots/{bot_id}")
+def patch_bot(bot_id: int, body: BotPatch, user: User = Depends(current_user)):
+    with session() as s:
+        b = _bot(s, bot_id, user, manage=True)
+        data = body.model_dump(exclude_none=True)
+        if "endpoint_id" in data:
+            _usable_endpoint(s, data["endpoint_id"], b.team_id, user)
+        _need(data.get("approval_mode", "ask") in ("ask", "auto"), 400, "approval_mode: ask | auto")
+        for k, v in data.items():
+            setattr(b, k, v)
+        s.add(b)
+        s.commit()
+        return _bot_out(s, b, user)
+
+
+@router.delete("/bots/{bot_id}")
+async def delete_bot(bot_id: int, user: User = Depends(current_user)):
+    """Owner only. Removes the bot for everyone, with its chats, memory, skills and routines."""
+    with session() as s:
+        b = s.get(Bot, bot_id)
+        _need(b and b.owner_id == user.id, 404, "bot not found")
+        for r in s.exec(select(Routine).where(Routine.bot_id == bot_id)).all():
+            routines.remove(r.id)
+        for conv in s.exec(select(Conversation).where(Conversation.bot_id == bot_id)).all():
+            for m in s.exec(select(Message).where(Message.conversation_id == conv.id)).all():
+                s.delete(m)
+            s.delete(conv)
+        for model in (BotAccess, Memory, Skill, Routine, Secret, McpServer, Approval, ChannelMember):
+            for row in s.exec(select(model).where(model.bot_id == bot_id)).all():
+                s.delete(row)
+        s.delete(b)
+        s.commit()
+    return {"ok": True}
+
+
+class AccessEntry(BaseModel):
+    user_id: int
+    role: str = "collaborator"
+
+
+class ShareIn(BaseModel):
+    published: bool
+    access: str = "team"
+    members: list[AccessEntry] = []
+
+
+@router.get("/bots/{bot_id}/share")
+def get_share(bot_id: int, user: User = Depends(current_user)):
+    with session() as s:
+        b = _bot(s, bot_id, user, manage=True)
+        rows = s.exec(select(BotAccess).where(BotAccess.bot_id == bot_id)).all()
+        return {"published": b.published, "access": b.access,
+                "members": [{"user_id": r.user_id, "role": r.role} for r in rows]}
+
+
+@router.put("/bots/{bot_id}/share")
+def share_bot(bot_id: int, body: ShareIn, user: User = Depends(current_user)):
+    _need(body.access in ("team", "selected"), 400, "access: team | selected")
+    with session() as s:
+        b = _bot(s, bot_id, user, manage=True)
+        _need(b.is_team, 400, "only a Team Bot can be shared")
+        team = s.get(Team, b.team_id)
+        _need(team.bot_sharing == "everyone" or team_role(s, user.id, b.team_id) == "admin",
+              403, "bot sharing is limited to team admins")
+        b.published, b.access = body.published, body.access
+        s.add(b)
+        for r in s.exec(select(BotAccess).where(BotAccess.bot_id == bot_id)).all():
+            s.delete(r)
+        for m in body.members:
+            _need(m.role in ("manager", "collaborator"), 400, "role: manager | collaborator")
+            if m.user_id != b.owner_id and team_role(s, m.user_id, b.team_id):
+                s.add(BotAccess(bot_id=bot_id, user_id=m.user_id, role=m.role))
+        s.commit()
+    return {"ok": True}
+
+
+# ---------------------------------------------------------------- memory, skills, secrets, MCP
+
+@router.get("/bots/{bot_id}/memories")
+def list_memories(bot_id: int, user: User = Depends(current_user)):
+    """Team memory for everyone; your own personal memory; pending learnings for owner and managers."""
+    with session() as s:
+        b = _bot(s, bot_id, user)
+        manage = can_manage(s, user.id, b)
+        rows = s.exec(select(Memory).where(Memory.bot_id == bot_id)).all()
+        names = {u.id: u.display_name for u in s.exec(select(User)).all()}
+    out = []
+    for m in rows:
+        mine = m.scope == "personal" and m.user_id == user.id
+        team_ok = m.scope == "team" and (m.status == "active" or manage or m.proposed_by == user.id)
+        if mine or team_ok:
+            out.append({"id": m.id, "scope": m.scope, "content": m.content, "status": m.status,
+                        "proposed_by": names.get(m.proposed_by, "")})
+    return out
+
+
+class MemoryIn(BaseModel):
+    content: str
+    scope: str = "personal"
+
+
+@router.post("/bots/{bot_id}/memories")
+def add_memory(bot_id: int, body: MemoryIn, user: User = Depends(current_user)):
+    with session() as s:
+        b = _bot(s, bot_id, user)
+        if body.scope == "team":
+            m = Memory(bot_id=bot_id, scope="team", content=body.content, proposed_by=user.id,
+                       status="active" if can_manage(s, user.id, b) else "pending")
+        else:
+            m = Memory(bot_id=bot_id, scope="personal", user_id=user.id, content=body.content)
+        s.add(m)
+        s.commit()
+    return {"id": m.id, "status": m.status}
+
+
+class ReviewIn(BaseModel):
+    approve: bool
+
+
+@router.post("/memories/{memory_id}/review")
+def review_memory(memory_id: int, body: ReviewIn, user: User = Depends(current_user)):
+    """The human gate on shared knowledge: an owner or manager approves or rejects a learning."""
+    with session() as s:
+        m = s.get(Memory, memory_id)
+        _need(m and m.status == "pending", 404, "no pending learning with this id")
+        _bot(s, m.bot_id, user, manage=True)
+        if body.approve:
+            m.status = "active"
+            s.add(m)
+        else:
+            s.delete(m)
+        s.commit()
+    return {"ok": True}
+
+
+@router.delete("/memories/{memory_id}")
+def delete_memory(memory_id: int, user: User = Depends(current_user)):
+    with session() as s:
+        m = s.get(Memory, memory_id)
+        _need(m, 404, "memory not found")
+        b = _bot(s, m.bot_id, user)
+        _need((m.scope == "personal" and m.user_id == user.id) or (m.scope == "team" and can_manage(s, user.id, b)))
+        s.delete(m)
+        s.commit()
+    return {"ok": True}
+
+
+class SkillIn(BaseModel):
+    name: str
+    description: str = ""
+    instructions: str
+
+
+@router.get("/bots/{bot_id}/skills")
+def list_skills(bot_id: int, user: User = Depends(current_user)):
+    with session() as s:
+        _bot(s, bot_id, user)
+        return [k.model_dump() for k in s.exec(select(Skill).where(Skill.bot_id == bot_id)).all()]
+
+
+@router.post("/bots/{bot_id}/skills")
+def add_skill(bot_id: int, body: SkillIn, user: User = Depends(current_user)):
+    with session() as s:
+        _bot(s, bot_id, user, manage=True)
+        k = Skill(bot_id=bot_id, created_by=user.id, **body.model_dump())
+        s.add(k)
+        s.commit()
+        return k.model_dump()
+
+
+@router.delete("/skills/{skill_id}")
+def delete_skill(skill_id: int, user: User = Depends(current_user)):
+    with session() as s:
+        k = s.get(Skill, skill_id)
+        _need(k, 404, "skill not found")
+        _bot(s, k.bot_id, user, manage=True)
+        s.delete(k)
+        s.commit()
+    return {"ok": True}
+
+
+class SecretIn(BaseModel):
+    name: str
+    value: str
+    hosts: str = ""  # comma-separated hosts this secret may be sent to, e.g. "api.github.com"
+
+
+@router.get("/bots/{bot_id}/secrets")
+def list_secrets(bot_id: int, user: User = Depends(current_user)):
+    with session() as s:
+        _bot(s, bot_id, user, manage=True)
+        return [{"id": r.id, "name": r.name, "hosts": r.hosts}
+                for r in s.exec(select(Secret).where(Secret.bot_id == bot_id)).all()]
+
+
+@router.post("/bots/{bot_id}/secrets")
+def add_secret(bot_id: int, body: SecretIn, user: User = Depends(current_user)):
+    _need(re.fullmatch(r"[A-Z_][A-Z0-9_]{0,63}", body.name), 400, "name must look like AN_ENV_VAR")
+    with session() as s:
+        _bot(s, bot_id, user, manage=True)
+        for r in s.exec(select(Secret).where(Secret.bot_id == bot_id, Secret.name == body.name)).all():
+            s.delete(r)
+        hosts = ",".join(h.strip().lower() for h in body.hosts.split(",") if h.strip())
+        _need(all(re.fullmatch(r"[a-z0-9.-]+", h) for h in hosts.split(",") if h), 400,
+              "hosts: plain host names, comma-separated")
+        r = Secret(bot_id=bot_id, name=body.name, value_enc=config.encrypt(body.value), hosts=hosts)
+        s.add(r)
+        s.commit()
+    return {"id": r.id, "name": r.name, "hosts": r.hosts}
+
+
+@router.delete("/secrets/{secret_id}")
+def delete_secret(secret_id: int, user: User = Depends(current_user)):
+    with session() as s:
+        r = s.get(Secret, secret_id)
+        _need(r, 404, "secret not found")
+        _bot(s, r.bot_id, user, manage=True)
+        s.delete(r)
+        s.commit()
+    return {"ok": True}
+
+
+class McpIn(BaseModel):
+    name: str
+    url: str
+    headers: dict[str, str] = {}
+    trusted: bool = False
+
+
+@router.get("/bots/{bot_id}/mcp")
+def list_mcp(bot_id: int, user: User = Depends(current_user)):
+    with session() as s:
+        _bot(s, bot_id, user, manage=True)
+        rows = s.exec(select(McpServer).where(McpServer.bot_id == bot_id)).all()
+    return [{"id": r.id, "name": r.name, "url": r.url, "trusted": r.trusted} for r in rows]
+
+
+@router.post("/bots/{bot_id}/mcp")
+async def add_mcp(bot_id: int, body: McpIn, user: User = Depends(current_user)):
+    _need(re.fullmatch(r"[a-z0-9_-]{1,24}", body.name), 400, "name: 1-24 chars of a-z 0-9 _ -")
+    with session() as s:
+        _bot(s, bot_id, user, manage=True)
+        r = McpServer(bot_id=bot_id, name=body.name, url=body.url, trusted=body.trusted,
+                      headers_enc=config.encrypt(json.dumps(body.headers)) if body.headers else "")
+        s.add(r)
+        s.commit()
+    try:
+        tools = [t["name"] for t in await asyncio.wait_for(mcp_client.list_tools(r, ttl=0), 20)]
+        error = ""
+    except Exception as e:  # noqa: BLE001
+        tools, error = [], f"saved, but the server did not answer: {e.__class__.__name__}"
+    return {"id": r.id, "name": r.name, "tools": tools, "error": error}
+
+
+@router.delete("/mcp/{server_id}")
+def delete_mcp(server_id: int, user: User = Depends(current_user)):
+    with session() as s:
+        r = s.get(McpServer, server_id)
+        _need(r, 404, "server not found")
+        _bot(s, r.bot_id, user, manage=True)
+        s.delete(r)
+        s.commit()
+    mcp_client.invalidate(server_id)
+    return {"ok": True}
+
+
+# ---------------------------------------------------------------- routines
+
+class RoutineIn(BaseModel):
+    name: str
+    cron: str
+    prompt: str
+    conversation_id: int
+
+
+class RoutinePatch(BaseModel):
+    enabled: bool
+
+
+def _routine(s, routine_id: int, user: User) -> Routine:
+    r = s.get(Routine, routine_id)
+    _need(r and r.owner_id == user.id, 404, "routine not found")
+    return r
+
+
+@router.get("/bots/{bot_id}/routines")
+def list_routines(bot_id: int, user: User = Depends(current_user)):
+    with session() as s:
+        _bot(s, bot_id, user)
+        rows = s.exec(select(Routine).where(Routine.bot_id == bot_id, Routine.owner_id == user.id)).all()
+        return [r.model_dump(mode="json") for r in rows]
+
+
+@router.post("/bots/{bot_id}/routines")
+async def add_routine(bot_id: int, body: RoutineIn, user: User = Depends(current_user)):
+    try:
+        CronTrigger.from_crontab(body.cron)
+    except ValueError as e:
+        raise HTTPException(400, f"invalid cron expression: {e}") from e
+    with session() as s:
+        _bot(s, bot_id, user)
+        conv = s.get(Conversation, body.conversation_id)
+        _need(conv and can_read_conversation(s, user.id, conv), 404, "conversation not found")
+        r = Routine(bot_id=bot_id, owner_id=user.id, **body.model_dump())
+        s.add(r)
+        s.commit()
+    routines.sync(r)
+    return r.model_dump(mode="json")
+
+
+@router.patch("/routines/{routine_id}")
+async def patch_routine(routine_id: int, body: RoutinePatch, user: User = Depends(current_user)):
+    with session() as s:
+        r = _routine(s, routine_id, user)
+        r.enabled = body.enabled
+        s.add(r)
+        s.commit()
+    routines.sync(r)
+    return {"ok": True}
+
+
+@router.delete("/routines/{routine_id}")
+async def delete_routine(routine_id: int, user: User = Depends(current_user)):
+    with session() as s:
+        r = _routine(s, routine_id, user)
+        s.delete(r)
+        s.commit()
+    routines.remove(routine_id)
+    return {"ok": True}
+
+
+@router.post("/routines/{routine_id}/run")
+async def run_routine(routine_id: int, user: User = Depends(current_user)):
+    with session() as s:
+        _routine(s, routine_id, user)
+    agent.spawn(routines.fire(routine_id))
+    return {"ok": True}
+
+
+# ---------------------------------------------------------------- conversations
+
+@router.post("/bots/{bot_id}/dm")
+def open_dm(bot_id: int, user: User = Depends(current_user)):
+    """Get or create the private chat between this person and this bot."""
+    with session() as s:
+        b = _bot(s, bot_id, user)
+        c = s.exec(select(Conversation).where(Conversation.kind == "dm", Conversation.bot_id == bot_id,
+                                              Conversation.user_id == user.id)).first()
+        if not c:
+            c = Conversation(team_id=b.team_id, kind="dm", name=b.name, user_id=user.id, bot_id=bot_id)
+            s.add(c)
+            s.commit()
+    return c.model_dump()
+
+
+@router.get("/bots/{bot_id}/feed")
+def open_feed(bot_id: int, user: User = Depends(current_user)):
+    """The Team Bot's shared activity feed: short summaries of finished tasks, for everyone with access."""
+    with session() as s:
+        b = _bot(s, bot_id, user)
+        _need(b.is_team, 400, "only a Team Bot has an activity feed")
+    return agent.feed_conversation(b).model_dump()
+
+
+class ConversationPatch(BaseModel):
+    share_activity: bool
+
+
+@router.patch("/conversations/{conv_id}")
+def patch_conversation(conv_id: int, body: ConversationPatch, user: User = Depends(current_user)):
+    """A person decides per private chat whether summaries of it go to the shared feed."""
+    with session() as s:
+        c = s.get(Conversation, conv_id)
+        _need(c and c.kind == "dm" and c.user_id == user.id, 404, "conversation not found")
+        c.share_activity = body.share_activity
+        s.add(c)
+        s.commit()
+    return c.model_dump()
+
+
+@router.get("/bots/{bot_id}/screen.jpg")
+async def bot_screen(bot_id: int, user: User = Depends(current_user)):
+    """Live view of a bot's screen, for everyone in the project who can use the bot."""
+    with session() as s:
+        b = _bot(s, bot_id, user)
+        _need(b.computer_use, 400, "computer use is off for this bot")
+    try:
+        data = await screen.screenshot(f"p{b.team_id}", b.id)
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(503, f"screen not available: {e}") from e
+    return Response(data, media_type="image/jpeg", headers={"Cache-Control": "no-store"})
+
+
+@router.get("/messages/{message_id}/image")
+def message_image(message_id: int, user: User = Depends(current_user)):
+    with session() as s:
+        m = s.get(Message, message_id)
+        _need(m and m.image_path, 404, "no image")
+        _conv(s, m.conversation_id, user)
+    return FileResponse(m.image_path, media_type="image/jpeg")
+
+
+class ChannelIn(BaseModel):
+    name: str
+    user_ids: list[int] = []
+    bot_ids: list[int] = []
+
+
+def _add_members(s, conv: Conversation, user: User, user_ids: list[int], bot_ids: list[int]) -> None:
+    have_u = {m.user_id for m in s.exec(select(ChannelMember).where(ChannelMember.conversation_id == conv.id)).all()}
+    have_b = {m.bot_id for m in s.exec(select(ChannelMember).where(ChannelMember.conversation_id == conv.id)).all()}
+    for uid in set(user_ids) - have_u:
+        if team_role(s, uid, conv.team_id):
+            s.add(ChannelMember(conversation_id=conv.id, user_id=uid))
+    for bid in set(bot_ids) - have_b:
+        b = s.get(Bot, bid)
+        # a bot can be brought into a channel by someone who manages it
+        if b and b.team_id == conv.team_id and can_manage(s, user.id, b):
+            s.add(ChannelMember(conversation_id=conv.id, bot_id=bid))
+    s.commit()
+
+
+@router.get("/teams/{team_id}/channels")
+def list_channels(team_id: int, user: User = Depends(current_user)):
+    with session() as s:
+        _need(team_role(s, user.id, team_id))
+        rows = s.exec(select(Conversation).where(Conversation.team_id == team_id,
+                                                 Conversation.kind == "channel")).all()
+        return [c.model_dump() for c in rows if can_read_conversation(s, user.id, c)]
+
+
+@router.post("/teams/{team_id}/channels")
+def create_channel(team_id: int, body: ChannelIn, user: User = Depends(current_user)):
+    with session() as s:
+        _need(team_role(s, user.id, team_id))
+        c = Conversation(team_id=team_id, kind="channel", name=body.name)
+        s.add(c)
+        s.commit()
+        _add_members(s, c, user, [user.id, *body.user_ids], body.bot_ids)
+    return c.model_dump()
+
+
+class MembersIn(BaseModel):
+    user_ids: list[int] = []
+    bot_ids: list[int] = []
+
+
+def _conv(s, conv_id: int, user: User) -> Conversation:
+    c = s.get(Conversation, conv_id)
+    _need(c and can_read_conversation(s, user.id, c), 404, "conversation not found")
+    return c
+
+
+@router.post("/channels/{conv_id}/members")
+def add_channel_members(conv_id: int, body: MembersIn, user: User = Depends(current_user)):
+    with session() as s:
+        c = _conv(s, conv_id, user)
+        _need(c.kind == "channel", 400, "not a channel")
+        _add_members(s, c, user, body.user_ids, body.bot_ids)
+    return {"ok": True}
+
+
+@router.get("/channels/{conv_id}/members")
+def channel_members(conv_id: int, user: User = Depends(current_user)):
+    with session() as s:
+        _conv(s, conv_id, user)
+        rows = s.exec(select(ChannelMember).where(ChannelMember.conversation_id == conv_id)).all()
+        return {"users": [{"id": m.user_id, "display_name": s.get(User, m.user_id).display_name}
+                          for m in rows if m.user_id],
+                "bots": [{"id": m.bot_id, "handle": s.get(Bot, m.bot_id).handle, "name": s.get(Bot, m.bot_id).name}
+                         for m in rows if m.bot_id and s.get(Bot, m.bot_id)]}
+
+
+@router.get("/conversations/{conv_id}/messages")
+def list_messages(conv_id: int, after: int = 0, user: User = Depends(current_user)):
+    with session() as s:
+        _conv(s, conv_id, user)
+        rows = s.exec(select(Message).where(Message.conversation_id == conv_id, Message.id > after)
+                      .order_by(Message.id)).all()
+        users = {u.id: u.display_name for u in s.exec(select(User)).all()}
+        bots = {b.id: b.name for b in s.exec(select(Bot)).all()}
+    return [{"id": m.id, "role": m.role, "content": m.content, "created_at": m.created_at.isoformat(),
+             "author": users.get(m.author_user_id) if m.role == "user" else bots.get(m.author_bot_id, "bot"),
+             "is_bot": m.role != "user", "tool_calls": json.loads(m.tool_calls) if m.tool_calls else [],
+             "tool_call_id": m.tool_call_id, "has_image": bool(m.image_path)} for m in rows]
+
+
+class MessageIn(BaseModel):
+    content: str
+
+
+@router.post("/conversations/{conv_id}/messages")
+async def send_message(conv_id: int, body: MessageIn, user: User = Depends(current_user)):
+    _need(body.content.strip(), 400, "empty message")
+    with session() as s:
+        _need(_conv(s, conv_id, user).kind != "feed", 400, "the activity feed is written by the bot only")
+    m = agent.handle_user_message(conv_id, user.id, body.content.strip())
+    return {"id": m.id}
+
+
+@router.get("/conversations/{conv_id}/approvals")
+def list_approvals(conv_id: int, user: User = Depends(current_user)):
+    with session() as s:
+        _conv(s, conv_id, user)
+        rows = s.exec(select(Approval).where(Approval.conversation_id == conv_id,
+                                             Approval.status == "pending")).all()
+        return [{"id": a.id, "tool_name": a.tool_name, "arguments": json.loads(a.arguments),
+                 "bot": s.get(Bot, a.bot_id).name, "requester": s.get(User, a.requester_id).display_name,
+                 "mine": a.requester_id == user.id} for a in rows]
+
+
+class DecisionIn(BaseModel):
+    allow: bool
+    always: bool = False
+
+
+@router.post("/approvals/{approval_id}")
+async def decide(approval_id: int, body: DecisionIn, user: User = Depends(current_user)):
+    try:
+        with session() as s:
+            a = s.get(Approval, approval_id)
+            _need(a and a.status == "pending", 404, "approval not found or already answered")
+            _need(a.requester_id == user.id, 403, "only the person who asked can approve this action")
+        agent.spawn(agent.resolve_approval(approval_id, user.id, body.allow, body.always))
+    except LookupError as e:
+        raise HTTPException(404, str(e)) from e
+    return {"ok": True}
+
+
+@router.get("/conversations/{conv_id}/events")
+async def stream_events(conv_id: int, user: User = Depends(current_user)):
+    with session() as s:
+        _conv(s, conv_id, user)
+
+    async def gen():
+        q = events.subscribe(conv_id)
+        try:
+            while True:
+                try:
+                    ev = await asyncio.wait_for(q.get(), 20)
+                    yield f"data: {json.dumps(ev)}\n\n"
+                except asyncio.TimeoutError:
+                    yield ": keepalive\n\n"
+        finally:
+            events.unsubscribe(conv_id, q)
+
+    return StreamingResponse(gen(), media_type="text/event-stream", headers={"Cache-Control": "no-cache"})

@@ -1,0 +1,31 @@
+services:
+  sandbox-image:            # only builds the image the app starts project sandboxes from
+    build: ./sandbox
+    image: teambots-sandbox:latest
+    command: ["true"]
+    restart: "no"
+  app:
+    build: .
+    depends_on: [sandbox-image]
+    ports: ["${TB_BIND:-127.0.0.1}:8080:8080"]   # local only by default; Caddy fronts it on a server
+    environment:
+      TB_SECRET_KEY: ${TB_SECRET_KEY:?set TB_SECRET_KEY in .env (long random string)}
+      TB_TIMEZONE: Europe/Amsterdam
+      TB_SANDBOX: docker
+      TB_HTTP_ALLOW_PRIVATE: ${TB_HTTP_ALLOW_PRIVATE:-0}
+    extra_hosts: ["host.docker.internal:host-gateway"]   # reach a model server on the host machine
+    volumes:
+      - tb-data:/data
+      # Gives the app control over the host Docker daemon. See README, "Security".
+      - /var/run/docker.sock:/var/run/docker.sock
+    restart: unless-stopped
+  caddy:                    # TLS front for a server: docker compose --profile server up -d
+    profiles: ["server"]
+    image: caddy:2
+    ports: ["80:80", "443:443"]
+    command: caddy reverse-proxy --from ${TB_DOMAIN:-localhost} --to app:8080
+    volumes: [caddy-data:/data]
+    restart: unless-stopped
+volumes:
+  tb-data:
+  caddy-data:
