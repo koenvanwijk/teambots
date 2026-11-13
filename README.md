@@ -17,7 +17,7 @@ capabilities that every teammate or client talks to in private.
 | Memory | Personal memory per user, shared team memory, learnings from collaborators wait for review |
 | Skills, routines | Saved by owner or manager; cron-scheduled prompts per user and conversation |
 | Computer | One sandbox per project, shared by its people and bots: shell and files |
-| Screen | With "computer use" on, a bot has its own virtual screen with a browser, screenshot / click / type / key / scroll tools, and a live view in the UI. Needs a model with image input |
+| Screen | With "computer use" on, a bot has its own virtual screen with a browser, screenshot / click / type / key / scroll tools, and a live view in the UI. "Open scherm" attaches noVNC to that same Xvfb so you can use mouse and keyboard (e.g. to sign in to Chromium). Needs a model with image input |
 | Secrets | Never in the sandbox or the model's context. The bot writes `{{secret:NAME}}` in an `http_request`; the app fills it in outside the sandbox, only for the hosts the secret is bound to, never follows redirects, and masks secret values in everything returned to the model |
 | Approvals | Risky tools pause for an approval card (Allow once / Always allow / Deny); only the requester can answer |
 | Channels | Several people and bots, bots answer on `@handle`, no personal memory in channels |
@@ -76,7 +76,7 @@ safe: it encrypts the stored API keys and secrets, and losing it makes them unre
 2. Add an endpoint and click it to run the connection test. "tool calling: true" is required.
 3. Create a bot. For a Team Bot: write instructions, add secrets / MCP servers / skills, then
    tick Published under Sharing.
-4. Chat. Create a channel and add people and bots to work together.
+4. Chat. Create a channel and add people and bots to work together. On a bot with computer use, **Open scherm** opens the interactive screen (sign in to Chromium there; the profile is kept in the project's Docker volume).
 
 ## Configuration
 

@@ -186,8 +186,10 @@ async function openPanel(bot) {
   p.append($('div', { className: 'row' }, $('h2', { textContent: `${bot.name} (@${bot.handle})`, style: 'flex:1' }), $('button', { textContent: 'Close', onclick: () => { clearInterval(S.screenTimer); p.style.display = 'none'; } })),
     $('div', { className: 'hint', textContent: `Your role: ${bot.role}. ` + (bot.is_team ? 'Team Bot.' : 'Personal bot.') }));
   if (bot.computer_use) { const img = $('img', { className: 'shot', alt: 'Live view of the bot screen' }), note = $('div', { className: 'hint', textContent: 'Refreshes every 3 seconds.' });
+    const open = $('button', { textContent: 'Open scherm', title: 'Interactief scherm: muis en toetsenbord, om zelf in te loggen in Chromium',
+      onclick: () => window.open(withToken(`/bots/${bot.id}/screen/vnc/`), '_blank', 'noopener') });
     const tick = () => { const n = new Image(); n.onload = () => { img.src = n.src; note.textContent = 'Refreshes every 3 seconds.'; }; n.onerror = () => { note.textContent = 'Screen not available (needs the Docker sandbox).'; }; n.src = withToken(`/bots/${bot.id}/screen.jpg?t=${Date.now()}`); };
-    p.append($('h4', { textContent: 'Screen' }), img, note); tick(); S.screenTimer = setInterval(tick, 3000); }
+    p.append($('div', { className: 'row' }, $('h4', { textContent: 'Screen', style: 'margin:0;border:0;padding:0;flex:1' }), open), img, note); tick(); S.screenTimer = setInterval(tick, 3000); }
   const list = async (title, path, line, add, hint) => {
     p.append($('h4', { textContent: title })); if (hint) p.append($('div', { className: 'hint', textContent: hint }));
     for (const it of await api('GET', path)) p.append(line(it));

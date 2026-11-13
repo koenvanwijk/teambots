@@ -7,9 +7,11 @@ import secrets
 from typing import Optional
 
 from apscheduler.triggers.cron import CronTrigger
-from fastapi import APIRouter, Depends, Header, HTTPException, Query
-from fastapi.responses import FileResponse, Response, StreamingResponse
+from fastapi import APIRouter, Cookie, Depends, Header, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
+from fastapi.responses import FileResponse, RedirectResponse, Response, StreamingResponse
 from pydantic import BaseModel
+import httpx
+import websockets
 
 from . import agent, config, events, llm, mcp_client, routines, screen
 from .access import bot_role, can_manage, can_read_conversation, team_role
@@ -23,14 +25,21 @@ def _hash(password: str, salt: str) -> str:
     return hashlib.pbkdf2_hmac("sha256", password.encode(), salt.encode(), 200_000).hex()
 
 
-def current_user(authorization: str = Header(default=""), token: str = Query(default="")) -> User:
-    tok = authorization.removeprefix("Bearer ").strip() or token
-    with session() as s:
-        row = s.get(AuthToken, tok) if tok else None
-        user = s.get(User, row.user_id) if row else None
+def current_user(authorization: str = Header(default=""), token: str = Query(default=""),
+                 tb_token: str = Cookie(default="")) -> User:
+    tok = authorization.removeprefix("Bearer ").strip() or token or tb_token
+    user = _user_for_token(tok)
     if not user:
         raise HTTPException(401, "not signed in")
     return user
+
+
+def _user_for_token(tok: str | None) -> User | None:
+    if not tok:
+        return None
+    with session() as s:
+        row = s.get(AuthToken, tok)
+        return s.get(User, row.user_id) if row else None
 
 
 def _need(cond, code=403, msg="not allowed"):
@@ -673,17 +682,121 @@ def patch_conversation(conv_id: int, body: ConversationPatch, user: User = Depen
     return c.model_dump()
 
 
-@router.get("/bots/{bot_id}/screen.jpg")
-async def bot_screen(bot_id: int, user: User = Depends(current_user)):
-    """Live view of a bot's screen, for everyone in the project who can use the bot."""
+def _screen_bot(bot_id: int, user: User) -> Bot:
     with session() as s:
         b = _bot(s, bot_id, user)
         _need(b.computer_use, 400, "computer use is off for this bot")
+        s.expunge(b)
+        return b
+
+
+@router.get("/bots/{bot_id}/screen.jpg")
+async def bot_screen(bot_id: int, user: User = Depends(current_user)):
+    """Live view of a bot's screen, for everyone in the project who can use the bot."""
+    b = _screen_bot(bot_id, user)
     try:
         data = await screen.screenshot(f"p{b.team_id}", b.id)
     except Exception as e:  # noqa: BLE001
         raise HTTPException(503, f"screen not available: {e}") from e
     return Response(data, media_type="image/jpeg", headers={"Cache-Control": "no-store"})
+
+
+def _vnc_cookie(response: Response, token: str) -> None:
+    # Lets noVNC's own JS/CSS and the websocket reuse the session without putting the token in every URL.
+    if token:
+        response.set_cookie("tb_token", token, httponly=True, samesite="lax",
+                            path="/api/bots/", max_age=60 * 60 * 24 * 30)
+
+
+@router.get("/bots/{bot_id}/screen/vnc")
+@router.get("/bots/{bot_id}/screen/vnc/")
+async def vnc_index(bot_id: int, user: User = Depends(current_user),
+                    authorization: str = Header(default=""), token: str = Query(default=""),
+                    tb_token: str = Cookie(default="")):
+    """Open the interactive screen (noVNC) behind TeamBots auth; no extra LAN port."""
+    b = _screen_bot(bot_id, user)
+    try:
+        await screen.ensure_vnc(f"p{b.team_id}", b.id)
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(503, f"interactive screen not available: {e}") from e
+    dest = f"/api/bots/{bot_id}/screen/vnc/vnc.html?autoconnect=1&resize=scale&reconnect=1&path=ws"
+    resp = RedirectResponse(dest, status_code=302)
+    _vnc_cookie(resp, authorization.removeprefix("Bearer ").strip() or token or tb_token)
+    return resp
+
+
+@router.websocket("/bots/{bot_id}/screen/vnc/ws")
+async def vnc_ws(ws: WebSocket, bot_id: int, token: str = Query(default="")):
+    """Authenticated proxy from the browser to websockify inside the sandbox."""
+    tok = token or ws.cookies.get("tb_token") or ""
+    user = _user_for_token(tok)
+    if not user:
+        await ws.close(code=4401, reason="not signed in")
+        return
+    try:
+        b = _screen_bot(bot_id, user)
+        host, port = await screen.ensure_vnc(f"p{b.team_id}", b.id)
+    except HTTPException as e:
+        await ws.close(code=4400 + (e.status_code % 100), reason=e.detail[:80])
+        return
+    except Exception as e:  # noqa: BLE001
+        await ws.close(code=1011, reason=str(e)[:80])
+        return
+    requested = ws.headers.get("sec-websocket-protocol", "")
+    sub = "binary" if "binary" in requested else ("base64" if "base64" in requested else None)
+    await ws.accept(subprotocol=sub)
+    upstream = f"ws://{host}:{port}/"
+    try:
+        async with websockets.connect(upstream, subprotocols=[sub] if sub else None, open_timeout=10) as up:
+            async def down():
+                try:
+                    while True:
+                        msg = await ws.receive()
+                        if msg["type"] == "websocket.disconnect":
+                            return
+                        data = msg.get("bytes") if msg.get("bytes") is not None else msg.get("text")
+                        if data is not None:
+                            await up.send(data)
+                except (WebSocketDisconnect, Exception):
+                    return
+
+            async def up_to_client():
+                try:
+                    async for msg in up:
+                        if isinstance(msg, (bytes, bytearray)):
+                            await ws.send_bytes(msg)
+                        else:
+                            await ws.send_text(msg)
+                except Exception:
+                    return
+
+            await asyncio.gather(down(), up_to_client())
+    except Exception as e:  # noqa: BLE001
+        try:
+            await ws.close(code=1011, reason=f"vnc upstream: {e}"[:80])
+        except Exception:
+            return
+
+
+@router.api_route("/bots/{bot_id}/screen/vnc/{path:path}", methods=["GET"])
+async def vnc_http(bot_id: int, path: str, user: User = Depends(current_user)):
+    """Proxy noVNC static files from websockify in the sandbox (same auth as the rest of the API)."""
+    if path == "ws":
+        raise HTTPException(404, "use the websocket")
+    b = _screen_bot(bot_id, user)
+    try:
+        host, port = await screen.ensure_vnc(f"p{b.team_id}", b.id)
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(503, f"interactive screen not available: {e}") from e
+    url = f"http://{host}:{port}/{path}"
+    try:
+        async with httpx.AsyncClient(timeout=20) as client:
+            r = await client.get(url)
+    except httpx.HTTPError as e:
+        raise HTTPException(503, f"interactive screen not available: {e}") from e
+    media = r.headers.get("content-type", "application/octet-stream")
+    return Response(r.content, status_code=r.status_code, media_type=media,
+                    headers={"Cache-Control": "no-store"})
 
 
 @router.get("/messages/{message_id}/image")

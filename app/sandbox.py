@@ -121,3 +121,25 @@ async def read_file(key: str, path: str) -> str:
     path = _check_path(path)
     code, out = await sb_exec(key, ["cat", "--", path])
     return out if code == 0 else f"error: {out}"
+
+
+async def sandbox_addr(key: str) -> str:
+    """Address of the sandbox from the TeamBots host (container IP, or 127.0.0.1 when local).
+
+    Used to reach noVNC/websockify inside a Docker sandbox without publishing ports on the LAN.
+    Requires TB_SANDBOX_NETWORK to give the container an address (the default `bridge` does).
+    """
+    key = _safe_key(key)
+    if config.SANDBOX_BACKEND != "docker":
+        return "127.0.0.1"
+    name = f"tb-{key}"
+    await _ensure_container(name)
+    code, out = await _run([
+        "docker", "inspect", "-f",
+        "{{range .NetworkSettings.Networks}}{{.IPAddress}} {{end}}", name], None, 20)
+    ip = (out or "").split()[0] if code == 0 else ""
+    if not ip:
+        raise RuntimeError(
+            "sandbox has no network address; interactive screen needs TB_SANDBOX_NETWORK=bridge (the default)")
+    return ip
+

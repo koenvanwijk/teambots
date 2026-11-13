@@ -1,13 +1,18 @@
 """A screen per bot: a virtual X display inside the project's sandbox, with a browser.
 
 The model looks with `screen_screenshot` and acts with mouse and keyboard tools. People watch
-the same screen in the web UI. Needs Xvfb, xdotool, ImageMagick and a Chromium in the sandbox
-image (sandbox/Dockerfile installs them) and a model that accepts image input.
+the same screen in the web UI, and can take over with mouse and keyboard through noVNC
+(x11vnc attached to this Xvfb, proxied by TeamBots). Needs Xvfb, xdotool, ImageMagick and a
+Chromium in the sandbox image (sandbox/Dockerfile installs them, plus x11vnc/noVNC) and a
+model that accepts image input.
 """
 import asyncio
+import logging
 
 from . import config
-from .sandbox import sb_exec, sb_spawn
+from .sandbox import sandbox_addr, sb_exec, sb_spawn
+
+log = logging.getLogger("teambots.screen")
 
 WIDTH, HEIGHT = 1280, 800
 
@@ -16,21 +21,89 @@ def _display(bot_id: int) -> int:
     return 100 + bot_id
 
 
-async def _env(key: str, bot_id: int) -> dict:
+def vnc_port(bot_id: int) -> int:
+    return 5900 + bot_id
+
+
+def ws_port(bot_id: int) -> int:
+    return 6080 + bot_id
+
+
+async def _port_open(key: str, port: int) -> bool:
+    code, out = await sb_exec(
+        key,
+        ["python3", "-c",
+         "import socket; s=socket.socket(); s.settimeout(0.4); "
+         f"print(s.connect_ex(('127.0.0.1',{int(port)}))==0)"],
+        timeout=10,
+    )
+    return code == 0 and "True" in (out or "")
+
+
+async def _has_vnc_tools(key: str) -> bool:
+    code, _ = await sb_exec(key, ["sh", "-c", "command -v x11vnc && command -v websockify"], timeout=10)
+    return code == 0
+
+
+async def _ensure_vnc(key: str, bot_id: int, env: dict) -> None:
+    """Attach x11vnc + websockify to this bot's existing Xvfb. No-op if the tools are absent."""
+    if not await _has_vnc_tools(key):
+        return
+    rfb, ws = vnc_port(bot_id), ws_port(bot_id)
+    n = _display(bot_id)
+    if not await _port_open(key, rfb):
+        await sb_spawn(key, [
+            "x11vnc", "-display", f":{n}", "-rfbport", str(rfb),
+            "-localhost", "-forever", "-shared", "-nopw", "-noxdamage", "-noshm",
+            "-ncache", "0", "-quiet",
+        ], env=env)
+        for _ in range(40):
+            await asyncio.sleep(0.15)
+            if await _port_open(key, rfb):
+                break
+        else:
+            raise RuntimeError("x11vnc did not start; is it installed in the sandbox image?")
+    if not await _port_open(key, ws):
+        await sb_spawn(key, [
+            "websockify", "--heartbeat", "30", f"0.0.0.0:{ws}", f"127.0.0.1:{rfb}",
+            "--web=/usr/share/novnc",
+        ], env=env)
+        for _ in range(40):
+            await asyncio.sleep(0.15)
+            if await _port_open(key, ws):
+                break
+        else:
+            raise RuntimeError("noVNC/websockify did not start; is it installed in the sandbox image?")
+
+
+async def _env(key: str, bot_id: int, *, start_vnc: bool = True) -> dict:
     """Make sure this bot's display is up and return the environment that points at it."""
     n = _display(bot_id)
     env = {"DISPLAY": f":{n}"}
     code, _ = await sb_exec(key, ["xdotool", "getdisplaygeometry"], env=env, timeout=10)
-    if code == 0:
-        return env
-    await sb_exec(key, ["sh", "-c", f"rm -f /tmp/.X{n}-lock /tmp/.X11-unix/X{n}"])  # stale after a restart
-    await sb_spawn(key, ["Xvfb", f":{n}", "-screen", "0", f"{WIDTH}x{HEIGHT}x24", "-nolisten", "tcp"])
-    for _ in range(40):
-        await asyncio.sleep(0.25)
-        code, _ = await sb_exec(key, ["xdotool", "getdisplaygeometry"], env=env, timeout=10)
-        if code == 0:
-            return env
-    raise RuntimeError("the screen did not start; does the sandbox image contain Xvfb and xdotool?")
+    if code != 0:
+        await sb_exec(key, ["sh", "-c", f"rm -f /tmp/.X{n}-lock /tmp/.X11-unix/X{n}"])  # stale after a restart
+        await sb_spawn(key, ["Xvfb", f":{n}", "-screen", "0", f"{WIDTH}x{HEIGHT}x24", "-nolisten", "tcp"])
+        for _ in range(40):
+            await asyncio.sleep(0.25)
+            code, _ = await sb_exec(key, ["xdotool", "getdisplaygeometry"], env=env, timeout=10)
+            if code == 0:
+                break
+        else:
+            raise RuntimeError("the screen did not start; does the sandbox image contain Xvfb and xdotool?")
+    if start_vnc:
+        try:
+            await _ensure_vnc(key, bot_id, env)
+        except Exception:
+            log.exception("interactive VNC did not start for bot %s (screenshot still works)", bot_id)
+    return env
+
+
+async def ensure_vnc(key: str, bot_id: int) -> tuple[str, int]:
+    """Start the screen and VNC if needed; return (host, websockify port) reachable from TeamBots."""
+    env = await _env(key, bot_id, start_vnc=False)
+    await _ensure_vnc(key, bot_id, env)
+    return await sandbox_addr(key), ws_port(bot_id)
 
 
 async def screenshot(key: str, bot_id: int) -> bytes:
