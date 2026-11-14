@@ -193,7 +193,10 @@ async function boot() {
     $('main', { id: 'main' }, $('header', { id: 'top' }), $('div', { id: 'stage' }, $('div', { id: 'view' }, $('div', { id: 'col' })), $('div', { id: 'dock' }))),
     $('aside', { id: 'drawer' })));
   el('view').addEventListener('scroll', updateJump, { passive: true });
-  el('col').addEventListener('click', e => { const s = e.target.closest('summary'); if (s) s.parentElement.dataset.user = s.parentElement.open ? '0' : '1'; });
+  // Remember what the person opened or closed by hand. Read `open` on the next frame, after the
+  // browser has finished toggling it — reading during the click can catch the pre-toggle state and
+  // store the opposite intent, which then re-collapses the block on the next redraw (new line).
+  el('col').addEventListener('click', e => { const s = e.target.closest('summary'); if (!s) return; const d = s.parentElement; requestAnimationFrame(() => { d.dataset.user = d.open ? '1' : '0'; }); });
   await loadTeam();
   if (store.get('tb_last_home') === '1') {
     try { return await openOverview(); } catch { /* fall through */ }
