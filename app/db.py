@@ -62,9 +62,11 @@ class Endpoint(SQLModel, table=True):
     owner_id: int
     shared: bool = False  # usable by every team member when creating bots
     name: str
-    base_url: str
-    api_key_enc: str = ""
+    base_url: str  # display / OpenAI base; for Copilot, the fallback API host
+    api_key_enc: str = ""  # OpenAI key, or GitHub OAuth token for github_copilot
     default_model: str
+    provider: str = "openai"  # openai | github_copilot
+    github_domain: str = ""  # github.com or org.ghe.com; unused for openai
 
 
 class Bot(SQLModel, table=True):
@@ -210,6 +212,7 @@ def init_db() -> None:
     SQLModel.metadata.create_all(engine)
     _ensure_channelmember_mention_only()
     _ensure_home_columns()
+    _ensure_endpoint_provider_columns()
     migrate_channel_bots()
     from .home import migrate_home_bots
     migrate_home_bots()
@@ -240,6 +243,19 @@ def _ensure_home_columns() -> None:
         bot_cols = [r[1] for r in conn.exec_driver_sql("PRAGMA table_info(bot)").fetchall()]
         if "is_home" not in bot_cols:
             conn.exec_driver_sql("ALTER TABLE bot ADD COLUMN is_home BOOLEAN NOT NULL DEFAULT 0")
+        conn.commit()
+
+
+def _ensure_endpoint_provider_columns() -> None:
+    """Add Endpoint.provider and github_domain on databases created before those columns existed."""
+    if not config.DB_URL.startswith("sqlite"):
+        return
+    with engine.connect() as conn:
+        cols = [r[1] for r in conn.exec_driver_sql("PRAGMA table_info(endpoint)").fetchall()]
+        if "provider" not in cols:
+            conn.exec_driver_sql("ALTER TABLE endpoint ADD COLUMN provider VARCHAR DEFAULT 'openai'")
+        if "github_domain" not in cols:
+            conn.exec_driver_sql("ALTER TABLE endpoint ADD COLUMN github_domain VARCHAR DEFAULT ''")
         conn.commit()
 
 

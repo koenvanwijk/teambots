@@ -88,6 +88,8 @@ function openDialog(cls, ...kids) {
 function form({ title, intro, fields, ok = 'Save', onSubmit }) {
   return new Promise(resolve => {
     let result = null; const inputs = {}, err = $('div', { className: 'err', role: 'alert' });
+    const values = () => { const v = {}; for (const f of fields) v[f.name] = f.type === 'checkbox' ? inputs[f.name].checked : inputs[f.name].value.trim(); return v; };
+    const needed = (f, v) => typeof f.required === 'function' ? !!f.required(v) : !!f.required;
     const rows = fields.map(f => {
       let input;
       if (f.type === 'textarea') input = $('textarea', { rows: f.rows || 4, value: f.value || '', placeholder: f.placeholder || '' });
@@ -95,25 +97,35 @@ function form({ title, intro, fields, ok = 'Save', onSubmit }) {
       else if (f.type === 'checkbox') input = $('input', { type: 'checkbox', checked: !!f.value });
       else input = $('input', { type: f.type || 'text', value: f.value || '', placeholder: f.placeholder || '', autocomplete: f.type === 'password' ? 'new-password' : 'off', spellcheck: !f.mono });
       if (f.mono) input.classList.add('mono');
-      if (f.required) input.required = true;
+      if (f.required && typeof f.required !== 'function') input.required = true;
       inputs[f.name] = input;
       if (f.oninput) input.addEventListener('input', () => f.oninput(input.value, inputs));
+      if (f.type === 'select') input.addEventListener('change', applyWhen);
       return f.type === 'checkbox'
         ? $('label', { className: 'check' }, input, $('span', {}, f.label, f.hint && $('small', { textContent: f.hint })))
         : $('label', { className: 'field' }, $('span', { textContent: f.label }), input, f.hint && $('small', { textContent: f.hint }));
     });
+    function applyWhen() {
+      const v = values();
+      fields.forEach((f, i) => {
+        const on = !f.when || !!f.when(v);
+        rows[i].hidden = !on;
+        inputs[f.name].required = on && needed(f, v);
+      });
+    }
+    applyWhen();
     const submit = $('button', { className: 'btn primary', type: 'submit', textContent: ok });
     const fm = $('form', { className: 'pad' }, $('h2', { textContent: title }), intro && $('p', { className: 'intro', textContent: intro }), rows, err,
       $('div', { className: 'dfoot' }, $('button', { className: 'btn', type: 'button', textContent: 'Cancel', onclick: () => d.close() }), submit));
     fm.onsubmit = async e => {
       e.preventDefault();
-      const v = {}; for (const f of fields) v[f.name] = f.type === 'checkbox' ? inputs[f.name].checked : inputs[f.name].value.trim();
+      const v = values();
       submit.disabled = true; err.textContent = '';
       try { result = onSubmit ? ((await onSubmit(v)) ?? v) : v; d.close(); } catch (x) { err.textContent = x.message; submit.disabled = false; }
     };
     const d = openDialog('', fm);
     d.addEventListener('close', () => resolve(result));
-    const first = fields.find(f => f.type !== 'checkbox' && f.type !== 'select'); if (first) inputs[first.name].focus();
+    const first = fields.find(f => f.type !== 'checkbox' && f.type !== 'select' && (!f.when || f.when(values()))); if (first) inputs[first.name].focus();
   });
 }
 function confirmBox({ title, text, ok = 'Confirm', danger }) {
@@ -290,11 +302,30 @@ async function renameProject() {
   if (!v) return;
   Object.assign(t, v); renderSide(); if (!S.conv) showHome();
 }
+function isCopilot(v) { return (v.provider || 'openai') === 'github_copilot'; }
+function endpointFields(e) {
+  return [
+    { name: 'name', label: 'Name', required: true, value: e ? e.name : '', placeholder: 'dgx-spark' },
+    { name: 'provider', label: 'Provider', type: 'select', value: (e && e.provider) || 'openai', options: [
+      { value: 'openai', label: 'OpenAI-compatible' },
+      { value: 'github_copilot', label: 'GitHub Copilot' }] },
+    { name: 'base_url', label: 'Base URL', required: true, value: (e && e.base_url) || 'http://localhost:8000/v1', mono: true, when: v => !isCopilot(v) },
+    { name: 'github_domain', label: 'GitHub domain', required: true, value: (e && e.github_domain) || 'github.com', mono: true,
+      hint: 'github.com, or a data-residency tenant such as org.ghe.com.', when: isCopilot },
+    { name: 'default_model', label: 'Default model', required: true, value: e ? e.default_model : '', mono: true, placeholder: 'claude-sonnet-5' },
+    { name: 'api_key', label: e ? 'New token / API key' : 'Token / API key', type: 'password', required: v => !e && isCopilot(v),
+      hint: e && e.has_key ? 'Leave empty to keep the stored key.' : 'For Copilot, a GitHub OAuth token (ghu_…). Otherwise optional. Stored encrypted, never shown again.' },
+    { name: 'shared', label: 'Share with the project', type: 'checkbox', value: e && e.shared, hint: 'Other members can use this endpoint for their bots.' },
+  ];
+}
+function endpointPayload(v) {
+  if (!v.api_key) delete v.api_key;
+  if (isCopilot(v)) delete v.base_url; else delete v.github_domain;
+  return v;
+}
 async function editEndpoint(e) {
-  const r = await form({ title: 'Edit endpoint', fields: [{ name: 'name', label: 'Name', required: true, value: e.name }, { name: 'base_url', label: 'Base URL', required: true, value: e.base_url, mono: true },
-    { name: 'default_model', label: 'Default model', required: true, value: e.default_model, mono: true }, { name: 'api_key', label: 'New API key', type: 'password', hint: e.has_key ? 'Leave empty to keep the stored key.' : 'Optional. Stored encrypted, never shown again.' },
-    { name: 'shared', label: 'Share with the project', type: 'checkbox', value: e.shared, hint: 'Other members can use this endpoint for their bots.' }],
-    onSubmit: v => { if (!v.api_key) delete v.api_key; return api('PATCH', `/endpoints/${e.id}`, v); } });
+  const r = await form({ title: 'Edit endpoint', fields: endpointFields(e),
+    onSubmit: v => api('PATCH', `/endpoints/${e.id}`, endpointPayload(v)) });
   if (r) { await loadTeam(); toast('Saved'); }
 }
 async function newProject() {
@@ -393,29 +424,39 @@ async function showRoutines() {
 
 // ---------------------------------------------------------------- create things
 async function newEndpoint() {
-  const e = await form({ title: 'New endpoint', intro: 'An OpenAI-compatible chat completions API. The model needs tool calling.', ok: 'Add endpoint', fields: [
-    { name: 'name', label: 'Name', required: true, placeholder: 'dgx-spark' },
-    { name: 'base_url', label: 'Base URL', required: true, value: 'http://localhost:8000/v1', mono: true },
-    { name: 'default_model', label: 'Default model', required: true, mono: true },
-    { name: 'api_key', label: 'API key (optional)', type: 'password', hint: 'Stored encrypted. It is never shown again.' },
-    { name: 'shared', label: 'Share with the project', type: 'checkbox', hint: 'Other members can use this endpoint for their bots.' }],
-    onSubmit: v => api('POST', `/teams/${S.team.id}/endpoints`, v) });
+  const e = await form({ title: 'New endpoint', intro: 'An OpenAI-compatible chat completions API, or GitHub Copilot. The model needs tool calling.', ok: 'Add endpoint',
+    fields: endpointFields(null), onSubmit: v => api('POST', `/teams/${S.team.id}/endpoints`, endpointPayload(v)) });
   if (!e) return;
   await loadTeam(); if (!S.conv) showHome();
   const t = await api('POST', `/endpoints/${e.id}/test`);
   toast(t.reachable && t.tool_calling ? `${e.name} works, tool calling included` : `${e.name}: ${t.detail}`, t.reachable && t.tool_calling ? '' : 'bad');
 }
 function endpointDialog(e) {
-  const out = $('div', { className: 'err' }), mine = e.owner_id === S.me.id;
+  const out = $('div', { className: 'err' }), mine = e.owner_id === S.me.id, copilot = isCopilot(e);
   const test = $('button', { className: 'btn', textContent: 'Test connection', onclick: async () => { test.disabled = true; out.style.color = 'var(--muted)'; out.textContent = 'Testing…';
     try { const t = await api('POST', `/endpoints/${e.id}/test`); const good = t.reachable && t.tool_calling; out.style.color = good ? 'var(--ok)' : 'var(--bad)'; out.textContent = good ? 'Reachable, and the model calls tools.' : !t.reachable ? 'Not reachable: ' + t.detail : 'Reachable, but no tool calling: ' + t.detail; }
     catch (x) { out.style.color = 'var(--bad)'; out.textContent = x.message; } test.disabled = false; } });
+  const modelsBtn = $('button', { className: 'btn', textContent: 'List models', onclick: async () => {
+    modelsBtn.disabled = true; out.style.color = 'var(--muted)'; out.textContent = 'Listing models…';
+    try {
+      const r = await api('GET', `/endpoints/${e.id}/models`);
+      const ids = (r.models || []).map(m => m.id).filter(Boolean);
+      out.style.color = ids.length ? 'var(--ok)' : 'var(--muted)';
+      out.textContent = ids.length ? ids.join(', ') : (r.detail && r.detail !== 'ok' ? r.detail : 'No model list from this endpoint.');
+    } catch (x) { out.style.color = 'var(--bad)'; out.textContent = x.message; }
+    modelsBtn.disabled = false;
+  }});
   const d = openDialog('', $('div', { className: 'pad' }, $('h2', { textContent: e.name }),
-    $('dl', { className: 'kv', style: 'margin-top:14px' }, $('dt', { textContent: 'Base URL' }), $('dd', { className: 'mono', textContent: e.base_url }), $('dt', { textContent: 'Default model' }), $('dd', { className: 'mono', textContent: e.default_model }),
-      $('dt', { textContent: 'API key' }), $('dd', { textContent: e.has_key ? 'Stored (hidden)' : 'None' }), $('dt', { textContent: 'Sharing' }), $('dd', { textContent: e.shared ? 'Everyone in the project' : 'Only you' })),
+    $('dl', { className: 'kv', style: 'margin-top:14px' },
+      $('dt', { textContent: 'Provider' }), $('dd', { textContent: copilot ? 'GitHub Copilot' : 'OpenAI-compatible' }),
+      copilot ? [$('dt', { textContent: 'GitHub domain' }), $('dd', { className: 'mono', textContent: e.github_domain || 'github.com' })]
+              : [$('dt', { textContent: 'Base URL' }), $('dd', { className: 'mono', textContent: e.base_url })],
+      $('dt', { textContent: 'Default model' }), $('dd', { className: 'mono', textContent: e.default_model }),
+      $('dt', { textContent: copilot ? 'GitHub token' : 'API key' }), $('dd', { textContent: e.has_key ? 'Stored (hidden)' : 'None' }),
+      $('dt', { textContent: 'Sharing' }), $('dd', { textContent: e.shared ? 'Everyone in the project' : 'Only you' })),
     mine ? out : $('div', { className: 'err muted', textContent: 'Only the person who added this endpoint can test or remove it.' }),
     $('div', { className: 'dfoot' }, mine && $('button', { className: 'btn danger', textContent: 'Remove', onclick: guard(async () => { if (!await confirmBox({ title: 'Remove endpoint?', text: `"${e.name}" is removed for everyone. Bots must be moved to another endpoint first.`, ok: 'Remove', danger: true })) return; await api('DELETE', `/endpoints/${e.id}`); d.close(); await loadTeam(); }) }),
-      mine && $('button', { className: 'btn', textContent: 'Edit', onclick: () => { d.close(); guard(editEndpoint)(e); } }), mine && test, $('button', { className: 'btn primary', textContent: 'Done', onclick: () => d.close() }))));
+      mine && $('button', { className: 'btn', textContent: 'Edit', onclick: () => { d.close(); guard(editEndpoint)(e); } }), mine && test, mine && modelsBtn, $('button', { className: 'btn primary', textContent: 'Done', onclick: () => d.close() }))));
 }
 async function newBot() {
   if (!S.endpoints.length) { toast('Add a model endpoint first'); return newEndpoint(); }

@@ -58,9 +58,44 @@ def _choice(data: dict, ep_name: str) -> tuple[dict, str]:
         raise LLMError(f"endpoint '{ep_name}' returned an unexpected response") from e
 
 
+async def list_models(ep: Endpoint) -> list[dict]:
+    """Best-effort model catalog. Empty if the endpoint has no /models."""
+    if getattr(ep, "provider", "openai") == "github_copilot":
+        from . import copilot
+        return await copilot.list_models(ep)
+    headers = {"Accept": "application/json"}
+    key = config.decrypt(ep.api_key_enc)
+    if key:
+        headers["Authorization"] = f"Bearer {key}"
+    url = ep.base_url.rstrip("/") + "/models"
+    try:
+        async with httpx.AsyncClient(timeout=config.LLM_TIMEOUT) as client:
+            r = await client.get(url, headers=headers)
+            if r.status_code == 404:
+                return []
+            if r.status_code >= 400:
+                raise LLMError(f"endpoint '{ep.name}' /models returned HTTP {r.status_code}: {r.text[:300]}")
+            data = r.json()
+    except httpx.HTTPError as e:
+        raise LLMError(f"cannot reach endpoint '{ep.name}': {e.__class__.__name__}") from e
+    rows = data.get("data") if isinstance(data, dict) else data
+    if not isinstance(rows, list):
+        return []
+    out = []
+    for item in rows:
+        if isinstance(item, str):
+            out.append({"id": item})
+        elif isinstance(item, dict) and item.get("id"):
+            out.append({"id": item["id"], "name": item.get("name") or item["id"]})
+    return out
+
+
 async def chat(ep: Endpoint, model: str, messages: list[dict], tools: list[dict] | None = None,
                max_tokens: int | None = None) -> dict:
     """Return the assistant message dict ({'content': ..., 'tool_calls': [...]})."""
+    if getattr(ep, "provider", "openai") == "github_copilot":
+        from . import copilot
+        return await copilot.chat(ep, model, messages, tools, max_tokens=max_tokens)
     budget = max_tokens or config.LLM_MAX_TOKENS
     body: dict = {"model": model or ep.default_model, "messages": messages, "max_tokens": budget}
     if tools:

@@ -1,7 +1,7 @@
 """A tiny MCP server (streamable HTTP) with one tool, for tests."""
 from mcp.server.fastmcp import FastMCP
 
-mcp = FastMCP("calc", host="127.0.0.1", port=8792)
+mcp = FastMCP("calc", host="127.0.0.1", port=18792)
 
 
 @mcp.tool()

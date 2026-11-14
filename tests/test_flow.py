@@ -28,7 +28,7 @@ import mock_llm  # noqa: E402
 from app.main import app  # noqa: E402
 
 LLM_URL = "http://127.0.0.1:8791/v1"
-MCP_URL = "http://127.0.0.1:8792/mcp"
+MCP_URL = "http://127.0.0.1:18792/mcp"
 
 
 @pytest.fixture(scope="module")

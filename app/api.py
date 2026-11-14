@@ -12,7 +12,7 @@ from pydantic import BaseModel
 import httpx
 import websockets
 
-from . import agent, config, events, home, llm, mcp_client, routines, sandbox, screen, secrets_http
+from . import agent, config, copilot, events, home, llm, mcp_client, routines, sandbox, screen, secrets_http
 from .access import bot_role, can_manage, can_read_conversation, team_role
 from .db import (Approval, AuthToken, Bot, BotAccess, ChannelMember, Conversation, Endpoint, McpServer, Memory,
                  Message, Routine, Secret, Skill, Team, TeamMember, User, select, session)
@@ -260,7 +260,9 @@ def patch_team(team_id: int, body: TeamPatch, user: User = Depends(current_user)
 
 class EndpointIn(BaseModel):
     name: str
-    base_url: str
+    provider: str = "openai"  # openai | github_copilot
+    base_url: str = ""
+    github_domain: str = ""
     api_key: str = ""
     default_model: str
     shared: bool = False
@@ -268,7 +270,22 @@ class EndpointIn(BaseModel):
 
 def _ep_out(e: Endpoint) -> dict:  # the key never leaves the server
     return {"id": e.id, "name": e.name, "base_url": e.base_url, "default_model": e.default_model,
-            "shared": e.shared, "owner_id": e.owner_id, "has_key": bool(e.api_key_enc)}
+            "shared": e.shared, "owner_id": e.owner_id, "has_key": bool(e.api_key_enc),
+            "provider": getattr(e, "provider", None) or "openai",
+            "github_domain": getattr(e, "github_domain", None) or ""}
+
+
+def _normalize_provider(value: str) -> str:
+    provider = (value or "openai").strip()
+    _need(provider in ("openai", "github_copilot"), 400, "provider: openai | github_copilot")
+    return provider
+
+
+def _github_domain_or_400(raw: str) -> str:
+    try:
+        return copilot.normalize_domain(raw)
+    except ValueError as e:
+        raise HTTPException(400, str(e)) from e
 
 
 @router.get("/teams/{team_id}/endpoints")
@@ -281,11 +298,26 @@ def list_endpoints(team_id: int, user: User = Depends(current_user)):
 
 @router.post("/teams/{team_id}/endpoints")
 def create_endpoint(team_id: int, body: EndpointIn, user: User = Depends(current_user)):
-    _need(body.base_url.startswith(("http://", "https://")), 400, "base_url must start with http:// or https://")
+    _need(body.name.strip() and body.default_model.strip(), 400, "name and default model cannot be empty")
+    provider = _normalize_provider(body.provider)
+    if provider == "github_copilot":
+        domain = _github_domain_or_400(body.github_domain or "github.com")
+        _need(body.api_key.strip(), 400, "a GitHub token is required")
+        base = body.base_url.strip().rstrip("/")
+        if base:
+            _need(base.startswith(("http://", "https://")), 400, "base_url must start with http:// or https://")
+        else:
+            base = copilot.fallback_base(domain)
+        fields = dict(provider=provider, github_domain=domain, base_url=base,
+                      api_key_enc=config.encrypt(body.api_key.strip()))
+    else:
+        _need(body.base_url.startswith(("http://", "https://")), 400, "base_url must start with http:// or https://")
+        fields = dict(provider="openai", github_domain="", base_url=body.base_url.rstrip("/"),
+                      api_key_enc=config.encrypt(body.api_key))
     with session() as s:
         _need(team_role(s, user.id, team_id))
-        e = Endpoint(team_id=team_id, owner_id=user.id, name=body.name, base_url=body.base_url.rstrip("/"),
-                     api_key_enc=config.encrypt(body.api_key), default_model=body.default_model, shared=body.shared)
+        e = Endpoint(team_id=team_id, owner_id=user.id, name=body.name.strip(),
+                     default_model=body.default_model.strip(), shared=body.shared, **fields)
         s.add(e)
         s.commit()
     return _ep_out(e)
@@ -293,7 +325,9 @@ def create_endpoint(team_id: int, body: EndpointIn, user: User = Depends(current
 
 class EndpointPatch(BaseModel):
     name: Optional[str] = None
+    provider: Optional[str] = None
     base_url: Optional[str] = None
+    github_domain: Optional[str] = None
     api_key: Optional[str] = None  # left out = keep the stored key
     default_model: Optional[str] = None
     shared: Optional[bool] = None
@@ -302,17 +336,41 @@ class EndpointPatch(BaseModel):
 @router.patch("/endpoints/{endpoint_id}")
 def patch_endpoint(endpoint_id: int, body: EndpointPatch, user: User = Depends(current_user)):
     data = body.model_dump(exclude_none=True)
-    _need(all(str(data[k]).strip() for k in ("name", "base_url", "default_model") if k in data), 400,
-          "name, base URL and default model cannot be empty")
-    _need(data.get("base_url", "http://").startswith(("http://", "https://")), 400,
-          "base_url must start with http:// or https://")
+    _need(all(str(data[k]).strip() for k in ("name", "default_model") if k in data), 400,
+          "name and default model cannot be empty")
     with session() as s:
         e = s.get(Endpoint, endpoint_id)
         _need(e and e.owner_id == user.id, 404, "endpoint not found")
+        provider = _normalize_provider(data.get("provider", getattr(e, "provider", None) or "openai"))
+        if provider == "github_copilot":
+            raw_domain = data["github_domain"] if "github_domain" in data else (e.github_domain or "github.com")
+            domain = _github_domain_or_400(raw_domain)
+            data["github_domain"] = domain
+            if "api_key" in data:
+                _need(str(data["api_key"]).strip(), 400, "GitHub token cannot be empty")
+            elif not e.api_key_enc:
+                raise HTTPException(400, "a GitHub token is required")
+            if "base_url" in data:
+                base = data["base_url"].strip().rstrip("/")
+                if base:
+                    _need(base.startswith(("http://", "https://")), 400,
+                          "base_url must start with http:// or https://")
+                    data["base_url"] = base
+                else:
+                    data["base_url"] = copilot.fallback_base(domain)
+            elif (getattr(e, "provider", None) or "openai") != "github_copilot" or "github_domain" in data:
+                data["base_url"] = copilot.fallback_base(domain)
+        else:
+            data["github_domain"] = data.get("github_domain", "") or ""
+            if "base_url" in data:
+                _need(data["base_url"].strip().startswith(("http://", "https://")), 400,
+                      "base_url must start with http:// or https://")
+                data["base_url"] = data["base_url"].strip().rstrip("/")
+            elif (getattr(e, "provider", None) or "openai") == "github_copilot":
+                raise HTTPException(400, "base_url must start with http:// or https://")
+        data["provider"] = provider
         if "api_key" in data:
             e.api_key_enc = config.encrypt(data.pop("api_key"))
-        if "base_url" in data:
-            data["base_url"] = data["base_url"].strip().rstrip("/")
         for k, v in data.items():
             setattr(e, k, v.strip() if isinstance(v, str) else v)
         s.add(e)
@@ -345,6 +403,20 @@ async def test_endpoint(endpoint_id: int, user: User = Depends(current_user)):
         return {"reachable": False, "tool_calling": False, "detail": str(err)}
     return {"reachable": True, "tool_calling": bool(reply["tool_calls"]),
             "detail": "ok" if reply["tool_calls"] else "the model answered in text instead of calling the tool"}
+
+
+@router.get("/endpoints/{endpoint_id}/models")
+async def list_endpoint_models(endpoint_id: int, user: User = Depends(current_user)):
+    """Best-effort model list. The key is never returned."""
+    with session() as s:
+        e = s.get(Endpoint, endpoint_id)
+        _need(e, 404, "endpoint not found")
+        _need(e.owner_id == user.id or (e.shared and team_role(s, user.id, e.team_id)), 404, "endpoint not found")
+    try:
+        models = await llm.list_models(e)
+    except llm.LLMError as err:
+        return {"models": [], "detail": str(err)}
+    return {"models": models, "detail": "ok"}
 
 
 # ---------------------------------------------------------------- bots and sharing

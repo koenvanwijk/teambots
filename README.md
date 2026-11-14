@@ -8,7 +8,7 @@ capabilities that every teammate or client talks to in private.
 
 | Area | What works |
 | --- | --- |
-| Endpoints | Register any `/v1/chat/completions` endpoint (vLLM, Ollama, LiteLLM, ...), key stored encrypted and write-only, connection test that checks tool calling, model override per bot |
+| Endpoints | Register any `/v1/chat/completions` endpoint (vLLM, Ollama, LiteLLM, ...) or GitHub Copilot (github.com or a data-residency tenant such as `org.ghe.com`). The key or GitHub token is stored encrypted and write-only; a connection test checks tool calling; model override per bot |
 | Projects | A project is the workspace; an optional client name groups projects. The Overview page shows all your projects per client with their latest shared activity |
 | Bots | Several bots per project; every project member can make one. Personal bots and Team Bots |
 | Team Bots | Draft, publish, share with the whole project or selected people; roles owner / manager / collaborator |
@@ -29,8 +29,8 @@ capabilities that every teammate or client talks to in private.
 Not built: Slack / Discord / Microsoft Teams, meeting bots, voice, SSO, token streaming,
 event-triggered routines.
 
-What has and has not been tested: `pytest -q` runs 28 tests (24 end-to-end plus 4 unit tests for thinking-model replies) against a scripted model,
-including the screen tools with a real Xvfb and Chromium on the local backend. Not tested: the
+What has and has not been tested: `pytest -q` runs 36 tests (24 end-to-end, 4 unit tests for thinking-model replies, and 8 GitHub Copilot tests against a mock — no real token) against a scripted model,
+including the screen tools with a real Xvfb and Chromium on the local backend (skipped when those are missing). The test MCP listens on port 18792 so it does not collide with other local services. Not tested: the
 Docker sandbox backend, a real model, and anything on Windows or Hetzner.
 
 ## Run it on Linux
@@ -78,7 +78,7 @@ safe: it encrypts the stored API keys and secrets, and losing it makes them unre
 ## First steps in the UI
 
 1. Create an account, then a team. Share the invite code with teammates.
-2. Add an endpoint and click it to run the connection test. "tool calling: true" is required.
+2. Add an endpoint and click it to run the connection test. "tool calling: true" is required. For GitHub Copilot, pick that provider type and enter the GitHub domain (for example `ictgroup.ghe.com`) plus a GitHub OAuth token; TeamBots exchanges it for a short-lived Copilot session and does not store that session token.
 3. Create a bot. For a Team Bot: write instructions, add secrets / MCP servers / skills, then
    tick Published under Sharing.
 4. Chat. Create a channel and all project bots join it automatically and reply to every message; remove a bot or set it to mention-only if you do not want that. On a bot with computer use, **Open scherm** opens the interactive screen (sign in to Chromium there; the profile is kept in the project's Docker volume). To use `gh` in the sandbox, run `gh auth login` there (config is stored on the project volume); TeamBots secrets never enter the sandbox, so a `GH_TOKEN` secret cannot be used as an environment variable inside it.
@@ -149,6 +149,7 @@ app/db.py          data model (SQLModel)
 app/access.py      every permission rule
 app/agent.py       agent loop, tools, approval gate, handoff
 app/llm.py         OpenAI-compatible client
+app/copilot.py     GitHub Copilot provider (token exchange, cache, completions)
 app/sandbox.py     the project computer (docker / local)
 app/screen.py      a virtual screen per bot: screenshot, mouse, keyboard
 app/secrets_http.py  secrets filled in outside the sandbox, masking
@@ -157,6 +158,7 @@ app/routines.py    cron scheduler
 app/api.py         REST API + SSE
 app/static/        web UI without a build step: index.html, app.css, app.js
 tests/             end-to-end tests against a scripted model (pytest -q)
+scripts/           local helpers (e.g. import the OpenClaw ICT Copilot token)
 ```
 
 ## Security
