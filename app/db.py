@@ -283,8 +283,25 @@ class McpServer(SQLModel, table=True):
     bot_id: int = Field(index=True)
     name: str
     url: str  # streamable HTTP endpoint
-    headers_enc: str = ""  # JSON object, encrypted
+    headers_enc: str = ""  # JSON object of extra static headers, encrypted
     trusted: bool = False  # trusted servers skip the approval gate
+    # Auth. mode: "none" | "token" (static bearer/API key) | "oauth" (Phase 2, per user).
+    auth_mode: str = "none"
+    auth_scope: str = "shared"  # "shared" = one credential for the bot; "user" = each member connects their own
+    auth_header: str = "Authorization"  # header the token goes in
+    auth_prefix: str = "Bearer"  # scheme word joined to the token with a space ("" for a bare API key)
+    token_enc: str = ""  # the shared token (auth_scope == "shared"), encrypted
+
+
+class McpCredential(SQLModel, table=True):
+    """A per-user credential for an MCP server (auth_scope == "user"): each person connects
+    their own token, so a shared team bot uses the requester's own access."""
+    __table_args__ = (UniqueConstraint("mcp_server_id", "user_id", name="uq_mcpcred_server_user"),)
+    id: Optional[int] = Field(default=None, primary_key=True)
+    mcp_server_id: int = Field(index=True)
+    user_id: int = Field(index=True)
+    value_enc: str = ""  # the user's token, encrypted
+    updated_at: datetime = Field(default_factory=now)
 
 
 _connect_args = {"check_same_thread": False} if config.DB_URL.startswith("sqlite") else {}
@@ -299,6 +316,7 @@ def init_db() -> None:
     _ensure_oauth_columns()
     _ensure_costs_columns()
     _ensure_router_columns()
+    _ensure_mcp_auth_columns()
     from .usage import seed_prices
     seed_prices()
     migrate_channel_bots()
@@ -393,6 +411,25 @@ def _ensure_router_columns() -> None:
             conn.exec_driver_sql("ALTER TABLE message ADD COLUMN route VARCHAR DEFAULT ''")
         if "route_reason" not in msg_cols:
             conn.exec_driver_sql("ALTER TABLE message ADD COLUMN route_reason VARCHAR DEFAULT ''")
+        conn.commit()
+
+
+def _ensure_mcp_auth_columns() -> None:
+    """Add McpServer auth columns on databases created before per-user MCP auth existed."""
+    if not config.DB_URL.startswith("sqlite"):
+        return
+    with engine.connect() as conn:
+        cols = [r[1] for r in conn.exec_driver_sql("PRAGMA table_info(mcpserver)").fetchall()]
+        adds = {
+            "auth_mode": "VARCHAR NOT NULL DEFAULT 'none'",
+            "auth_scope": "VARCHAR NOT NULL DEFAULT 'shared'",
+            "auth_header": "VARCHAR NOT NULL DEFAULT 'Authorization'",
+            "auth_prefix": "VARCHAR NOT NULL DEFAULT 'Bearer'",
+            "token_enc": "VARCHAR NOT NULL DEFAULT ''",
+        }
+        for name, decl in adds.items():
+            if name not in cols:
+                conn.exec_driver_sql(f"ALTER TABLE mcpserver ADD COLUMN {name} {decl}")
         conn.commit()
 
 

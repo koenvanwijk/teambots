@@ -1242,7 +1242,7 @@ function closeDrawer() { const d = el('drawer'); if (d) { d.classList.remove('op
 async function openDrawer(bot, tab = 'setup') {
   const p = el('drawer'), manage = bot.role !== 'collaborator', again = t => openDrawer(bot, t || tab);
   clearInterval(S.screenTimer); clearInterval(S.previewTimer);
-  const tabs = [['setup', 'Setup'], manage && bot.is_team && ['sharing', 'Sharing'], ['knowledge', 'Memory and skills'], ['routines', 'Routines'], manage && ['connections', 'Secrets and tools']].filter(Boolean);
+  const tabs = [['setup', 'Setup'], manage && bot.is_team && ['sharing', 'Sharing'], ['knowledge', 'Memory and skills'], ['routines', 'Routines'], ['connections', manage ? 'Secrets and tools' : 'Tools']].filter(Boolean);
   const body = $('div', { className: 'dbody' });
   // A live screen preview above the tabs, refreshed every 5s. Each bot has its own screen on
   // the project computer, so this shows only when the bot has computer use.
@@ -1327,12 +1327,41 @@ async function openDrawer(bot, tab = 'setup') {
         return li(r.name, sub, $('label', { className: 'switch', title: r.enabled ? 'Enabled' : 'Paused' }, on), ib('play', 'Run now', guard(async () => { await api('POST', `/routines/${r.id}/run`); toast('Started'); }), 15), ib('edit', 'Edit', guard(() => editRoutine(r, again)), 15), del(`/routines/${r.id}`, 'this routine')); }) : none('No routines yet.'));
   }
   if (tab === 'connections') {
-    const [secrets, mcp] = await Promise.all([get('secrets'), get('mcp')]);
-    put(body, head('Secrets', 'Add', async () => { if (await form({ title: 'New secret', intro: 'The value never enters the sandbox or the model. The bot uses it by name in an HTTP request and it is filled in outside the sandbox.', ok: 'Save secret', fields: [{ name: 'name', label: 'Name', required: true, mono: true, placeholder: 'API_TOKEN', hint: 'Capitals, digits and underscores.' }, { name: 'value', label: 'Value', type: 'password', required: true, hint: 'Stored encrypted. It is never shown again.' }, { name: 'hosts', label: 'Hosts it may be sent to', mono: true, placeholder: 'api.github.com', hint: 'Comma-separated. Without a host the secret cannot be used.' }], onSubmit: v => api('POST', `/bots/${bot.id}/secrets`, { ...v, name: v.name.toUpperCase() }) })) { await loadCtx(S.conv); again(); } }),
-      hint('Everyone who can use the bot can make requests with its secrets to the bound hosts.'),
-      secrets.length ? secrets.map(s => li(s.name, s.hosts ? 'Only sent to ' + s.hosts : 'No host bound yet', del(`/secrets/${s.id}`, 'this secret'))) : none('No secrets.'),
-      head('MCP servers', 'Add', async () => { const r = await form({ title: 'New MCP server', intro: 'A streamable-HTTP MCP server. Its tools become tools of this bot.', ok: 'Connect', fields: [{ name: 'name', label: 'Name', required: true, mono: true, placeholder: 'tickets', hint: 'Lowercase letters, digits, - and _.' }, { name: 'url', label: 'URL', required: true, mono: true, value: 'http://localhost:9000/mcp' }, { name: 'trusted', label: 'Trusted', type: 'checkbox', hint: 'Its tools run without an approval card.' }], onSubmit: v => api('POST', `/bots/${bot.id}/mcp`, v) }); if (r) { toast(r.error || (r.tools.length ? 'Tools: ' + r.tools.join(', ') : 'Connected, but the server lists no tools'), r.error ? 'bad' : ''); again(); } }),
-      mcp.length ? mcp.map(s => li(s.name, s.url, $('span', { className: 'tag', textContent: s.trusted ? 'trusted' : 'asks first' }), del(`/mcp/${s.id}`, 'this server'))) : none('No MCP servers.'));
+    const mcp = await get('mcp');
+    const parts = [];
+    if (manage) {
+      const secrets = await get('secrets');
+      parts.push(head('Secrets', 'Add', async () => { if (await form({ title: 'New secret', intro: 'The value never enters the sandbox or the model. The bot uses it by name in an HTTP request and it is filled in outside the sandbox.', ok: 'Save secret', fields: [{ name: 'name', label: 'Name', required: true, mono: true, placeholder: 'API_TOKEN', hint: 'Capitals, digits and underscores.' }, { name: 'value', label: 'Value', type: 'password', required: true, hint: 'Stored encrypted. It is never shown again.' }, { name: 'hosts', label: 'Hosts it may be sent to', mono: true, placeholder: 'api.github.com', hint: 'Comma-separated. Without a host the secret cannot be used.' }], onSubmit: v => api('POST', `/bots/${bot.id}/secrets`, { ...v, name: v.name.toUpperCase() }) })) { await loadCtx(S.conv); again(); } }),
+        hint('Everyone who can use the bot can make requests with its secrets to the bound hosts.'),
+        secrets.length ? secrets.map(s => li(s.name, s.hosts ? 'Only sent to ' + s.hosts : 'No host bound yet', del(`/secrets/${s.id}`, 'this secret'))) : none('No secrets.'));
+    }
+    const addMcp = async () => { const r = await form({ title: 'New MCP server', intro: 'A streamable-HTTP MCP server. Its tools become tools of this bot.', ok: 'Add', fields: [
+        { name: 'name', label: 'Name', required: true, mono: true, placeholder: 'homey', hint: 'Lowercase letters, digits, - and _.' },
+        { name: 'url', label: 'URL', required: true, mono: true, value: 'https://' },
+        { name: 'trusted', label: 'Trusted', type: 'checkbox', hint: 'Its tools run without an approval card.' },
+        { name: 'auth_mode', label: 'Authentication', type: 'select', value: 'none', options: [{ value: 'none', label: 'None' }, { value: 'token', label: 'API key / token' }] },
+        { name: 'auth_scope', label: 'Token', type: 'select', value: 'user', when: v => v.auth_mode === 'token', options: [{ value: 'user', label: 'Each member connects their own' }, { value: 'shared', label: 'One shared token for the bot' }] },
+        { name: 'auth_header', label: 'Header name', mono: true, value: 'Authorization', when: v => v.auth_mode === 'token', hint: 'e.g. Authorization or X-API-Key.' },
+        { name: 'auth_prefix', label: 'Prefix', mono: true, value: 'Bearer', when: v => v.auth_mode === 'token', hint: 'Joined to the token with a space. Leave empty for a bare API key.' },
+        { name: 'token', label: 'Shared token', type: 'password', when: v => v.auth_mode === 'token' && v.auth_scope === 'shared', required: v => v.auth_mode === 'token' && v.auth_scope === 'shared', hint: 'Stored encrypted. Used for everyone who uses this bot.' },
+      ], onSubmit: v => api('POST', `/bots/${bot.id}/mcp`, v) }); if (r) { toast(r.error || (r.tools.length ? 'Tools: ' + r.tools.join(', ') : 'Saved. Members can connect their own token below.'), r.error ? 'bad' : ''); again(); } };
+    const mcpRow = srv => {
+      const perUser = srv.auth_mode === 'token' && srv.auth_scope === 'user';
+      const tail = [$('span', { className: 'tag', textContent: srv.trusted ? 'trusted' : 'asks first' })];
+      if (srv.auth_mode === 'token') tail.push($('span', { className: 'tag', textContent: perUser ? (srv.connected ? 'you: connected' : 'you: not connected') : 'shared token' }));
+      if (perUser) {
+        tail.push($('button', { className: 'btn sm', textContent: srv.connected ? 'Update token' : 'Connect', onclick: guard(async () => {
+          const v = await form({ title: `Connect ${srv.name}`, intro: 'Paste your own token for this service. It is stored encrypted and used only for your own requests in this team.', ok: 'Save', fields: [{ name: 'value', label: 'Your token', type: 'password', required: true }], onSubmit: x => api('PUT', `/mcp/${srv.id}/credential`, x) });
+          if (v) { toast('Connected'); again(); } }) }));
+        if (srv.connected) tail.push(ib('x', 'Disconnect', guard(async () => { await api('DELETE', `/mcp/${srv.id}/credential`); toast('Disconnected'); again(); }), 15));
+      }
+      if (manage) tail.push(del(`/mcp/${srv.id}`, 'this server'));
+      return li(srv.name, srv.url, ...tail);
+    };
+    parts.push(head('MCP servers', manage && 'Add', manage ? addMcp : null),
+      hint(manage ? 'Each MCP server adds its tools to this bot. For a per-user server, every member connects their own token.' : 'Connect your own token to use these tools with your account.'),
+      mcp.length ? mcp.map(mcpRow) : none(manage ? 'No MCP servers.' : 'No tools to connect.'));
+    put(body, ...parts);
   }
 }
 

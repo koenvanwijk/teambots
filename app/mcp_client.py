@@ -1,4 +1,10 @@
-"""Minimal MCP client (streamable HTTP). Each call opens a short-lived session."""
+"""Minimal MCP client (streamable HTTP). Each call opens a short-lived session.
+
+Auth is resolved per call: a server can be anonymous, use a shared static token, or
+use a per-user token (each member connects their own, so a shared team bot calls the
+MCP server as the requester). Tokens live encrypted in the database and never reach
+the sandbox or the model.
+"""
 import json
 import time
 
@@ -6,32 +12,68 @@ from mcp import ClientSession
 from mcp.client.streamable_http import streamablehttp_client
 
 from . import config
-from .db import McpServer
+from .db import McpCredential, McpServer, select, session  # noqa: F401 (McpServer for type context)
 
-_cache: dict[int, tuple[float, list[dict]]] = {}
+_cache: dict[tuple[int, int], tuple[float, list[dict]]] = {}
 
 
-def _headers(server: McpServer) -> dict:
+class McpAuthError(Exception):
+    """A token is required but missing (not configured, or the user has not connected)."""
+
+
+def _static_headers(server: McpServer) -> dict:
     return json.loads(config.decrypt(server.headers_enc)) if server.headers_enc else {}
 
 
-async def list_tools(server: McpServer, ttl: float = 120) -> list[dict]:
-    """Return [{'name', 'description', 'parameters'}]; cached for `ttl` seconds."""
-    hit = _cache.get(server.id)
+def user_token(server_id: int, user_id: int) -> str:
+    with session() as s:
+        cred = s.exec(select(McpCredential).where(
+            McpCredential.mcp_server_id == server_id, McpCredential.user_id == user_id)).first()
+    return config.decrypt(cred.value_enc) if cred and cred.value_enc else ""
+
+
+def resolve_headers(server: McpServer, user_id: int | None = None) -> dict:
+    """Headers for a request, including auth. Raises McpAuthError if a needed token is missing."""
+    headers = _static_headers(server)
+    mode = getattr(server, "auth_mode", "none") or "none"
+    if mode == "token":
+        scope = getattr(server, "auth_scope", "shared") or "shared"
+        if scope == "user":
+            if not user_id:
+                raise McpAuthError(f"'{server.name}' needs your personal token")
+            value = user_token(server.id, user_id)
+            if not value:
+                raise McpAuthError(f"connect your account for '{server.name}' in the bot's settings")
+        else:
+            value = config.decrypt(server.token_enc) if getattr(server, "token_enc", "") else ""
+            if not value:
+                raise McpAuthError(f"'{server.name}' has no token configured")
+        header = getattr(server, "auth_header", None) or "Authorization"
+        prefix = (getattr(server, "auth_prefix", "") or "").strip()
+        headers[header] = f"{prefix} {value}" if prefix else value
+    return headers
+
+
+async def list_tools(server: McpServer, user_id: int | None = None, ttl: float = 120) -> list[dict]:
+    """Return [{'name', 'description', 'parameters'}]; cached for `ttl` seconds per (server, user)."""
+    key = (server.id, user_id or 0)
+    hit = _cache.get(key)
     if hit and time.time() - hit[0] < ttl:
         return hit[1]
-    async with streamablehttp_client(server.url, headers=_headers(server)) as (read, write, _):
+    headers = resolve_headers(server, user_id)
+    async with streamablehttp_client(server.url, headers=headers) as (read, write, _):
         async with ClientSession(read, write) as sess:
             await sess.initialize()
             res = await sess.list_tools()
     tools = [{"name": t.name, "description": t.description or "",
               "parameters": t.inputSchema or {"type": "object", "properties": {}}} for t in res.tools]
-    _cache[server.id] = (time.time(), tools)
+    _cache[key] = (time.time(), tools)
     return tools
 
 
-async def call_tool(server: McpServer, name: str, arguments: dict) -> str:
-    async with streamablehttp_client(server.url, headers=_headers(server)) as (read, write, _):
+async def call_tool(server: McpServer, name: str, arguments: dict, user_id: int | None = None) -> str:
+    headers = resolve_headers(server, user_id)
+    async with streamablehttp_client(server.url, headers=headers) as (read, write, _):
         async with ClientSession(read, write) as sess:
             await sess.initialize()
             res = await sess.call_tool(name, arguments)
@@ -41,4 +83,5 @@ async def call_tool(server: McpServer, name: str, arguments: dict) -> str:
 
 
 def invalidate(server_id: int) -> None:
-    _cache.pop(server_id, None)
+    for key in [k for k in _cache if k[0] == server_id]:
+        _cache.pop(key, None)

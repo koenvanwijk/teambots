@@ -19,8 +19,9 @@ import websockets
 
 from . import agent, config, copilot, events, home, llm, mcp_client, oauth, routines, sandbox, screen, secrets_http
 from .access import bot_role, can_manage, can_read_conversation, team_role
-from .db import (Approval, AuthToken, Bot, BotAccess, ChannelMember, Conversation, Endpoint, Identity, McpServer,
-                 Memory, Message, OAuthState, Routine, Secret, Skill, Team, TeamMember, User, now, select, session)
+from .db import (Approval, AuthToken, Bot, BotAccess, ChannelMember, Conversation, Endpoint, Identity, McpCredential,
+                 McpServer, Memory, Message, OAuthState, Routine, Secret, Skill, Team, TeamMember, User, now, select,
+                 session)
 
 router = APIRouter(prefix="/api")
 
@@ -847,6 +848,9 @@ async def delete_bot(bot_id: int, user: User = Depends(current_user)):
             for m in s.exec(select(Message).where(Message.conversation_id == conv.id)).all():
                 s.delete(m)
             s.delete(conv)
+        for srv in s.exec(select(McpServer).where(McpServer.bot_id == bot_id)).all():
+            for cred in s.exec(select(McpCredential).where(McpCredential.mcp_server_id == srv.id)).all():
+                s.delete(cred)
         for model in (BotAccess, Memory, Skill, Routine, Secret, McpServer, Approval, ChannelMember):
             for row in s.exec(select(model).where(model.bot_id == bot_id)).all():
                 s.delete(row)
@@ -1047,31 +1051,106 @@ class McpIn(BaseModel):
     url: str
     headers: dict[str, str] = {}
     trusted: bool = False
+    auth_mode: str = "none"       # none | token
+    auth_scope: str = "shared"    # shared (one token for the bot) | user (each member connects their own)
+    auth_header: str = "Authorization"
+    auth_prefix: str = "Bearer "
+    token: str = ""               # the shared token, when auth_mode=token and auth_scope=shared
+
+
+def _mcp_out(r: McpServer, user_id: int, s) -> dict:
+    """The token value is never returned; `connected` says whether this user has a per-user token."""
+    per_user = r.auth_mode == "token" and r.auth_scope == "user"
+    connected = bool(s.exec(select(McpCredential).where(
+        McpCredential.mcp_server_id == r.id, McpCredential.user_id == user_id)).first()) if per_user else None
+    return {"id": r.id, "name": r.name, "url": r.url, "trusted": r.trusted,
+            "auth_mode": getattr(r, "auth_mode", "none") or "none", "auth_scope": getattr(r, "auth_scope", "shared"),
+            "auth_header": getattr(r, "auth_header", "Authorization"), "auth_prefix": getattr(r, "auth_prefix", ""),
+            "has_shared_token": bool(getattr(r, "token_enc", "")), "connected": connected}
 
 
 @router.get("/bots/{bot_id}/mcp")
 def list_mcp(bot_id: int, user: User = Depends(current_user)):
+    # Any user of the bot may list servers and see whether they are connected, so a team
+    # member can connect their own per-user token without being a manager.
     with session() as s:
-        _bot(s, bot_id, user, manage=True)
+        _bot(s, bot_id, user)
         rows = s.exec(select(McpServer).where(McpServer.bot_id == bot_id)).all()
-    return [{"id": r.id, "name": r.name, "url": r.url, "trusted": r.trusted} for r in rows]
+        return [_mcp_out(r, user.id, s) for r in rows]
 
 
 @router.post("/bots/{bot_id}/mcp")
 async def add_mcp(bot_id: int, body: McpIn, user: User = Depends(current_user)):
     _need(re.fullmatch(r"[a-z0-9_-]{1,24}", body.name), 400, "name: 1-24 chars of a-z 0-9 _ -")
+    _need(body.auth_mode in ("none", "token"), 400, "auth_mode: none | token")
+    _need(body.auth_scope in ("shared", "user"), 400, "auth_scope: shared | user")
+    token_enc = ""
+    if body.auth_mode == "token" and body.auth_scope == "shared":
+        _need(body.token.strip(), 400, "a shared-token server needs a token")
+        token_enc = config.encrypt(body.token.strip())
     with session() as s:
         _bot(s, bot_id, user, manage=True)
         r = McpServer(bot_id=bot_id, name=body.name, url=body.url, trusted=body.trusted,
-                      headers_enc=config.encrypt(json.dumps(body.headers)) if body.headers else "")
+                      headers_enc=config.encrypt(json.dumps(body.headers)) if body.headers else "",
+                      auth_mode=body.auth_mode, auth_scope=body.auth_scope,
+                      auth_header=(body.auth_header or "Authorization").strip(),
+                      auth_prefix=body.auth_prefix, token_enc=token_enc)
         s.add(r)
         s.commit()
+        r_id = r.id
+    # A per-user server has no credentials yet, so don't probe it as the adder.
     try:
-        tools = [t["name"] for t in await asyncio.wait_for(mcp_client.list_tools(r, ttl=0), 20)]
+        probe_user = user.id if body.auth_scope != "user" else None
+        with session() as s:
+            r = s.get(McpServer, r_id)
+        tools = [t["name"] for t in await asyncio.wait_for(mcp_client.list_tools(r, probe_user, ttl=0), 20)]
         error = ""
     except Exception as e:  # noqa: BLE001
         tools, error = [], f"saved, but the server did not answer: {e.__class__.__name__}"
-    return {"id": r.id, "name": r.name, "tools": tools, "error": error}
+    return {"id": r_id, "name": body.name, "tools": tools, "error": error}
+
+
+class McpCredIn(BaseModel):
+    value: str
+
+
+@router.put("/mcp/{server_id}/credential")
+def set_mcp_credential(server_id: int, body: McpCredIn, user: User = Depends(current_user)):
+    """Connect the current user's own token to a per-user MCP server. Usable by any member."""
+    _need(body.value.strip(), 400, "token cannot be empty")
+    with session() as s:
+        r = s.get(McpServer, server_id)
+        _need(r, 404, "server not found")
+        _bot(s, r.bot_id, user)
+        _need(r.auth_mode == "token" and r.auth_scope == "user", 400,
+              "this server does not use per-user tokens")
+        cred = s.exec(select(McpCredential).where(
+            McpCredential.mcp_server_id == server_id, McpCredential.user_id == user.id)).first()
+        if cred:
+            cred.value_enc = config.encrypt(body.value.strip())
+            cred.updated_at = now()
+        else:
+            cred = McpCredential(mcp_server_id=server_id, user_id=user.id,
+                                 value_enc=config.encrypt(body.value.strip()))
+        s.add(cred)
+        s.commit()
+    mcp_client.invalidate(server_id)
+    return {"ok": True, "connected": True}
+
+
+@router.delete("/mcp/{server_id}/credential")
+def clear_mcp_credential(server_id: int, user: User = Depends(current_user)):
+    with session() as s:
+        r = s.get(McpServer, server_id)
+        _need(r, 404, "server not found")
+        _bot(s, r.bot_id, user)
+        cred = s.exec(select(McpCredential).where(
+            McpCredential.mcp_server_id == server_id, McpCredential.user_id == user.id)).first()
+        if cred:
+            s.delete(cred)
+            s.commit()
+    mcp_client.invalidate(server_id)
+    return {"ok": True, "connected": False}
 
 
 @router.delete("/mcp/{server_id}")
@@ -1080,6 +1159,8 @@ def delete_mcp(server_id: int, user: User = Depends(current_user)):
         r = s.get(McpServer, server_id)
         _need(r, 404, "server not found")
         _bot(s, r.bot_id, user, manage=True)
+        for cred in s.exec(select(McpCredential).where(McpCredential.mcp_server_id == server_id)).all():
+            s.delete(cred)
         s.delete(r)
         s.commit()
     mcp_client.invalidate(server_id)

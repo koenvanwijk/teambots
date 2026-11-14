@@ -194,7 +194,7 @@ async def build_tools(bot: Bot, ctx: Ctx) -> tuple[list[dict], dict[str, tuple[M
         servers = s.exec(select(McpServer).where(McpServer.bot_id == bot.id)).all()
     for srv in servers:
         try:
-            tools = await asyncio.wait_for(mcp_client.list_tools(srv), 20)
+            tools = await asyncio.wait_for(mcp_client.list_tools(srv, ctx.requester_id), 20)
         except Exception as e:  # noqa: BLE001 - an unreachable server must not break the bot
             log.warning("MCP server %s unavailable: %s", srv.name, e)
             continue
@@ -258,7 +258,7 @@ async def _screen(ctx: Ctx, name: str, args: dict) -> str:
 async def _execute(ctx: Ctx, name: str, args: dict, mcp_map: dict) -> str:
     if name in mcp_map:
         srv, real = mcp_map[name]
-        return await asyncio.wait_for(mcp_client.call_tool(srv, real, args), 120)
+        return await asyncio.wait_for(mcp_client.call_tool(srv, real, args, ctx.requester_id), 120)
     if name.startswith("screen_"):
         return await _screen(ctx, name, args)
     if name == "http_request":
@@ -376,7 +376,7 @@ async def _execute(ctx: Ctx, name: str, args: dict, mcp_map: dict) -> str:
         return await run_subagent(sub, args["message"], asked_by=bot.name)
     if name == "add_mcp_server":
         try:
-            tools = [t["name"] for t in await asyncio.wait_for(mcp_client.list_tools(new_mcp, ttl=0), 20)]
+            tools = [t["name"] for t in await asyncio.wait_for(mcp_client.list_tools(new_mcp, ctx.requester_id, ttl=0), 20)]
             return f"MCP server '{new_mcp.name}' added. New tools: {', '.join(tools) or 'none listed yet'}."
         except Exception:  # noqa: BLE001
             return f"MCP server '{new_mcp.name}' added, but it did not answer yet; its tools appear once it does."
