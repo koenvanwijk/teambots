@@ -763,7 +763,7 @@ async function newChannel() {
 }
 
 // ---------------------------------------------------------------- conversation
-function stopConv() { if (S.es) { S.es.close(); S.es = null; } S.dockSync = null; clearInterval(S.screenTimer); }
+function stopConv() { if (S.es) { S.es.close(); S.es = null; } S.dockSync = null; clearInterval(S.screenTimer); clearInterval(S.previewTimer); }
 const openBot = async b => openConv(await api('POST', `/bots/${b.id}/dm`), b);
 const openFeed = async b => openConv(await api('GET', `/bots/${b.id}/feed`), b);
 async function openOverview() {
@@ -1187,14 +1187,27 @@ function secretGuard(found, { swap, send, focus }) {
 }
 
 // ---------------------------------------------------------------- bot settings
-function closeDrawer() { const d = el('drawer'); if (d) { d.classList.remove('open'); d.replaceChildren(); } clearInterval(S.screenTimer); }
+function closeDrawer() { const d = el('drawer'); if (d) { d.classList.remove('open'); d.replaceChildren(); } clearInterval(S.screenTimer); clearInterval(S.previewTimer); }
 async function openDrawer(bot, tab = 'setup') {
   const p = el('drawer'), manage = bot.role !== 'collaborator', again = t => openDrawer(bot, t || tab);
-  clearInterval(S.screenTimer);
+  clearInterval(S.screenTimer); clearInterval(S.previewTimer);
   const tabs = [['setup', 'Setup'], manage && bot.is_team && ['sharing', 'Sharing'], ['knowledge', 'Memory and skills'], ['routines', 'Routines'], manage && ['connections', 'Secrets and tools'], bot.computer_use && ['screen', 'Screen']].filter(Boolean);
   const body = $('div', { className: 'dbody' });
-  p.replaceChildren($('div', { className: 'dhead' }, avatar(bot.name, 'bot'), $('div', { className: 'nm' }, $('b', { textContent: bot.name }), $('small', { textContent: `@${bot.handle} · ${bot.is_team ? 'Team Bot' : 'Personal bot'} · you are ${bot.role}` })), ib('x', 'Close', closeDrawer)),
-    $('div', { className: 'tabs', role: 'tablist' }, tabs.map(([id, label]) => $('button', { className: id === tab ? 'on' : '', role: 'tab', textContent: label, onclick: () => again(id) }))), body);
+  // A live screen preview above the tabs, refreshed every 5s. Each bot has its own screen on
+  // the project computer, so this shows only when the bot has computer use.
+  let preview = null;
+  if (bot.computer_use) {
+    const pimg = $('img', { className: 'shot', alt: `Live screen of ${bot.name}` });
+    const ptick = () => { const n = new Image(); n.onload = () => { pimg.src = n.src; pimg.classList.add('ready'); }; n.src = withToken(`/bots/${bot.id}/screen.jpg?t=${Date.now()}`); };
+    preview = $('button', { className: 'screenpreview', title: 'Live screen, refreshed every 5 seconds. Click to open the full screen.',
+      onclick: () => window.open(withToken(`/bots/${bot.id}/screen/vnc/`), '_blank', 'noopener') }, pimg, $('span', { className: 'spbadge' }, icon('screen', 12), 'Live'));
+    ptick(); S.previewTimer = setInterval(ptick, 5000);
+  }
+  p.replaceChildren(...[
+    $('div', { className: 'dhead' }, avatar(bot.name, 'bot'), $('div', { className: 'nm' }, $('b', { textContent: bot.name }), $('small', { textContent: `@${bot.handle} · ${bot.is_team ? 'Team Bot' : 'Personal bot'} · you are ${bot.role}` })), ib('x', 'Close', closeDrawer)),
+    preview,
+    $('div', { className: 'tabs', role: 'tablist' }, tabs.map(([id, label]) => $('button', { className: id === tab ? 'on' : '', role: 'tab', textContent: label, onclick: () => again(id) }))),
+    body].filter(Boolean));
   p.classList.add('open');
   const head = (title, addLabel, add) => $('h4', {}, title, add && $('button', { className: 'btn sm', onclick: guard(add) }, icon('plus', 14), addLabel));
   const hint = text => $('p', { className: 'hint', textContent: text });
