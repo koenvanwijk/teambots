@@ -279,7 +279,7 @@ function renderSide() {
   const item = (on, onclick, lead, text, ...tail) => $('div', { className: 'item' + (on ? ' on' : ''), role: 'button', tabIndex: 0, onclick: guard(onclick), onkeydown: e => { if (e.key === 'Enter' && e.target === e.currentTarget) e.currentTarget.click(); } }, lead, $('span', { className: 'grow', textContent: text }), tail);
   const list = $('div', { className: 'scroll' });
   if (t) {
-    list.append(sec('Bots', 'New bot', newBot));
+    list.append(sec('Bots (private chat)', 'New bot', newBot));
     if (!S.bots.length) list.append($('div', { className: 'emptyhint', textContent: S.endpoints.length ? 'No bots yet.' : 'Add an endpoint, then create a bot.' }));
     const more = items => ib('dots', 'Rename and more', e => { e.stopPropagation(); popmenu(e.currentTarget, items); }, 15);
     for (const b of S.bots) list.append(item(c && c.kind === 'dm' && c.bot_id === b.id, () => openBot(b), avatar(b.name, 'bot'), b.name, botTag(b), botCostTag(b),
