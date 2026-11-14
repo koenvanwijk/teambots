@@ -545,6 +545,14 @@ function deliveryNote(m) {
   const d = S.state.delivery[m.id];
   return d === 'steer' ? ['s', 'check', 'Added to the running task'] : d === 'interrupt' ? ['i', 'stop', 'Stopped the running task for this'] : d === 'dropped' ? ['d', 'x', 'Not run, because you stopped the bot'] : d === 'stopped' ? ['x', 'stop', 'You stopped the bot here'] : null;
 }
+/** Mock-LLM test format: a user message that only asks the scripted model to call a tool. */
+function toolDirective(text) {
+  const m = /^\s*TOOL:\s*(\{[\s\S]*\})\s*$/.exec(text || '');
+  if (!m) return null;
+  try { const o = JSON.parse(m[1]); return o && o.name ? o : null; } catch { return null; }
+}
+/** Mock-LLM final answer (`RESULT: …` / `ECHO[mock-1]: …`) must never appear as a chat bubble. */
+function isMockLeak(text) { return /^\s*(RESULT:|ECHO\[mock[-\w]*\]:)/.test(text || ''); }
 function blocks() {
   const c = S.conv, out = [];
   if (!S.msgs.length) return [{ key: 'hero', sig: c.kind + S.ctx.skills.length, make: heroNode }];
@@ -556,6 +564,9 @@ function blocks() {
     out.push({ key: 'g' + g.id, sig: g.calls.map(x => x.r ? 'r' + x.r.id : x.a ? 'a' + x.a.id : busy ? 'run' : 'idle').join() + (S.details ? 'D' : ''), make: () => workNode(g, busy) }); };
   for (const m of S.msgs) {
     if (m.role === 'tool') continue;
+    // Raw TOOL:/RESULT:/ECHO[mock] text is test format, not a chat message. Tool calls already fold into a step.
+    if (m.role === 'user' && toolDirective(m.content)) continue;
+    if (m.role === 'assistant' && isMockLeak(m.content) && !(m.tool_calls && m.tool_calls.length)) continue;
     const d = ts(m.created_at), dn = d.toDateString();
     if (dn !== day) { flush(); if (day || dn !== new Date().toDateString()) out.push({ key: 'd' + dn, sig: '', make: () => $('div', { className: 'daysep', textContent: dayName(d) }) }); day = dn; }
     if (m.content) { flush(); working = false; const note = m.role === 'user' ? deliveryNote(m) : null; out.push({ key: 'm' + m.id, sig: note ? note[0] : '', make: () => msgNode(m, note) }); }
@@ -589,8 +600,8 @@ function updateJump() { const v = el('view'), j = el('jump'); if (j) j.classList
 function heroNode() {
   const c = S.conv, b = S.bot;
   if (c.kind === 'feed') return $('div', { className: 'herobox', style: 'padding-top:16vh' }, $('p', { textContent: 'No shared activity yet. When this bot finishes a task for someone, a short summary shows up here.' }));
-  if (c.kind === 'dm') return $('div', { className: 'herobox' }, avatar(c.name, 'bot lg'), $('h1', { textContent: 'What can I do for you?' }),
-    $('p', { textContent: (b && b.instructions.trim().split('\n')[0]) || `${c.name} works on the project computer and remembers what matters.` }));
+  if (c.kind === 'dm' || c.kind === 'home') return $('div', { className: 'herobox' }, avatar(c.name, 'bot lg'), $('h1', { textContent: 'What can I do for you?' }),
+    $('p', { textContent: c.kind === 'home' ? 'I can see every project, bot and channel you have access to.' : ((b && b.instructions.trim().split('\n')[0]) || `${c.name} works on the project computer and remembers what matters.`)}));
   return $('div', { className: 'herobox' }, $('h1', { textContent: '# ' + c.name }), $('p', { textContent: (S.ctx.mem && S.ctx.mem.bots.length) ? 'The bots here reply to every message. Mention one with @ to address only that bot.' : 'There is no bot in this channel. Type @ to add one.' }));
 }
 function msgNode(m, note) {
@@ -601,14 +612,15 @@ function msgNode(m, note) {
     return $('div', { className: 'msg user' + (mine ? ' mine' : '') }, !mine && $('div', { className: 'who' }, avatar(m.author), m.author || 'Someone', time), plain(m.content, $('div', { className: 'body', title: mine ? when.toLocaleString() : '' })),
       note && $('div', { className: 'note' }, icon(note[1], 13), note[2]));
   }
+  const direct = c.kind === 'dm' || c.kind === 'home';
   const body = $('div', { className: 'body' }, md(m.content)), done = ib('copy', 'Copy', async e => { const btn = e.currentTarget; await copyText(m.content); btn.replaceChildren(icon('check')); setTimeout(() => btn.replaceChildren(icon('copy')), 1500); }, 15);
-  return $('div', { className: 'msg bot' + (/^Endpoint error: /.test(m.content) ? ' error' : '') }, c.kind !== 'dm' && $('div', { className: 'who' }, avatar(m.author, 'bot'), m.author, time), body, $('div', { className: 'acts' }, done, c.kind === 'dm' && $('span', { className: 'muted', style: 'font-size:12px;align-self:center;margin-left:4px', textContent: clock(when) })));
+  return $('div', { className: 'msg bot' + (/^Endpoint error: /.test(m.content) ? ' error' : '') }, !direct && $('div', { className: 'who' }, avatar(m.author, 'bot'), m.author, time), body, $('div', { className: 'acts' }, done, direct && $('span', { className: 'muted', style: 'font-size:12px;align-self:center;margin-left:4px', textContent: clock(when) })));
 }
 const failed = r => !!r && /^(denied|cancelled|stopped|error)|^exit code [1-9]/.test(r.content);
 /** One quiet line for everything a bot did in a row. Commands and file contents stay folded away. */
 function workNode(g, busy) {
   const n = g.calls.length, asks = g.calls.filter(x => x.a).length, open = g.calls.filter(x => !x.r && !x.a), bad = g.calls.filter(x => failed(x.r)).length;
-  const running = busy && open.length > 0, who = S.conv.kind === 'dm' ? '' : g.author + ' · ';
+  const running = busy && open.length > 0, who = (S.conv.kind === 'dm' || S.conv.kind === 'home') ? '' : g.author + ' · ';
   const kinds = [...new Set(g.calls.map(x => toolInfo(x.tc.function.name)[1]))];
   const text = asks ? 'Needs your approval' : running ? toolInfo(open[open.length - 1].tc.function.name)[1] : `${n} ${n === 1 ? 'step' : 'steps'}` + (bad ? ` · ${bad} did not succeed` : '') + (open.length ? ' · stopped' : '');
   const lead = asks ? icon('pause', 15) : running ? $('span', { className: 'spin' }) : icon(bad || open.length ? 'dots' : 'check', 15);

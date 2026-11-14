@@ -595,7 +595,10 @@ async def _run_locked(conv_id: int, bot_id: int, requester_id: int, run: Run | N
         calls = reply["tool_calls"]
         if not calls and run and None in run.steers.values():
             continue  # the person added something while the model was answering: answer again, with it
-        msg = _post(conv_id, role="assistant", content=reply["content"],
+        text = (reply["content"] or "").strip()
+        if not calls and not text:
+            text = "The model returned no text. Please try again."
+        msg = _post(conv_id, role="assistant", content=text if not calls else (reply["content"] or ""),
                     tool_calls=json.dumps(calls) if calls else "", **common)
         if not calls:
             await share_activity(conv, bot, user, ep)

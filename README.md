@@ -29,7 +29,7 @@ capabilities that every teammate or client talks to in private.
 Not built: Slack / Discord / Microsoft Teams, meeting bots, voice, SSO, token streaming,
 event-triggered routines.
 
-What has and has not been tested: `pytest -q` runs 24 end-to-end tests against a scripted model,
+What has and has not been tested: `pytest -q` runs 28 tests (24 end-to-end plus 4 unit tests for thinking-model replies) against a scripted model,
 including the screen tools with a real Xvfb and Chromium on the local backend. Not tested: the
 Docker sandbox backend, a real model, and anything on Windows or Hetzner.
 
@@ -140,6 +140,7 @@ TeamBots is meant to sit behind a TLS reverse proxy. It honours `X-Forwarded-Pro
 | `TB_BIND`, `TB_DOMAIN` | `127.0.0.1`, `localhost` | Compose: bind address of the app, domain for Caddy |
 | `TB_TIMEZONE` | `Europe/Amsterdam` | Time zone for cron expressions |
 | `TB_MAX_STEPS` | `12` | Tool-call rounds per turn |
+| `TB_MAX_TOKENS` | `8192` | Completion budget sent to the model (thinking models need headroom so `reasoning_content` does not eat the whole reply) |
 
 ## Layout
 

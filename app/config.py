@@ -19,6 +19,9 @@ SANDBOX_BROWSER = os.environ.get("TB_BROWSER", "google-chrome")
 HTTP_ALLOW_PRIVATE = os.environ.get("TB_HTTP_ALLOW_PRIVATE", "0") == "1"
 MAX_STEPS = int(os.environ.get("TB_MAX_STEPS", "12"))
 LLM_TIMEOUT = float(os.environ.get("TB_LLM_TIMEOUT", "180"))
+# Completion budget. Thinking models spend tokens on reasoning_content first;
+# too low a cap yields an empty visible answer.
+LLM_MAX_TOKENS = int(os.environ.get("TB_MAX_TOKENS", "8192"))
 
 _fernet = Fernet(base64.urlsafe_b64encode(hashlib.sha256(SECRET_KEY.encode()).digest()))
 
