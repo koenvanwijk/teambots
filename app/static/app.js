@@ -31,7 +31,7 @@ const ICONS = {
   home: 'M4 11l8-7 8 7v9H15v-6h-6v6H4z', trash: 'M5 7h14M10 7V4h4v3M7 7l1 13h8l1-13',
   play: 'M8 5l11 7-11 7z', clock: 'M12 21a9 9 0 1 0 0-18 9 9 0 0 0 0 18zM12 7v5l3 2', coin: 'M12 21a9 9 0 1 0 0-18 9 9 0 0 0 0 18zM8 12h8M12 8v8', screen: 'M3 5h18v11H3zM9 20h6M12 16v4',
   globe: 'M12 21a9 9 0 1 0 0-18 9 9 0 0 0 0 18zM3 12h18M12 3c3 3 3 15 0 18M12 3c-3 3-3 15 0 18', book: 'M5 4h13v16H7a2 2 0 0 1-2-2zM5 18a2 2 0 0 1 2-2h11',
-  lock: 'M6 11h12v9H6zM9 11V8a3 3 0 0 1 6 0v3', edit: 'M4 20h4L19 9l-4-4L4 16zM13 7l4 4', stop: 'M7 7h10v10H7z', menu: 'M4 7h16M4 12h16M4 17h16', dots: 'M5 12h.01M12 12h.01M19 12h.01', pause: 'M9 6v12M15 6v12',
+  lock: 'M6 11h12v9H6zM9 11V8a3 3 0 0 1 6 0v3', arrow: 'M5 12h14M13 6l6 6-6 6', edit: 'M4 20h4L19 9l-4-4L4 16zM13 7l4 4', stop: 'M7 7h10v10H7z', menu: 'M4 7h16M4 12h16M4 17h16', dots: 'M5 12h.01M12 12h.01M19 12h.01', pause: 'M9 6v12M15 6v12',
 };
 function icon(name, size = 18) {
   const ns = 'http://www.w3.org/2000/svg', s = document.createElementNS(ns, 'svg'), p = document.createElementNS(ns, 'path');
@@ -208,13 +208,14 @@ async function boot() {
     try { return await openOverview(); } catch { /* fall through */ }
   }
   const last = S.team && store.get('tb_last_' + S.team.id), [kind, id] = (last || '').split(':');
-  const bot = S.bots.find(b => b.id === +id), ch = S.channels.find(c => c.id === +id);
-  try { if (kind === 'dm' && bot) return await openBot(bot); if (kind === 'feed') return await openProjectFeed(); if (kind === 'ch' && ch) return await openConv(ch, null); } catch { /* fall through to projects */ }
+  const bot = S.bots.find(b => b.id === +id), ch = S.channels.find(c => c.id === +id), ho = (S.handoffs || []).find(h => h.id === +id);
+  try { if (kind === 'dm' && bot) return await openBot(bot); if (kind === 'feed') return await openProjectFeed(); if (kind === 'ch' && ch) return await openConv(ch, null); if (kind === 'ho' && ho) return await openConv(ho, S.bots.find(b => b.id === ho.bot_id) || null); } catch { /* fall through to projects */ }
   await showHome();
 }
 async function loadTeam() {
-  if (S.team) [S.bots, S.channels, S.members, S.endpoints] = await Promise.all(['bots', 'channels', 'members', 'endpoints'].map(x => api('GET', `/teams/${S.team.id}/${x}`)));
-  else S.bots = S.channels = S.members = S.endpoints = [];
+  if (S.team) {
+    [S.bots, S.channels, S.members, S.endpoints, S.handoffs] = await Promise.all(['bots', 'channels', 'members', 'endpoints', 'handoffs'].map(x => api('GET', `/teams/${S.team.id}/${x}`)));
+  } else S.bots = S.channels = S.members = S.endpoints = S.handoffs = [];
   S.botCosts = {};
   if (S.me && S.me.can_view_costs) {
     try {
@@ -315,8 +316,15 @@ function renderSide() {
     list.append(sec('Bots (private chat)', 'New bot', newBot));
     if (!S.bots.length) list.append($('div', { className: 'emptyhint', textContent: S.endpoints.length ? 'No bots yet.' : 'Add an endpoint, then create a bot.' }));
     const more = items => ib('dots', 'Rename and more', e => { e.stopPropagation(); popmenu(e.currentTarget, items); }, 15);
-    for (const b of S.bots) list.append(item(c && c.kind === 'dm' && c.bot_id === b.id, () => openBot(b), avatar(b.name, 'bot'), b.name, botTag(b), botCostTag(b),
-      more([b.role !== 'collaborator' && { icon: 'edit', label: 'Rename', onclick: guard(() => renameBot(b)) }, { icon: 'sliders', label: 'Settings', onclick: guard(async () => { await openBot(b); openDrawer(b); }) }])));
+    for (const b of S.bots) {
+      list.append(item(c && c.kind === 'dm' && c.bot_id === b.id, () => openBot(b), avatar(b.name, 'bot'), b.name, botTag(b), botCostTag(b),
+        more([b.role !== 'collaborator' && { icon: 'edit', label: 'Rename', onclick: guard(() => renameBot(b)) }, { icon: 'sliders', label: 'Settings', onclick: guard(async () => { await openBot(b); openDrawer(b); }) }])));
+      for (const h of (S.handoffs || []).filter(x => x.bot_id === b.id)) {
+        const label = h.peer_handle ? ('From @' + h.peer_handle) : (h.name || 'Bot conversation');
+        list.append(item(c && c.id === h.id, () => openConv(h, b), $('span', { className: 'lead sub' }, icon('arrow', 14)), label,
+          h.pending_approval ? $('span', { className: 'tag', textContent: 'needs approval' }) : $('span', { className: 'tag', textContent: 'bot thread' })));
+      }
+    }
     list.append(sec('Team chats', 'New team chat', newChannel));
     if (!S.channels.length) list.append($('div', { className: 'emptyhint', textContent: 'Work with people and bots together.' }));
     for (const ch of S.channels) list.append(item(c && c.id === ch.id, () => openConv(ch, null), $('span', { className: 'lead' }, icon('hash', 16)), ch.name,
@@ -821,7 +829,7 @@ async function openConv(conv, bot) {
   if (conv.kind === 'home') store.set('tb_last_home', '1');
   else {
     store.set('tb_last_home', null);
-    store.set('tb_last_' + conv.team_id, (conv.kind === 'channel' ? 'ch:' + conv.id : conv.kind === 'feed' ? 'feed:project' : conv.kind + ':' + conv.bot_id));
+    store.set('tb_last_' + conv.team_id, (conv.kind === 'channel' ? 'ch:' + conv.id : conv.kind === 'feed' ? 'feed:project' : conv.kind === 'handoff' ? 'ho:' + conv.id : conv.kind + ':' + conv.bot_id));
   }
   renderSide(); renderTop(); el('col').replaceChildren(); el('dock').replaceChildren(); el('stage').classList.remove('hero');
   await loadCtx(conv); if (S.conv !== conv) return;
@@ -837,7 +845,7 @@ async function loadCtx(conv) {
     ctx.mem = await api('GET', `/channels/${conv.id}/members`);
     const lists = await Promise.all(ctx.mem.bots.map(b => quiet(api('GET', `/bots/${b.id}/skills`))));
     ctx.mem.bots.forEach((b, i) => lists[i].forEach(k => ctx.skills.push({ ...k, of: b.handle })));
-  } else if (conv.kind === 'dm' && S.bot) {
+  } else if ((conv.kind === 'dm' || conv.kind === 'handoff') && S.bot) {
     [ctx.skills, ctx.secrets] = await Promise.all([quiet(api('GET', `/bots/${S.bot.id}/skills`)), S.bot.role !== 'collaborator' ? quiet(api('GET', `/bots/${S.bot.id}/secrets`)) : []]);
   }
   if (S.conv === conv) S.ctx = ctx;
@@ -855,6 +863,10 @@ function renderTop() {
   const c = S.conv, lead = topLead();
   if (!c) return fill(top, ...lead, $('span', { className: 'title', textContent: S.page === 'routines' ? 'Routines' : S.page === 'costs' ? 'Costs' : 'Projects' }), $('span', { className: 'grow' }), $('button', { className: 'btn sm', onclick: openPalette }, icon('search', 15), 'Search'));
   if (c.kind === 'feed') return fill(top, ...lead, icon('pulse'), $('span', { className: 'title', textContent: c.name }), $('span', { className: 'sub grow', textContent: 'Short summaries of finished tasks. The private chats stay private.' }));
+  if (c.kind === 'handoff') {
+    const peer = c.peer_handle ? '@' + c.peer_handle : (c.name || 'another bot');
+    return fill(top, ...lead, icon('arrow'), $('span', { className: 'title', textContent: (S.bot ? S.bot.name : 'Bot') + ' · ' + peer }), $('span', { className: 'sub grow', textContent: 'Bot-to-bot thread. Tool approvals for this work appear here.' }));
+  }
   if (c.kind === 'dm' || c.kind === 'home') {
     const b = S.bot, shared = b && b.is_team && b.published && c.kind === 'dm';
     const cb = $('input', { type: 'checkbox', checked: c.share_activity, onchange: guard(async () => { Object.assign(c, await api('PATCH', `/conversations/${c.id}`, { share_activity: cb.checked })); toast(cb.checked ? 'Task summaries go to the activity feed' : 'Nothing from this chat is shared'); }) });
@@ -985,7 +997,7 @@ function msgNode(m, note) {
       m.has_image && $('img', { className: 'msgimg', src: withToken(`/messages/${m.id}/image`), alt: 'Pasted image', loading: 'lazy', onclick: () => window.open(withToken(`/messages/${m.id}/image`), '_blank', 'noopener') }),
       note && $('div', { className: 'note' }, icon(note[1], 13), note[2]));
   }
-  const direct = c.kind === 'dm' || c.kind === 'home';
+  const direct = c.kind === 'dm' || c.kind === 'home' || c.kind === 'handoff';
   const body = $('div', { className: 'body' }, md(m.content)), done = ib('copy', 'Copy', async e => { const btn = e.currentTarget; await copyText(m.content); btn.replaceChildren(icon('check')); setTimeout(() => btn.replaceChildren(icon('copy')), 1500); }, 15);
   return $('div', { className: 'msg bot' + (/^Endpoint error: /.test(m.content) ? ' error' : '') }, !direct && $('div', { className: 'who' }, avatar(m.author, 'bot'), m.author, time), body, $('div', { className: 'acts' }, m.route && $('span', { className: 'route-tag', textContent: m.route, title: m.route_reason || '' }), done, direct && $('span', { className: 'muted', style: 'font-size:12px;align-self:center;margin-left:4px', textContent: clock(when) })));
 }
@@ -993,7 +1005,7 @@ const failed = r => !!r && /^(denied|cancelled|stopped|error)|^exit code [1-9]/.
 /** One quiet line for everything a bot did in a row. Commands and file contents stay folded away. */
 function workNode(g, busy) {
   const n = g.calls.length, asks = g.calls.filter(x => x.a).length, open = g.calls.filter(x => !x.r && !x.a), bad = g.calls.filter(x => failed(x.r)).length;
-  const running = busy && open.length > 0, who = (S.conv.kind === 'dm' || S.conv.kind === 'home') ? '' : g.author + ' · ';
+  const running = busy && open.length > 0, who = (S.conv.kind === 'dm' || S.conv.kind === 'home' || S.conv.kind === 'handoff') ? '' : g.author + ' · ';
   const kinds = [...new Set(g.calls.map(x => toolInfo(x.tc.function.name)[1]))];
   const text = asks ? 'Needs your approval' : running ? toolInfo(open[open.length - 1].tc.function.name)[1] : `${n} ${n === 1 ? 'step' : 'steps'}` + (bad ? ` · ${bad} did not succeed` : '') + (open.length ? ' · stopped' : '');
   const lead = asks ? icon('pause', 15) : running ? $('span', { className: 'spin' }) : icon(bad || open.length ? 'dots' : 'check', 15);
@@ -1119,7 +1131,7 @@ async function loadFiles(then) {
 function renderDock() {
   const c = S.conv, dock = el('dock');
   if (c.kind === 'feed') return dock.replaceChildren();
-  const direct = c.kind === 'dm' || c.kind === 'home';
+  const direct = c.kind === 'dm' || c.kind === 'home' || c.kind === 'handoff';
   const ta = $('textarea', { rows: 1, ariaLabel: 'Message', placeholder: direct ? `Message ${c.name}` : 'Message the team chat, or @mention one bot', value: S.drafts[c.id] || '' });
   const hl = $('div', { className: 'hl', ariaHidden: 'true' }), send = $('button', { className: 'send', title: 'Send (Enter)', ariaLabel: 'Send' }, icon('up', 18));
   // While a bot works you can keep typing. The mode decides what a new message does to the running task.

@@ -29,7 +29,8 @@ def can_manage(s: Session, user_id: int, bot: Bot) -> bool:
 
 def can_read_conversation(s: Session, user_id: int, conv: Conversation) -> bool:
     """DMs are private to their user: owners and managers of the bot cannot read them."""
-    if conv.kind in ("dm", "home"):
+    if conv.kind in ("dm", "home", "handoff"):
+        # Handoff threads belong to the person the work is for (approvals land here).
         return conv.user_id == user_id
     if conv.kind == "feed":  # activity summaries
         if conv.bot_id is None:  # project-wide feed: any member of the project

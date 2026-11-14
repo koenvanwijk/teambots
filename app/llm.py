@@ -1,4 +1,6 @@
 """Client for any OpenAI-compatible /chat/completions endpoint (vLLM, Ollama, LiteLLM, ...)."""
+import asyncio
+import logging
 import re
 
 import httpx
@@ -6,9 +8,161 @@ import httpx
 from . import config
 from .db import Endpoint
 
+log = logging.getLogger("teambots.llm")
+
+LOCAL_5XX_RETRY_S = 1.0
+TOOL_RESULT_MAX_CHARS = 4000
+HISTORY_TEXT_BUDGET = 32000  # ~8k tokens of text; keeps long chats from ballooning
+
+# Model-name hints that usually accept image content parts.
+_VISION_HINTS = (
+    "gpt-4o", "gpt-4.1", "gpt-4.5", "gpt-5", "claude", "sonnet", "opus", "haiku",
+    "fable", "gemini", "grok", "o3", "o4", "vision", "omni",
+)
+_NO_VISION_HINTS = ("deepseek", "llama", "mistral", "qwen", "exl3", "flash-1017")
+
 
 class LLMError(Exception):
     pass
+
+
+def redact_error(text: str, limit: int = 800) -> str:
+    """Strip bearer tokens and obvious secrets from a snippet meant for errors or logs."""
+    text = text or ""
+    text = re.sub(r"(?i)(bearer\s+)\S+", r"\1[redacted]", text)
+    text = re.sub(r"\b(ghu_|gho_|ghs_|ghr_|github_pat_|tid=)\S+", r"\1…", text)
+    text = re.sub(r'(?i)("(?:token|access_token|api_key|client_secret)"\s*:\s*")[^"]+', r"\1[redacted]", text)
+    return text[:limit]
+
+
+def format_http_error(r: httpx.Response, ep_name: str, limit: int = 800) -> str:
+    """HTTP status plus the response body (or reason phrase if the body is empty)."""
+    body = redact_error((r.text or "").strip(), limit)
+    reason = (r.reason_phrase or "").strip()
+    detail = body or reason or "no body"
+    return f"endpoint '{ep_name}' returned HTTP {r.status_code}: {detail}"
+
+
+def log_http_error(ep_name: str, r: httpx.Response, *, model: str = "", has_images: bool = False,
+                   extra: str = "") -> None:
+    """Log the status and redacted body; never log Authorization or image payloads."""
+    ctype = r.headers.get("content-type", "")
+    log.warning(
+        "endpoint %s returned HTTP %s %s (model=%s images=%s content-type=%s%s): %s",
+        ep_name, r.status_code, (r.reason_phrase or "").strip(),
+        model or "-", has_images, ctype, f" {extra}" if extra else "",
+        redact_error((r.text or "").strip() or "(empty body)", 800),
+    )
+
+
+def messages_have_images(messages: list[dict] | None) -> bool:
+    for m in messages or []:
+        c = m.get("content")
+        if not isinstance(c, list):
+            continue
+        for p in c:
+            if not isinstance(p, dict):
+                continue
+            if p.get("type") in ("image_url", "image", "input_image") or "image_url" in p or p.get("source"):
+                return True
+    return False
+
+
+def model_accepts_images(provider: str, model: str) -> bool:
+    """Best-effort: send images only to models that typically have vision."""
+    name = (model or "").lower()
+    provider = (provider or "openai").lower()
+    if any(h in name for h in _NO_VISION_HINTS) and "vision" not in name and "vl" not in name:
+        return False
+    if provider == "claude_cli":
+        return True
+    if provider == "github_copilot":
+        return not name or any(h in name for h in _VISION_HINTS)
+    return any(h in name for h in _VISION_HINTS)
+
+
+def strip_image_parts(messages: list[dict], note: str = "[image omitted: this model has no vision]") -> list[dict]:
+    """Replace image content parts with a short text note; do not copy image payloads."""
+    out = []
+    for m in messages or []:
+        c = m.get("content")
+        if not isinstance(c, list):
+            out.append(m)
+            continue
+        parts, had = [], False
+        for p in c:
+            if isinstance(p, dict) and (p.get("type") in ("image_url", "image", "input_image")
+                                        or "image_url" in p or p.get("source")):
+                had = True
+                continue
+            parts.append(p)
+        if had:
+            text_already = any(isinstance(p, dict) and p.get("type") == "text" and note in (p.get("text") or "")
+                               for p in parts)
+            if not text_already:
+                parts.append({"type": "text", "text": note})
+            if len(parts) == 1 and isinstance(parts[0], dict) and parts[0].get("type") == "text":
+                nm = {**m, "content": parts[0].get("text") or note}
+            else:
+                nm = {**m, "content": parts or note}
+            out.append(nm)
+        else:
+            out.append(m)
+    return out
+
+
+def prepare_messages(messages: list[dict], provider: str, model: str) -> list[dict]:
+    """Drop image parts when the model cannot use them, so they do not bloat the prompt."""
+    if messages_have_images(messages) and not model_accepts_images(provider, model):
+        log.info("omitting images for %s model %s (no vision)", provider, model or "(default)")
+        return strip_image_parts(messages)
+    return messages
+
+
+def _msg_chars(m: dict) -> int:
+    c = m.get("content")
+    if isinstance(c, list):
+        n = 0
+        for p in c:
+            if isinstance(p, dict):
+                n += len(p.get("text") or "")
+            elif isinstance(p, str):
+                n += len(p)
+        return n + len(m.get("tool_calls") and str(m.get("tool_calls")) or "")
+    return len(str(c or "")) + len(m.get("tool_calls") and str(m.get("tool_calls")) or "")
+
+
+def trim_messages(messages: list[dict], budget: int = HISTORY_TEXT_BUDGET,
+                  tool_max: int = TOOL_RESULT_MAX_CHARS) -> list[dict]:
+    """Cap tool results and drop the oldest messages when the history is too long.
+
+    The latest user message is always kept. A tool-call group is not split: leading
+    orphan tool messages after a cut are dropped.
+    """
+    trimmed = []
+    for m in messages or []:
+        if m.get("role") == "tool" and isinstance(m.get("content"), str) and len(m["content"]) > tool_max:
+            trimmed.append({**m, "content": m["content"][:tool_max] + "\n[truncated]"})
+        else:
+            trimmed.append(m)
+    if sum(_msg_chars(m) for m in trimmed) <= budget:
+        return trimmed
+    kept, total = [], 0
+    for m in reversed(trimmed):
+        n = _msg_chars(m)
+        if kept and total + n > budget:
+            break
+        kept.append(m)
+        total += n
+    kept.reverse()
+    while kept and kept[0].get("role") == "tool":
+        kept.pop(0)
+    if not any(m.get("role") == "user" for m in kept):
+        for m in reversed(trimmed):
+            if m.get("role") == "user":
+                kept.insert(0, m)
+                break
+    return kept or trimmed[-1:]
 
 
 _THINK = re.compile(r"<think>.*?</think>", re.S)
@@ -141,9 +295,14 @@ async def chat(ep: Endpoint, model: str, messages: list[dict], tools: list[dict]
         return await copilot.chat(ep, model, messages, tools, max_tokens=max_tokens)
     if getattr(ep, "provider", "openai") == "claude_cli":
         from . import claude_cli
+        messages = trim_messages(prepare_messages(messages, "claude_cli", model or ep.default_model or ""))
         return await claude_cli.chat(ep, model, messages, tools, max_tokens=max_tokens)
+    from . import usage as usage_mod
+    provider = getattr(ep, "provider", "openai") or "openai"
+    model_id = model or ep.default_model or ""
+    messages = trim_messages(prepare_messages(messages, provider, model_id))
     budget = max_tokens or config.LLM_MAX_TOKENS
-    body: dict = {"model": model or ep.default_model, "messages": messages, "max_tokens": budget}
+    body: dict = {"model": model_id, "messages": messages, "max_tokens": budget}
     if tools:
         body["tools"] = tools
         body["tool_choice"] = "auto"
@@ -155,12 +314,24 @@ async def chat(ep: Endpoint, model: str, messages: list[dict], tools: list[dict]
     timer = usage.Timer()
     used = {}
     retried = False
+    has_images = messages_have_images(messages)
+
+    async def _post(client, payload):
+        r = await client.post(url, json=payload, headers=headers)
+        if r.status_code >= 500 and usage_mod.is_local_endpoint(ep):
+            log_http_error(ep.name, r, model=model_id, has_images=has_images, extra="will retry once")
+            await asyncio.sleep(LOCAL_5XX_RETRY_S)
+            r = await client.post(url, json=payload, headers=headers)
+            return r, True
+        return r, False
+
     try:
         try:
             async with httpx.AsyncClient(timeout=config.LLM_TIMEOUT) as client:
-                r = await client.post(url, json=body, headers=headers)
+                r, retried = await _post(client, body)
                 if r.status_code >= 400:
-                    raise LLMError(f"endpoint '{ep.name}' returned HTTP {r.status_code}: {r.text[:300]}")
+                    log_http_error(ep.name, r, model=model_id, has_images=has_images)
+                    raise LLMError(format_http_error(r, ep.name))
                 data = r.json()
                 used = usage.parse_usage(data)
                 msg, finish = _choice(data, ep.name)
@@ -172,9 +343,11 @@ async def chat(ep: Endpoint, model: str, messages: list[dict], tools: list[dict]
                     retried = True
                     timer = usage.Timer()
                     body["max_tokens"] = max(budget * 2, 16384)
-                    r = await client.post(url, json=body, headers=headers)
+                    r, extra = await _post(client, body)
+                    retried = retried or extra
                     if r.status_code >= 400:
-                        raise LLMError(f"endpoint '{ep.name}' returned HTTP {r.status_code}: {r.text[:300]}")
+                        log_http_error(ep.name, r, model=model_id, has_images=has_images)
+                        raise LLMError(format_http_error(r, ep.name))
                     data = r.json()
                     used = usage.parse_usage(data)
                     msg, finish = _choice(data, ep.name)

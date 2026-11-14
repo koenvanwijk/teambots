@@ -17,6 +17,7 @@ from . import config
 MAX_OUTPUT = 8000
 _started: set[str] = set()
 _lock = asyncio.Lock()
+_key_locks: dict[str, asyncio.Lock] = {}
 
 
 def _safe_key(key: str) -> str:
@@ -77,28 +78,38 @@ def _command(key: str, argv: list[str], env: dict, detach: bool = False) -> tupl
     return argv, workdir, {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": workdir, **env}
 
 
+def _key_lock(key: str) -> asyncio.Lock:
+    """One lock per sandbox, so two bot runs on the same project computer do not interleave."""
+    lock = _key_locks.get(key)
+    if lock is None:
+        lock = _key_locks[key] = asyncio.Lock()
+    return lock
+
+
 async def sb_exec(key: str, argv: list[str], stdin: bytes | None = None, env: dict | None = None,
                   timeout: float = 60, raw: bool = False):
     """Run a command in the sandbox. Returns (exit code, output); output is bytes when raw=True."""
     key = _safe_key(key)
-    if config.SANDBOX_BACKEND == "docker":
-        await _ensure_container(f"tb-{key}")
-    cmd, cwd, full_env = _command(key, argv, env or {})
-    return await _run(cmd, stdin, timeout, cwd=cwd, env=full_env, raw=raw)
+    async with _key_lock(key):
+        if config.SANDBOX_BACKEND == "docker":
+            await _ensure_container(f"tb-{key}")
+        cmd, cwd, full_env = _command(key, argv, env or {})
+        return await _run(cmd, stdin, timeout, cwd=cwd, env=full_env, raw=raw)
 
 
 async def sb_spawn(key: str, argv: list[str], env: dict | None = None) -> None:
     """Start a long-running process in the sandbox (a virtual screen, a browser) and return at once."""
     key = _safe_key(key)
-    if config.SANDBOX_BACKEND == "docker":
-        await _ensure_container(f"tb-{key}")
-        cmd, _, _ = _command(key, argv, env or {}, detach=True)
-        await _run(cmd, None, 30)
-        return
-    cmd, cwd, full_env = _command(key, argv, env or {})
-    await asyncio.create_subprocess_exec(*cmd, cwd=cwd, env=full_env, stdin=asyncio.subprocess.DEVNULL,
-                                         stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
-                                         start_new_session=True)
+    async with _key_lock(key):
+        if config.SANDBOX_BACKEND == "docker":
+            await _ensure_container(f"tb-{key}")
+            cmd, _, _ = _command(key, argv, env or {}, detach=True)
+            await _run(cmd, None, 30)
+            return
+        cmd, cwd, full_env = _command(key, argv, env or {})
+        await asyncio.create_subprocess_exec(*cmd, cwd=cwd, env=full_env, stdin=asyncio.subprocess.DEVNULL,
+                                             stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+                                             start_new_session=True)
 
 
 def _check_path(path: str) -> str:

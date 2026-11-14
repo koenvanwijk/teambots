@@ -59,6 +59,17 @@ async def models(authorization: str = Header("")):
     ]}
 
 
+def _has_image(messages) -> bool:
+    for m in messages or []:
+        c = m.get("content")
+        if not isinstance(c, list):
+            continue
+        for p in c:
+            if isinstance(p, dict) and (p.get("type") in ("image_url", "image") or "image_url" in p):
+                return True
+    return False
+
+
 @app.post("/chat/completions")
 @app.post("/v1/chat/completions")
 async def chat(request: Request, authorization: str = Header("")):
@@ -67,10 +78,20 @@ async def chat(request: Request, authorization: str = Header("")):
         return bad
     stats["chat"] += 1
     body = await request.json()
+    if _has_image(body.get("messages")) and request.headers.get("copilot-vision-request", "").lower() != "true":
+        # Match the real Copilot gateway: a plain 400 body when the vision header is missing.
+        from fastapi.responses import PlainTextResponse
+        return PlainTextResponse("Bad Request\n", status_code=400)
     text = ""
     for m in body.get("messages") or []:
         if m.get("role") == "user":
-            text = m.get("content") or ""
+            c = m.get("content")
+            text = c if isinstance(c, str) else " ".join(
+                (p.get("text") or "") for p in c if isinstance(p, dict)) if isinstance(c, list) else str(c or "")
+    if _has_image(body.get("messages")):
+        return {"choices": [{"finish_reason": "stop", "message": {
+            "role": "assistant", "content": "I can see the image."}}],
+                "usage": {"prompt_tokens": 20, "completion_tokens": 6, "total_tokens": 26}}
     if body.get("tools") and "ping" in text.lower():
         return {"choices": [{"finish_reason": "tool_calls", "message": {
             "role": "assistant", "content": None,

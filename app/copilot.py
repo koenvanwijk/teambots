@@ -18,7 +18,9 @@ import httpx
 
 from . import config
 from .db import Endpoint
-from .llm import LLMError, parse_message, _choice
+from .llm import (LLMError, format_http_error, log_http_error, messages_have_images,
+                  model_accepts_images, parse_message, prepare_messages, redact_error,
+                  strip_image_parts, trim_messages, _choice)
 
 INTEGRATION_ID = "vscode-chat"
 EDITOR_VERSION = "vscode/1.107.0"
@@ -50,13 +52,17 @@ def ide_headers(*, api_version: bool = False) -> dict[str, str]:
 def completions_headers(messages: list[dict] | None = None) -> dict[str, str]:
     last = (messages or [{}])[-1] if messages else {}
     initiator = "agent" if last.get("role") in ("assistant", "tool") else "user"
-    return {
+    headers = {
         **ide_headers(),
         "Content-Type": "application/json",
         "Accept": "application/json",
         "Openai-Organization": "github-copilot",
         "x-initiator": initiator,
     }
+    # Copilot rejects vision requests with HTTP 400 unless this header is set.
+    if messages_have_images(messages):
+        headers["Copilot-Vision-Request"] = "true"
+    return headers
 
 
 def normalize_domain(raw: str | None) -> str:
@@ -104,10 +110,7 @@ def _expires_ms(value) -> Optional[int]:
 
 def redact(text: str, limit: int = 300) -> str:
     """Strip bearer tokens and GitHub/Copilot secrets from a snippet meant for errors."""
-    text = re.sub(r"(?i)(bearer\s+)\S+", r"\1[redacted]", text)
-    text = re.sub(r"\b(ghu_|gho_|ghs_|ghr_|github_pat_|tid=)[^\s\"']+", r"\1…", text)
-    text = re.sub(r"(?i)(\"(?:token|access_token|api_key)\"\s*:\s*\")[^\"]+", r"\1[redacted]", text)
-    return text[:limit]
+    return redact_error(text, limit)
 
 
 def _base_from_token(token: str) -> Optional[str]:
@@ -283,13 +286,23 @@ async def list_models(ep: Endpoint, *, client: httpx.AsyncClient | None = None,
             await client.aclose()
 
 
+def _vision_rejected(text: str) -> bool:
+    t = (text or "").lower()
+    if any(w in t for w in ("vision", "image", "media type", "copilot-vision")):
+        return True
+    return t.strip() in ("", "bad request")
+
+
 async def chat(ep: Endpoint, model: str, messages: list[dict], tools: list[dict] | None = None,
                max_tokens: int | None = None, *, client: httpx.AsyncClient | None = None,
                token_endpoint: str | None = None) -> dict:
     """Chat completions through Copilot, returning {content, tool_calls}."""
     from . import usage
+    provider = getattr(ep, "provider", "github_copilot") or "github_copilot"
+    model_id = model or ep.default_model or ""
+    messages = trim_messages(prepare_messages(messages, provider, model_id))
     budget = max_tokens or config.LLM_MAX_TOKENS
-    body: dict = {"model": model or ep.default_model, "messages": messages, "max_tokens": budget}
+    body: dict = {"model": model_id, "messages": messages, "max_tokens": budget}
     if tools:
         body["tools"] = tools
         body["tool_choice"] = "auto"
@@ -299,7 +312,6 @@ async def chat(ep: Endpoint, model: str, messages: list[dict], tools: list[dict]
     timer = usage.Timer()
     used: dict = {}
     retried = False
-    model_id = body["model"]
     try:
         try:
             sess = await _session(ep, client, token_endpoint=token_endpoint)
@@ -312,9 +324,27 @@ async def chat(ep: Endpoint, model: str, messages: list[dict], tools: list[dict]
                     break
             if r is None:
                 raise LLMError(f"cannot reach Copilot completions at '{ep.name}'")
+
+            async def _raise_or_fallback(resp):
+                nonlocal messages, body, headers, retried
+                has_img = messages_have_images(body.get("messages"))
+                log_http_error(ep.name, resp, model=model_id, has_images=has_img,
+                               extra="vision_header=" + str(bool(headers.get("Copilot-Vision-Request"))))
+                if (resp.status_code == 400 and has_img and _vision_rejected(resp.text)):
+                    # Model rejected the image (no vision, bad media type) or returned an
+                    # opaque "Bad Request": retry once as text, so the turn is not lost.
+                    retried = True
+                    messages = strip_image_parts(messages)
+                    body["messages"] = messages
+                    headers = {**completions_headers(messages), "Authorization": f"Bearer {sess['token']}"}
+                    resp = await client.post(url, json=body, headers=headers)
+                    if resp.status_code < 400:
+                        return resp
+                    log_http_error(ep.name, resp, model=model_id, has_images=False, extra="after text-only retry")
+                raise LLMError(format_http_error(resp, ep.name))
+
             if r.status_code >= 400:
-                raise LLMError(
-                    f"endpoint '{ep.name}' returned HTTP {r.status_code}: {redact(r.text)}")
+                r = await _raise_or_fallback(r)
             data = r.json()
             used = usage.parse_usage(data)
             msg, finish = _choice(data, ep.name)
@@ -327,8 +357,7 @@ async def chat(ep: Endpoint, model: str, messages: list[dict], tools: list[dict]
                 body["max_tokens"] = max(budget * 2, 16384)
                 r = await client.post(url, json=body, headers=headers)
                 if r.status_code >= 400:
-                    raise LLMError(
-                        f"endpoint '{ep.name}' returned HTTP {r.status_code}: {redact(r.text)}")
+                    r = await _raise_or_fallback(r)
                 data = r.json()
                 used = usage.parse_usage(data)
                 msg, finish = _choice(data, ep.name)

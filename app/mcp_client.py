@@ -1,5 +1,10 @@
 """Minimal MCP client (streamable HTTP). Each call opens a short-lived session.
 
+The official MCP Python `streamablehttp_client` already sends `mcp-session-id`
+and accepts JSON or SSE responses on POST. A server that does not offer a GET
+SSE stream (Home Assistant's `/api/mcp` returns 405 on GET) is tolerated by
+the SDK; request/response still goes over POST.
+
 Auth is resolved per call: a server can be anonymous, use a shared static token, or
 use a per-user token (each member connects their own, so a shared team bot calls the
 MCP server as the requester). Tokens live encrypted in the database and never reach

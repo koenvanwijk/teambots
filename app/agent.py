@@ -218,7 +218,41 @@ async def build_tools(bot: Bot, ctx: Ctx) -> tuple[list[dict], dict[str, tuple[M
     return specs, mcp_map
 
 
-def needs_approval(bot: Bot, ctx: Ctx, name: str, mcp_map: dict) -> bool:
+def _is_home_assistant(server) -> bool:
+    name = (getattr(server, "name", "") or "").lower().replace("_", "-")
+    url = (getattr(server, "url", "") or "").lower()
+    if name in ("home-assistant", "homeassistant", "hass"):
+        return True
+    return "/api/mcp" in url and (":8123" in url or "home-assistant" in url or "hass" in url)
+
+
+def is_ha_lock_action(server, name: str, args: dict | None) -> bool:
+    """True when an HA MCP tool would lock, unlock, or otherwise act on a lock.* entity.
+
+    These actions always need an approval card, even if the server is trusted or the
+    bot is in auto-approval mode. Bold / door locks must not run without an explicit OK.
+    """
+    if not server or not _is_home_assistant(server):
+        return False
+    args = args or {}
+    blob = (name or "") + " " + json.dumps(args, default=str)
+    lower = blob.lower()
+    if re.search(r"\block\.[a-z0-9_]+", lower):
+        return True
+    service = str(args.get("service") or args.get("domain") or "").lower()
+    if service in ("lock", "lock.lock", "lock.unlock", "lock.open", "lock.close") or service.startswith("lock."):
+        return True
+    tool = (name or "").lower()
+    if "lock" in tool and any(w in tool for w in ("lock", "unlock", "hass")):
+        # HassLock / mcp_home_assistant_lock / CallService already caught by entity_id or service
+        if tool.endswith("lock") or "unlock" in tool or "hasslock" in tool.replace("_", ""):
+            return True
+    return False
+
+
+def needs_approval(bot: Bot, ctx: Ctx, name: str, mcp_map: dict, args: dict | None = None) -> bool:
+    if name in mcp_map and is_ha_lock_action(mcp_map[name][0], name, args):
+        return True
     if bot.approval_mode == "auto":
         return False
     risky = (name in RISKY_TOOLS or (name in mcp_map and not mcp_map[name][0].trusted)
@@ -407,10 +441,11 @@ async def _execute(ctx: Ctx, name: str, args: dict, mcp_map: dict) -> str:
                     ChannelMember.conversation_id == ctx.conv_id, ChannelMember.bot_id == target.id)).first():
                 return "error: that bot is not a member of this channel"
             target_id, target_team, target_home = target.id, target.team_id, bool(target.is_home)
+            asker_id, asker_name = bot.id, bot.name
     if name == "ask_bot":
         sub = Ctx(bot_id=target_id, requester_id=ctx.requester_id, conv_id=ctx.conv_id,
                   is_channel=ctx.is_channel, depth=ctx.depth + 1, team_id=target_team, is_home=target_home)
-        return await run_subagent(sub, args["message"], asked_by=bot.name)
+        return await run_subagent(sub, args["message"], asked_by=asker_name, asker_id=asker_id)
     if name == "add_mcp_server":
         if new_mcp_oauth:
             return (f"MCP server '{new_mcp.name}' added with OAuth. Members connect their own account "
@@ -424,6 +459,50 @@ async def _execute(ctx: Ctx, name: str, args: dict, mcp_map: dict) -> str:
 
 
 # ---------------------------------------------------------------- prompt and history
+
+
+def recent_work_brief(bot: Bot, user: User, exclude_id: int | None = None, per_conv: int = 6) -> str:
+    """A short digest of this bot's recent DMs with this person and the channels it is in."""
+    with session() as s:
+        convs = list(s.exec(select(Conversation).where(Conversation.team_id == bot.team_id,
+                                                       Conversation.kind.in_(("dm", "channel", "home")))).all())
+        blocks = []
+        for conv in convs:
+            if exclude_id and conv.id == exclude_id:
+                continue
+            if conv.kind == "dm" and not (conv.bot_id == bot.id and conv.user_id == user.id):
+                continue
+            if conv.kind == "home" and conv.user_id != user.id:
+                continue
+            if conv.kind == "channel" and not s.exec(select(ChannelMember).where(
+                    ChannelMember.conversation_id == conv.id, ChannelMember.bot_id == bot.id)).first():
+                continue
+            rows = list(reversed(s.exec(select(Message).where(Message.conversation_id == conv.id)
+                                        .order_by(Message.id.desc()).limit(per_conv)).all()))
+            lines = []
+            for m in rows:
+                text = (m.content or "").replace("\n", " ").strip()
+                if not text or m.role == "tool":
+                    continue
+                who = "you" if m.author_bot_id == bot.id else ("person" if m.role == "user" else "bot")
+                lines.append(f"- {who}: {text[:240]}")
+            if not lines:
+                continue
+            if conv.kind == "dm":
+                label = f"private chat with {user.display_name}"
+            elif conv.kind == "channel":
+                label = f"#{conv.name}"
+            else:
+                label = "overview"
+            blocks.append(label + ":\n" + "\n".join(lines))
+            if len(blocks) >= 6:
+                break
+    if not blocks:
+        return ""
+    return ("## Recent work in your other conversations\n"
+            "You are answering another bot in a separate thread. This is a brief of your recent "
+            "work for the same person, so you stay consistent.\n\n" + "\n\n".join(blocks))
+
 
 def system_prompt(bot: Bot, conv: Conversation, user: User, ctx: Ctx) -> str:
     with session() as s:
@@ -508,6 +587,20 @@ def system_prompt(bot: Bot, conv: Conversation, user: User, ctx: Ctx) -> str:
                  + "\n".join(setup))
     if others and ctx.depth == 0:
         parts.append("## Other bots (ask_bot)\n" + "\n".join(other_lines))
+    if conv.kind == "handoff":
+        peer = None
+        if getattr(conv, "peer_bot_id", None):
+            with session() as s:
+                peer = s.get(Bot, conv.peer_bot_id)
+        who = f"@{peer.handle}" if peer else "another bot"
+        parts.append(
+            "## Bot-to-bot thread\nThis is a separate conversation, started because " + who + " asked you "
+            "to help " + user.display_name + ". It runs in parallel with your other chats. Answer the request. "
+            "Risky tools still pause for their approval in this thread."
+        )
+        brief = recent_work_brief(bot, user, exclude_id=conv.id)
+        if brief:
+            parts.append(brief)
     return "\n\n".join(p for p in parts if p)
 
 
@@ -569,7 +662,8 @@ def build_history(conv: Conversation, bot: Bot, limit: int = 80, run: Run | None
                 out.append({"role": "user", "content": text})
         elif m.role == "assistant" and m.content:
             out.append({"role": "user", "content": f"[bot {bots.get(m.author_bot_id, 'bot')}]: {m.content}"})
-    return out
+    from .llm import trim_messages
+    return trim_messages(out)
 
 
 def _post_tool(conv_id: int, tool_call_id: str, result: str, **common) -> Message:
@@ -695,13 +789,16 @@ async def _run_locked(conv_id: int, bot_id: int, requester_id: int, run: Run | N
                             .order_by(Message.id.desc())).first() or 0
         if run:  # steering messages that came in since the last step are read from here on
             run.steers.update({i: newest for i, after in run.steers.items() if after is None})
-        ctx = Ctx(bot_id, requester_id, conv_id, conv.kind == "channel", team_id=bot.team_id, is_home=bot.is_home)
+        ctx = Ctx(bot_id, requester_id, conv_id, conv.kind == "channel",
+                  depth=1 if conv.kind == "handoff" else 0, team_id=bot.team_id, is_home=bot.is_home)
         specs, mcp_map = await build_tools(bot, ctx)
         messages = [{"role": "system", "content": system_prompt(bot, conv, user, ctx)}] + build_history(conv, bot, run=run)
         common = dict(author_bot_id=bot_id, requester_id=requester_id)
         from . import usage
         from . import llm_router
         origin = (usage.current().origin if usage.current() else None) or ("overview" if bot.is_home else "chat")
+        if conv.kind == "handoff":
+            origin = "ask_bot"
         if "usage_first" not in locals():
             usage_first = True
             llm_router.begin_turn()
@@ -739,7 +836,7 @@ async def _run_locked(conv_id: int, bot_id: int, requester_id: int, run: Run | N
             if args is None:
                 _post(conv_id, role="tool", tool_call_id=tc["id"], content="error: arguments are not valid JSON",
                       **common)
-            elif needs_approval(bot, ctx, name, mcp_map):
+            elif needs_approval(bot, ctx, name, mcp_map, args):
                 with session() as s:
                     a = Approval(conversation_id=conv_id, bot_id=bot_id, message_id=msg.id, tool_call_id=tc["id"],
                                  tool_name=name, arguments=json.dumps(args), requester_id=requester_id)
@@ -789,7 +886,7 @@ async def share_activity(conv: Conversation, bot: Bot, user: User, ep: Endpoint)
 
     Only turns in which the bot used a tool count as activity, and the person can switch it off per chat.
     """
-    if not (conv.kind == "dm" and bot.is_team and bot.published and conv.share_activity):
+    if not (conv.kind in ("dm", "handoff") and bot.is_team and bot.published and conv.share_activity):
         return
     queued = [i for i, _ in _held.get((conv.id, bot.id), [])] or [0]
     with session() as s:
@@ -819,41 +916,76 @@ async def share_activity(conv: Conversation, bot: Bot, user: User, ep: Endpoint)
               author_bot_id=bot.id, requester_id=user.id)
 
 
-async def run_subagent(ctx: Ctx, message: str, asked_by: str) -> str:
-    """A handoff: the other bot works in a scratch context and only its answer comes back."""
+HANDOFF_WAIT_S = 900  # seconds to wait for the other bot (and for a person to approve tools)
+
+
+def handoff_conversation(team_id: int, target: Bot, asker: Bot, user: User) -> Conversation:
+    """Get or create the visible bot-to-bot thread for this (target, asker, person) triple."""
     with session() as s:
-        bot, conv, user = s.get(Bot, ctx.bot_id), s.get(Conversation, ctx.conv_id), s.get(User, ctx.requester_id)
-        ep = s.get(Endpoint, bot.endpoint_id)
-    specs, mcp_map = await build_tools(bot, ctx)
-    messages = [{"role": "system", "content": system_prompt(bot, conv, user, ctx)},
-                {"role": "user", "content": f"[handed over by bot {asked_by}, working for {user.display_name}]\n{message}"}]
-    from . import usage
-    from . import llm_router
-    first = True
-    llm_router.begin_turn()
-    for _ in range(config.MAX_STEPS):
-        try:
-            with usage.bind(origin="ask_bot", user_id=ctx.requester_id, team_id=bot.team_id,
-                            bot_id=bot.id, conversation_id=ctx.conv_id,
-                            endpoint_id=ep.id if ep else None, billable_request=first):
-                first = False
-                reply = await llm.chat(ep, bot.model, messages, specs)
-        except llm.LLMError as e:
-            return f"error: {e}"
-        if not reply["tool_calls"]:
-            return reply["content"] or "(no answer)"
-        messages.append({"role": "assistant", "content": reply["content"], "tool_calls": reply["tool_calls"]})
-        for tc in reply["tool_calls"]:
-            name, args = tc.get("function", {}).get("name", ""), _parse_args(tc)
-            if args is None:
-                result = "error: arguments are not valid JSON"
-            elif needs_approval(bot, ctx, name, mcp_map):
-                result = (f"not executed: '{name}' needs the person's approval, which is not possible inside a "
-                          f"handoff. Report this back so they can ask @{bot.handle} directly.")
-            else:
-                result = await execute_tool(ctx, name, args, mcp_map)
-            messages.append({"role": "tool", "tool_call_id": tc["id"], "content": result})
-    return "error: the other bot did not finish within the step limit"
+        c = s.exec(select(Conversation).where(
+            Conversation.kind == "handoff", Conversation.team_id == team_id,
+            Conversation.bot_id == target.id, Conversation.peer_bot_id == asker.id,
+            Conversation.user_id == user.id)).first()
+        if c:
+            return c
+        c = Conversation(team_id=team_id, kind="handoff", name=f"From @{asker.handle}",
+                         user_id=user.id, bot_id=target.id, peer_bot_id=asker.id,
+                         share_activity=True)
+        s.add(c)
+        s.commit()
+        s.refresh(c)
+        return c
+
+
+async def _wait_handoff_answer(conv_id: int, bot_id: int, after_id: int,
+                               timeout: float = HANDOFF_WAIT_S) -> str:
+    """Wait until the target bot finishes this request (approvals may extend the wait)."""
+    deadline = asyncio.get_event_loop().time() + timeout
+    while asyncio.get_event_loop().time() < deadline:
+        await asyncio.sleep(0.05)
+        with session() as s:
+            pending = s.exec(select(Approval).where(
+                Approval.conversation_id == conv_id, Approval.bot_id == bot_id,
+                Approval.status == "pending")).first()
+            last = s.exec(select(Message).where(
+                Message.conversation_id == conv_id, Message.role == "assistant",
+                Message.author_bot_id == bot_id, Message.id > after_id)
+                .order_by(Message.id.desc())).first()
+        running = (conv_id, bot_id) in _runs
+        if pending:
+            continue
+        if last and not last.tool_calls and not running:
+            return last.content or "(no answer)"
+        if last and (last.content or "").startswith("Endpoint error:") and not running:
+            return last.content
+    return ("error: the other bot did not finish in time (a tool may still be waiting "
+            "for approval in the bot-to-bot thread)")
+
+
+async def run_subagent(ctx: Ctx, message: str, asked_by: str, asker_id: int | None = None) -> str:
+    """Run the target bot in its own parallel handoff thread and return its answer.
+
+    The thread is a Conversation(kind='handoff') per (target, asking bot, person). It
+    does not share a lock with the target's private chats or channels, so it can run
+    at the same time. Instructions, memory, skills and MCP tools are the target's own;
+    a brief of recent work for this person is added to the system prompt. Risky tools
+    still pause for the person's approval in this thread.
+    """
+    with session() as s:
+        bot = s.get(Bot, ctx.bot_id)
+        user = s.get(User, ctx.requester_id)
+        asker = s.get(Bot, asker_id) if asker_id else None
+        if not (bot and user):
+            return "error: handoff is missing the target bot or the person"
+        if asker is None:
+            asker = Bot(id=0, team_id=bot.team_id, owner_id=user.id, name=asked_by or "bot",
+                        handle=(asked_by or "bot").lower().replace(" ", "-")[:24],
+                        endpoint_id=bot.endpoint_id)
+    hconv = handoff_conversation(bot.team_id or ctx.team_id, bot, asker, user)
+    text = "[from bot " + asked_by + ", working for " + user.display_name + "]\n" + message
+    msg = handle_user_message(hconv.id, ctx.requester_id, text)
+    return await _wait_handoff_answer(hconv.id, bot.id, msg.id)
+
 
 
 # ---------------------------------------------------------------- entry points
@@ -885,7 +1017,7 @@ async def resolve_approval(approval_id: int, user_id: int, allow: bool, always: 
             run = _runs[key] = Run(a.requester_id, asyncio.current_task())
         publish(a.conversation_id, "approval", id=a.id)
         try:
-            ctx = Ctx(a.bot_id, a.requester_id, a.conversation_id, conv.kind == "channel", team_id=bot.team_id, is_home=bot.is_home)
+            ctx = Ctx(a.bot_id, a.requester_id, a.conversation_id, conv.kind == "channel", depth=1 if conv.kind == "handoff" else 0, team_id=bot.team_id, is_home=bot.is_home)
             if allow:
                 _, mcp_map = await build_tools(bot, ctx)
                 result = await execute_tool(ctx, a.tool_name, json.loads(a.arguments), mcp_map)
@@ -1001,7 +1133,7 @@ def handle_user_message(conv_id: int, user_id: int, content: str, mode: str = "a
         conv = s.get(Conversation, conv_id)
         if conv.kind == "feed":
             raise ValueError("the activity feed is written by the bot only")
-        if conv.kind in ("dm", "home"):
+        if conv.kind in ("dm", "home", "handoff"):
             targets = [s.get(Bot, conv.bot_id)]
         else:
             handles = {h.lower() for h in re.findall(r"@([A-Za-z0-9_-]+)", content)}

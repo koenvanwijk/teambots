@@ -203,3 +203,44 @@ def test_api_create_and_test_copilot_endpoint(copilot):
             e = s.get(Endpoint, ep_id)
             assert config.decrypt(e.api_key_enc) == mock_copilot.GITHUB_TOKEN
             assert mock_copilot.COPILOT_TOKEN not in (e.api_key_enc or "")
+
+
+def test_vision_header_required_for_images(copilot):
+    from app import config
+    from app.copilot import completions_headers
+    from app.db import Endpoint
+
+    text_msgs = [{"role": "user", "content": "hello"}]
+    assert "Copilot-Vision-Request" not in completions_headers(text_msgs)
+    img_msgs = [{"role": "user", "content": [
+        {"type": "text", "text": "what is this"},
+        {"type": "image_url", "image_url": {"url": "data:image/png;base64,xxxx"}},
+    ]}]
+    h = completions_headers(img_msgs)
+    assert h["Copilot-Vision-Request"] == "true"
+
+    ep = Endpoint(
+        id=99, team_id=1, owner_id=1, name="ICT Copilot",
+        base_url=MOCK, api_key_enc=config.encrypt(mock_copilot.GITHUB_TOKEN),
+        default_model="claude-sonnet-5", provider="github_copilot",
+        github_domain="ictgroup.ghe.com",
+    )
+
+    async def go():
+        # The provider sets the vision header, so the mock accepts the image.
+        reply = await copilot.chat(ep, "claude-sonnet-5", img_msgs)
+        assert "image" in reply["content"].lower()
+        # Direct request without the header is what used to happen, and is a 400.
+        import httpx as hx
+        sess = await copilot._session(ep, hx.AsyncClient(timeout=10))
+        async with hx.AsyncClient(timeout=10) as client:
+            r = await client.post(MOCK + "/chat/completions", json={"model": "claude-sonnet-5", "messages": img_msgs},
+                                  headers={"Authorization": f"Bearer {sess['token']}",
+                                           "Content-Type": "application/json"})
+        assert r.status_code == 400
+        assert r.text.strip() == "Bad Request"
+        from app.llm import format_http_error
+        err = format_http_error(r, "ICT Copilot")
+        assert "HTTP 400" in err and "Bad Request" in err
+        assert sess["token"] not in err
+    asyncio.run(go())

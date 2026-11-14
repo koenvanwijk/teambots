@@ -1735,6 +1735,32 @@ def list_channels(team_id: int, user: User = Depends(current_user)):
         return [c.model_dump() for c in rows if can_read_conversation(s, user.id, c)]
 
 
+
+@router.get("/teams/{team_id}/handoffs")
+def list_handoffs(team_id: int, user: User = Depends(current_user)):
+    """Bot-to-bot threads for this person in this project (visible, with approvals)."""
+    from .db import Approval
+    with session() as s:
+        _need(team_role(s, user.id, team_id), 404, "team not found")
+        rows = s.exec(select(Conversation).where(
+            Conversation.team_id == team_id, Conversation.kind == "handoff",
+            Conversation.user_id == user.id).order_by(Conversation.id.desc())).all()
+        out = []
+        for c in rows:
+            bot, peer = s.get(Bot, c.bot_id), s.get(Bot, getattr(c, "peer_bot_id", None) or 0)
+            pending = s.exec(select(Approval).where(
+                Approval.conversation_id == c.id, Approval.status == "pending")).first()
+            out.append({
+                "id": c.id, "team_id": c.team_id, "kind": c.kind, "name": c.name,
+                "bot_id": c.bot_id, "peer_bot_id": getattr(c, "peer_bot_id", None),
+                "user_id": c.user_id,
+                "bot_name": bot.name if bot else "", "bot_handle": bot.handle if bot else "",
+                "peer_name": peer.name if peer else "", "peer_handle": peer.handle if peer else "",
+                "pending_approval": bool(pending),
+            })
+        return out
+
+
 @router.post("/teams/{team_id}/channels")
 def create_channel(team_id: int, body: ChannelIn, user: User = Depends(current_user)):
     with session() as s:

@@ -127,11 +127,12 @@ class BotAccess(SQLModel, table=True):
 class Conversation(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
     team_id: int = Field(index=True)
-    kind: str  # dm | channel | feed | home (the per-user overview chat)
+    kind: str  # dm | channel | feed | home | handoff (bot-to-bot thread)
     name: str = ""
     share_activity: bool = True  # dm only: summaries of finished tasks go to the project's activity feed
     user_id: Optional[int] = Field(default=None, index=True)  # dm only
-    bot_id: Optional[int] = Field(default=None, index=True)  # dm/home; None for channels and project activity
+    bot_id: Optional[int] = Field(default=None, index=True)  # dm/home/handoff; None for channels and project activity
+    peer_bot_id: Optional[int] = Field(default=None, index=True)  # handoff: the bot that asked
 
 
 class ChannelMember(SQLModel, table=True):
@@ -337,6 +338,7 @@ def init_db() -> None:
     _ensure_costs_columns()
     _ensure_router_columns()
     _ensure_mcp_auth_columns()
+    _ensure_handoff_columns()
     from .usage import seed_prices
     seed_prices()
     migrate_channel_bots()
@@ -495,6 +497,17 @@ def _ensure_mcp_auth_columns() -> None:
             if "expires_at" not in cred_cols:
                 conn.exec_driver_sql("ALTER TABLE mcpcredential ADD COLUMN expires_at DATETIME")
         conn.commit()
+
+
+def _ensure_handoff_columns() -> None:
+    """Add Conversation.peer_bot_id on databases created before bot-to-bot threads."""
+    if not config.DB_URL.startswith("sqlite"):
+        return
+    with engine.connect() as conn:
+        cols = [r[1] for r in conn.exec_driver_sql("PRAGMA table_info(conversation)").fetchall()]
+        if "peer_bot_id" not in cols:
+            conn.exec_driver_sql("ALTER TABLE conversation ADD COLUMN peer_bot_id INTEGER")
+            conn.commit()
 
 
 def _ensure_costs_columns() -> None:
