@@ -746,7 +746,8 @@ async function loadFiles(then) {
 function renderDock() {
   const c = S.conv, dock = el('dock');
   if (c.kind === 'feed') return dock.replaceChildren();
-  const ta = $('textarea', { rows: 1, ariaLabel: 'Message', placeholder: c.kind === 'dm' ? `Message ${c.name}` : 'Message the channel, or @mention one bot', value: S.drafts[c.id] || '' });
+  const direct = c.kind === 'dm' || c.kind === 'home';
+  const ta = $('textarea', { rows: 1, ariaLabel: 'Message', placeholder: direct ? `Message ${c.name}` : 'Message the channel, or @mention one bot', value: S.drafts[c.id] || '' });
   const hl = $('div', { className: 'hl', ariaHidden: 'true' }), send = $('button', { className: 'send', title: 'Send (Enter)', ariaLabel: 'Send' }, icon('up', 18));
   // While a bot works you can keep typing. The mode decides what a new message does to the running task.
   const MODES = { auto: ['Auto', 'decides for you'], steer: ['Steer', 'adds to this task'], queue: ['Queue', 'runs afterwards'], interrupt: ['Interrupt', 'stops this task'] };
@@ -827,7 +828,7 @@ function renderDock() {
   else for (const b of (S.ctx.mem ? S.ctx.mem.bots : []).slice(0, 4)) chips.append($('button', { className: 'chip', onclick: () => insert('@' + b.handle + ' ') }, icon('bot', 15), $('span', { textContent: 'Ask ' + b.name })));
   chips.append($('button', { className: 'chip', onclick: atButton }, icon('at', 15), $('span', { textContent: 'See what you can add' })));
   dock.replaceChildren($('button', { id: 'jump', title: 'Jump to the latest message', ariaLabel: 'Jump to the latest message', onclick: () => { el('view').scrollTop = el('view').scrollHeight; } }, icon('down', 16)), box, chips,
-    $('div', { className: 'foot', textContent: c.kind === 'dm' ? 'Bots can be wrong. Check what matters before you allow or use it.' : 'Everyone in this channel reads what is said here.' }));
+    $('div', { className: 'foot', textContent: (c.kind === 'dm' || c.kind === 'home') ? 'Bots can be wrong. Check what matters before you allow or use it.' : 'Everyone in this channel reads what is said here.' }));
   sync(); S.dockSync(); if (!isNarrow()) ta.focus();
 }
 
