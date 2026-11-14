@@ -512,7 +512,7 @@ async function showHome() {
   renderSide(); afterNav(); renderTop();
   const h = new Date().getHours(), col = el('col');
   const page = $('div', { className: 'home', data: { key: 'home' } }, $('h1', { textContent: `Good ${h < 12 ? 'morning' : h < 18 ? 'afternoon' : 'evening'}, ${S.me.display_name.split(' ')[0]}` }));
-  col.replaceChildren(page);
+  col.replaceChildren(page); el('dock').replaceChildren();  // no message composer on the home page
   if (!S.team) {
     put(page, $('p', { className: 'muted', textContent: 'Start by creating a project, or join one with an invite code.' }),
       $('div', { className: 'rowbtns' }, $('button', { className: 'btn primary', onclick: guard(newProject) }, icon('plus', 16), 'New project'), $('button', { className: 'btn', onclick: guard(joinProject) }, 'Join with a code')));
@@ -545,7 +545,7 @@ async function showRoutines() {
   stopConv(); closeDrawer(); S.conv = null; S.bot = null; S.page = 'routines'; if (S.team) store.set('tb_last_' + S.team.id, null);
   renderSide(); afterNav(); renderTop();
   const page = $('div', { className: 'home routines' }, $('h1', { textContent: 'Routines' }));
-  el('col').replaceChildren(page);
+  el('col').replaceChildren(page); el('dock').replaceChildren();  // no message composer on the routines page
   const rows = await api('GET', '/routines');
   if (S.page !== 'routines' || S.conv) return;
   if (!rows.length) {
@@ -584,7 +584,7 @@ async function showCosts() {
   renderSide(); afterNav(); renderTop();
   const page = $('div', { className: 'home costs' }, $('h1', { textContent: 'Costs' }),
     $('p', { className: 'muted', textContent: 'What the models actually used, with official prices where we have them. Unknown models are not guessed.' }));
-  el('col').replaceChildren(page);
+  el('col').replaceChildren(page); el('dock').replaceChildren();  // no message composer on the costs page
   let period = store.get('tb_costs_period') || '30d';
   let teamFilter = store.get('tb_costs_team') || '';
   const body = $('div', { className: 'costs-body' });
