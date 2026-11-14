@@ -75,9 +75,18 @@ input[type=checkbox] { width:16px; height:16px; accent-color:var(--btn); flex:no
 
 /* ---------- shell */
 #app { height:100%; display:flex; }
-#side { width:264px; flex:none; background:var(--side); border-right:1px solid var(--line); display:flex; flex-direction:column; padding:10px 8px 8px; min-height:0; }
+#side { width:var(--side-w, 264px); flex:none; background:var(--side); border-right:1px solid var(--line); display:flex; flex-direction:column; padding:10px 8px 8px; min-height:0; }
 #app.noside #side { display:none; }
 #scrim { display:none; }
+/* Drag handles to resize the sidebar and the drawer. Straddle the border with negative margins
+   so they add no layout width; double-click resets to the default. */
+.rsz { flex:none; width:8px; margin:0 -4px; z-index:20; cursor:col-resize; background:transparent; position:relative; touch-action:none; }
+.rsz::after { content:""; position:absolute; top:0; bottom:0; left:50%; width:2px; transform:translateX(-50%); background:transparent; transition:background .12s; }
+.rsz:hover::after, body.resizing .rsz::after { background:var(--btn); }
+body.resizing { cursor:col-resize; user-select:none; }
+#app.noside #rszL { display:none; }
+#app:not(:has(#drawer.open)) #rszR { display:none; }
+@media (max-width: 860px) { #rszL, #rszR { display:none; } }
 .brand { display:flex; align-items:center; gap:10px; padding:2px 4px 10px 6px; }
 .brand strong { flex:1; font-size:15.5px; letter-spacing:-.01em; }
 .nav, .item, .project, .me { display:flex; align-items:center; gap:10px; width:100%; text-align:left; border-radius:10px; padding:7px 9px; color:var(--ink2); font-size:14px; min-height:36px; }
@@ -233,7 +242,7 @@ button.card:hover { background:var(--s1); }
 .todo .tt { flex:1; } .todo small { display:block; color:var(--muted); font-size:13px; }
 
 /* ---------- drawer */
-#drawer { width:420px; flex:none; border-left:1px solid var(--line); background:var(--side); display:none; flex-direction:column; min-height:0; }
+#drawer { width:var(--drawer-w, 420px); flex:none; border-left:1px solid var(--line); background:var(--side); display:none; flex-direction:column; min-height:0; }
 #drawer.open { display:flex; }
 .dhead { display:flex; align-items:center; gap:10px; padding:12px 12px 10px 16px; }
 .dhead .nm { flex:1; min-width:0; } .dhead b { display:block; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; } .dhead small { color:var(--muted); font-size:12.5px; }

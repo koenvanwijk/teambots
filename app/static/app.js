@@ -189,10 +189,12 @@ async function boot() {
   S.team = S.teams.find(t => String(t.id) === store.get('tb_team')) || S.teams[0] || null;
   stopConv(); S.conv = null; S.bot = null;
   document.body.replaceChildren($('div', { id: 'app', className: store.get('tb_side') === '0' ? 'noside' : '' },
-    $('aside', { id: 'side' }), $('div', { id: 'scrim', onclick: () => el('app').classList.remove('sideopen') }),
+    $('aside', { id: 'side' }), $('div', { id: 'rszL', className: 'rsz', title: 'Drag to resize · double-click to reset' }),
+    $('div', { id: 'scrim', onclick: () => el('app').classList.remove('sideopen') }),
     $('main', { id: 'main' }, $('header', { id: 'top' }), $('div', { id: 'stage' }, $('div', { id: 'view' }, $('div', { id: 'col' })), $('div', { id: 'dock' }))),
-    $('aside', { id: 'drawer' })));
+    $('div', { id: 'rszR', className: 'rsz', title: 'Drag to resize · double-click to reset' }), $('aside', { id: 'drawer' })));
   el('view').addEventListener('scroll', updateJump, { passive: true });
+  setupResizers();
   // Remember what the person opened or closed by hand. Read `open` on the next frame, after the
   // browser has finished toggling it — reading during the click can catch the pre-toggle state and
   // store the opposite intent, which then re-collapses the block on the next redraw (new line).
@@ -220,6 +222,29 @@ async function loadTeam() {
 }
 const switchTeam = guard(async id => { store.set('tb_team', String(id)); await boot(); });
 const isNarrow = () => matchMedia('(max-width: 860px)').matches;
+// Let the person drag the sidebar and drawer wider or narrower; widths persist per browser.
+function setupResizers() {
+  const app = el('app');
+  const load = (varName, key, min, max) => { const v = +store.get(key); if (v) app.style.setProperty(varName, Math.max(min, Math.min(max, v)) + 'px'); };
+  load('--side-w', 'tb_sidew', 180, 480);
+  load('--drawer-w', 'tb_drawerw', 300, 700);
+  const wire = (handle, panel, varName, key, dir, min, cap) => {
+    if (!handle) return;
+    handle.addEventListener('pointerdown', e => {
+      e.preventDefault();
+      const x0 = e.clientX, base = parseInt(getComputedStyle(el(panel)).width) || 0;
+      try { handle.setPointerCapture(e.pointerId); } catch { /* older browsers */ }
+      document.body.classList.add('resizing');
+      const move = ev => app.style.setProperty(varName, Math.max(min, Math.min(cap(), base + dir * (ev.clientX - x0))) + 'px');
+      const up = () => { document.body.classList.remove('resizing'); handle.removeEventListener('pointermove', move); handle.removeEventListener('pointerup', up); store.set(key, String(parseInt(getComputedStyle(el(panel)).width))); };
+      handle.addEventListener('pointermove', move);
+      handle.addEventListener('pointerup', up);
+    });
+    handle.addEventListener('dblclick', () => { app.style.removeProperty(varName); store.set(key, null); });
+  };
+  wire(el('rszL'), 'side', '--side-w', 'tb_sidew', 1, 180, () => Math.min(480, window.innerWidth - 460));
+  wire(el('rszR'), 'drawer', '--drawer-w', 'tb_drawerw', -1, 300, () => Math.min(700, window.innerWidth - 360));
+}
 function toggleSide() { const a = el('app'); if (isNarrow()) a.classList.toggle('sideopen'); else { a.classList.toggle('noside'); store.set('tb_side', a.classList.contains('noside') ? '0' : '1'); } renderTop(); }
 const sideHidden = () => isNarrow() || el('app').classList.contains('noside');
 const afterNav = () => el('app') && el('app').classList.remove('sideopen');
