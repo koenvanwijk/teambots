@@ -32,12 +32,16 @@ app.add_middleware(ProxyHeadersMiddleware, trusted_hosts="*")
 
 
 @app.middleware("http")
-async def no_store_api(request: Request, call_next):
-    """Never let a browser or proxy serve a cached API response: a change (a new routine,
-    secret, ...) must show up immediately when the UI re-fetches."""
+async def cache_headers(request: Request, call_next):
+    """Never serve a cached API response, and make the app shell revalidate so a new
+    build shows up on the next load instead of a stale cached app.js / index.html."""
     response = await call_next(request)
-    if request.url.path.startswith("/api"):
+    path = request.url.path
+    if path.startswith("/api"):
         response.headers["Cache-Control"] = "no-store"
+    elif path == "/" or path.startswith("/static"):
+        # no-cache = may store, but must revalidate (ETag) before use, so a change is picked up.
+        response.headers["Cache-Control"] = "no-cache"
     return response
 
 

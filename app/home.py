@@ -29,13 +29,13 @@ VOICE_STYLE = (
 
 DEFAULT_INSTRUCTIONS = (
     "You are the user's overview assistant: one place to see and talk to every "
-    "project, bot and channel they have access to. You have your own private "
+    "project, bot and team chat they have access to. You have your own private "
     "computer, separate from every project workspace.\n"
     "Start with list_workspace or get_overview when they want a picture of what "
     "is going on. Use read_messages to look at a specific chat. Use ask_bot to "
     "ask a project bot a question and relay its answer (if the same @handle "
     "exists in more than one project, pass project as well). Use post_to_channel "
-    "only when they ask you to post in a channel. Use list_routines to see "
+    "only when they ask you to post in a team chat. Use list_routines to see "
     "their scheduled routines across projects, and update_routine, run_routine "
     "or delete_routine when they ask you to change, run or remove one. Be "
     "concise. Do not reveal chats, routines or approvals that are not theirs."
@@ -247,9 +247,9 @@ def list_workspace(s: Session, user: User) -> str:
         visible = [ch for ch in channels if can_read_conversation(s, user.id, ch)]
         if visible:
             for ch in visible:
-                lines.append(f"  channel #{ch.name} [id {ch.id}]")
+                lines.append(f"  team chat #{ch.name} [id {ch.id}]")
         else:
-            lines.append("  (no channels you are in)")
+            lines.append("  (no team chats you are in)")
     return "\n".join(lines)
 
 
@@ -319,7 +319,7 @@ def read_messages(s: Session, user: User, conversation_id: int | None = None,
                 if ch.name.lower() == channel.lstrip("#").lower() and can_read_conversation(s, user.id, ch):
                     found.append(ch)
         if len(found) != 1:
-            return "error: that channel was not found, or the name is ambiguous; pass project as well"
+            return "error: that team chat was not found, or the name is ambiguous; pass project as well"
         conv = found[0]
     elif handle:
         target = resolve_bot(s, user, handle, project)
@@ -377,15 +377,15 @@ def post_to_channel(user_id: int, content: str, project: str | None, channel: st
                 if ch.name.lower() == channel.lstrip("#").lower() and can_read_conversation(s, user_id, ch):
                     found.append((t, ch))
         if not found:
-            return "error: that channel was not found, or you are not a member"
+            return "error: that team chat was not found, or you are not a member"
         if len(found) > 1:
             names = ", ".join(f"#{ch.name} in {t.name}" for t, ch in found)
-            return f"error: that channel name exists in more than one project; pass project as well ({names})"
+            return f"error: that team chat name exists in more than one project; pass project as well ({names})"
         team, ch = found[0]
         conv_id, name, team_name = ch.id, ch.name, team.name
     from . import agent
     agent.handle_user_message(conv_id, user_id, content.strip())
-    return f"posted to #{name} in {team_name}. Channel bots may reply there."
+    return f"posted to #{name} in {team_name}. Team chat bots may reply there."
 
 
 
