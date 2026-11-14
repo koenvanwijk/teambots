@@ -282,7 +282,7 @@ function renderSide() {
     const more = items => ib('dots', 'Rename and more', e => { e.stopPropagation(); popmenu(e.currentTarget, items); }, 15);
     for (const b of S.bots) list.append(item(c && c.kind === 'dm' && c.bot_id === b.id, () => openBot(b), avatar(b.name, 'bot'), b.name, botTag(b), botCostTag(b),
       more([b.role !== 'collaborator' && { icon: 'edit', label: 'Rename', onclick: guard(() => renameBot(b)) }, { icon: 'sliders', label: 'Settings', onclick: guard(async () => { await openBot(b); openDrawer(b); }) }])));
-    list.append(sec('Channels', 'New channel', newChannel));
+    list.append(sec('Team chats', 'New team chat', newChannel));
     if (!S.channels.length) list.append($('div', { className: 'emptyhint', textContent: 'Work with people and bots together.' }));
     for (const ch of S.channels) list.append(item(c && c.id === ch.id, () => openConv(ch, null), $('span', { className: 'lead' }, icon('hash', 16)), ch.name,
       more([{ icon: 'edit', label: 'Rename', onclick: guard(() => renameChannel(ch)) }, { icon: 'users', label: 'People and bots', onclick: guard(async () => { await openConv(ch, null); await channelMembers(); }) }])));
@@ -361,7 +361,7 @@ async function renameBot(b) {
   if (el('drawer').classList.contains('open') && S.bot && S.bot.id === b.id) openDrawer(S.bot);
 }
 async function renameChannel(ch) {
-  const r = await form({ title: 'Rename channel', fields: [{ name: 'name', label: 'Name', required: true, value: ch.name }], onSubmit: v => api('PATCH', `/conversations/${ch.id}`, v) });
+  const r = await form({ title: 'Rename team chat', fields: [{ name: 'name', label: 'Name', required: true, value: ch.name }], onSubmit: v => api('PATCH', `/conversations/${ch.id}`, v) });
   if (!r) return;
   ch.name = r.name; if (S.conv && S.conv.id === ch.id) S.conv.name = r.name;
   renderSide(); renderTop();
@@ -730,7 +730,7 @@ async function newBot() {
   if (b.is_team) { openDrawer(S.bot, 'sharing'); toast('Created as a draft. Publish it under Sharing when it is ready.'); }
 }
 async function newChannel() {
-  const c = await form({ title: 'New channel', intro: 'People and bots in one conversation. Every bot of the project joins and replies to each message; you can remove a bot or set it to mention only afterwards.', ok: 'Create channel', fields: [
+  const c = await form({ title: 'New team chat', intro: 'People and bots in one conversation. Every bot of the project joins and replies to each message; you can remove a bot or set it to mention only afterwards.', ok: 'Create team chat', fields: [
     { name: 'name', label: 'Name', required: true, placeholder: 'general' },
     ...S.members.filter(m => m.user_id !== S.me.id).map(m => ({ name: 'u' + m.user_id, label: m.display_name, type: 'checkbox' })),],
     onSubmit: v => api('POST', `/teams/${S.team.id}/channels`, { name: v.name, user_ids: S.members.filter(m => v['u' + m.user_id]).map(m => m.user_id), bot_ids: [] }) });
@@ -815,10 +815,10 @@ async function channelMembers() {
     const sw = $('input', { type: 'checkbox', checked: b.mention_only, onchange: guard(async () => { await api('PATCH', `/channels/${c.id}/members/bots/${b.id}`, { mention_only: sw.checked }); b.mention_only = sw.checked; renderTop(); renderDock(); }) });
     return $('div', { className: 'li' }, avatar(b.name, 'bot'), $('div', { className: 'tx' }, b.name, $('small', { textContent: '@' + b.handle })),
       mine ? $('label', { className: 'switch', title: 'On: the bot answers only when someone mentions its @handle. Off: it replies to every message.' }, sw, 'Mention only') : $('span', { className: 'tag', textContent: b.mention_only ? 'mention only' : 'replies to all' }),
-      mine && ib('trash', 'Remove from this channel', guard(async () => { if (!await confirmBox({ title: `Remove ${b.name} from # ${c.name}?`, text: 'The bot stops reading and answering here. You can add it again later.', ok: 'Remove', danger: true })) return; await api('DELETE', `/channels/${c.id}/members/bots/${b.id}`); again(); }), 15));
+      mine && ib('trash', 'Remove from this team chat', guard(async () => { if (!await confirmBox({ title: `Remove ${b.name} from # ${c.name}?`, text: 'The bot stops reading and answering here. You can add it again later.', ok: 'Remove', danger: true })) return; await api('DELETE', `/channels/${c.id}/members/bots/${b.id}`); again(); }), 15));
   };
   const d = openDialog('', $('div', { className: 'pad' }, $('h2', { textContent: '# ' + c.name }), $('p', { className: 'intro', textContent: 'A bot replies to every message here, unless it is set to mention only. Mention a bot to address just that one.' }),
-    $('div', { className: 'field' }, $('span', { textContent: 'Bots' }), m.bots.length ? m.bots.map(botRow) : $('div', { className: 'none', textContent: 'No bots in this channel.' })),
+    $('div', { className: 'field' }, $('span', { textContent: 'Bots' }), m.bots.length ? m.bots.map(botRow) : $('div', { className: 'none', textContent: 'No bots in this team chat.' })),
     $('div', { className: 'field' }, $('span', { textContent: 'People' }), m.users.map(u => $('div', { className: 'li' }, avatar(u.display_name), $('div', { className: 'tx', textContent: u.display_name })))),
     (people.length || bots.length) ? $('div', { className: 'field' }, $('span', { textContent: 'Add' }), people.map(x => pick('u', x.user_id, x.display_name)), bots.map(b => pick('b', b.id, `${b.name} (@${b.handle})`))) : null,
     $('div', { className: 'dfoot' }, (people.length || bots.length) ? $('button', { className: 'btn', textContent: 'Add selected', onclick: guard(async () => { const on = picks.filter(x => x.cb.checked); if (!on.length) return toast('Tick who you want to add'); await api('POST', `/channels/${c.id}/members`, { user_ids: on.filter(x => x.kind === 'u').map(x => x.id), bot_ids: on.filter(x => x.kind === 'b').map(x => x.id) }); again(); }) }) : null,
@@ -827,7 +827,7 @@ async function channelMembers() {
 
 // ---------- messages
 const TOOLS = { run_command: ['term', 'Run command'], write_file: ['file', 'Write file'], read_file: ['file', 'Read file'], http_request: ['globe', 'HTTP request'], remember: ['book', 'Remember'], forget: ['book', 'Forget'],
-  save_skill: ['zap', 'Save skill'], use_skill: ['zap', 'Use skill'], ask_bot: ['bot', 'Ask another bot'], create_routine: ['clock', 'Create routine'], list_workspace: ['grid', 'List projects'], get_overview: ['home', 'Overview'], read_messages: ['book', 'Read messages'], post_to_channel: ['hash', 'Post to channel'], list_routines: ['clock', 'List routines'], update_routine: ['edit', 'Update routine'], delete_routine: ['trash', 'Delete routine'], run_routine: ['play', 'Run routine'] };
+  save_skill: ['zap', 'Save skill'], use_skill: ['zap', 'Use skill'], ask_bot: ['bot', 'Ask another bot'], create_routine: ['clock', 'Create routine'], list_workspace: ['grid', 'List projects'], get_overview: ['home', 'Overview'], read_messages: ['book', 'Read messages'], post_to_channel: ['hash', 'Post to team chat'], list_routines: ['clock', 'List routines'], update_routine: ['edit', 'Update routine'], delete_routine: ['trash', 'Delete routine'], run_routine: ['play', 'Run routine'] };
 function toolInfo(name) {
   if (TOOLS[name]) return TOOLS[name];
   if (name.startsWith('screen_')) return ['screen', 'Screen: ' + name.slice(7)];
@@ -900,8 +900,8 @@ function heroNode() {
   const c = S.conv, b = S.bot;
   if (c.kind === 'feed') return $('div', { className: 'herobox', style: 'padding-top:16vh' }, $('p', { textContent: 'No shared activity yet. When this bot finishes a task for someone, a short summary shows up here.' }));
   if (c.kind === 'dm' || c.kind === 'home') return $('div', { className: 'herobox' }, avatar(c.name, 'bot lg'), $('h1', { textContent: 'What can I do for you?' }),
-    $('p', { textContent: c.kind === 'home' ? 'I can see every project, bot and channel you have access to.' : ((b && b.instructions.trim().split('\n')[0]) || `${c.name} works on the project computer and remembers what matters.`)}));
-  return $('div', { className: 'herobox' }, $('h1', { textContent: '# ' + c.name }), $('p', { textContent: (S.ctx.mem && S.ctx.mem.bots.length) ? 'The bots here reply to every message. Mention one with @ to address only that bot.' : 'There is no bot in this channel. Type @ to add one.' }));
+    $('p', { textContent: c.kind === 'home' ? 'I can see every project, bot and team chat you have access to.' : ((b && b.instructions.trim().split('\n')[0]) || `${c.name} works on the project computer and remembers what matters.`)}));
+  return $('div', { className: 'herobox' }, $('h1', { textContent: '# ' + c.name }), $('p', { textContent: (S.ctx.mem && S.ctx.mem.bots.length) ? 'The bots here reply to every message. Mention one with @ to address only that bot.' : 'There is no bot in this team chat. Type @ to add one.' }));
 }
 function msgNode(m, note) {
   const c = S.conv, when = ts(m.created_at), time = $('time', { textContent: clock(when), title: when.toLocaleString() });
@@ -1022,10 +1022,10 @@ function mentionItems() {
   const c = S.conv, ch = c.kind === 'channel', mem = S.ctx.mem, items = [], add = (group, icon_, label, desc, insert, action) => items.push({ group, icon: icon_, label, desc, insert, action });
   if (ch && mem) {
     const inB = new Set(mem.bots.map(b => b.id)), inU = new Set(mem.users.map(u => u.id));
-    for (const b of mem.bots) add('Bots in this channel', 'bot', b.name, b.mention_only ? 'Answers only when mentioned' : 'Mention to address only this bot', '@' + b.handle);
-    for (const b of S.bots) if (!inB.has(b.id) && b.role !== 'collaborator') add('Add a bot', 'plus', b.name, 'Add to this channel and mention', '@' + b.handle, () => addToChannel({ bot_ids: [b.id] }));
-    for (const m of S.members) if (m.user_id !== S.me.id && inU.has(m.user_id)) add('People', 'user', m.display_name, 'In this channel', '@' + m.username);
-    for (const m of S.members) if (!inU.has(m.user_id)) add('Add people', 'plus', m.display_name, 'Add to this channel and mention', '@' + m.username, () => addToChannel({ user_ids: [m.user_id] }));
+    for (const b of mem.bots) add('Bots in this team chat', 'bot', b.name, b.mention_only ? 'Answers only when mentioned' : 'Mention to address only this bot', '@' + b.handle);
+    for (const b of S.bots) if (!inB.has(b.id) && b.role !== 'collaborator') add('Add a bot', 'plus', b.name, 'Add to this team chat and mention', '@' + b.handle, () => addToChannel({ bot_ids: [b.id] }));
+    for (const m of S.members) if (m.user_id !== S.me.id && inU.has(m.user_id)) add('People', 'user', m.display_name, 'In this team chat', '@' + m.username);
+    for (const m of S.members) if (!inU.has(m.user_id)) add('Add people', 'plus', m.display_name, 'Add to this team chat and mention', '@' + m.username, () => addToChannel({ user_ids: [m.user_id] }));
   }
   for (const k of S.ctx.skills) add('Skills', 'zap', k.name, (k.of ? `@${k.of} · ` : '') + (k.description || 'Saved steps for a task'), '@skill:' + quote(k.name));
   if (!ch) for (const b of S.bots) if (b.id !== c.bot_id) add('Other bots', 'bot', b.name, 'Hand over part of the task', '@' + b.handle);
@@ -1046,7 +1046,7 @@ function renderDock() {
   const c = S.conv, dock = el('dock');
   if (c.kind === 'feed') return dock.replaceChildren();
   const direct = c.kind === 'dm' || c.kind === 'home';
-  const ta = $('textarea', { rows: 1, ariaLabel: 'Message', placeholder: direct ? `Message ${c.name}` : 'Message the channel, or @mention one bot', value: S.drafts[c.id] || '' });
+  const ta = $('textarea', { rows: 1, ariaLabel: 'Message', placeholder: direct ? `Message ${c.name}` : 'Message the team chat, or @mention one bot', value: S.drafts[c.id] || '' });
   const hl = $('div', { className: 'hl', ariaHidden: 'true' }), send = $('button', { className: 'send', title: 'Send (Enter)', ariaLabel: 'Send' }, icon('up', 18));
   // While a bot works you can keep typing. The mode decides what a new message does to the running task.
   const MODES = { auto: ['Auto', 'decides for you'], steer: ['Steer', 'adds to this task'], queue: ['Queue', 'runs afterwards'], interrupt: ['Interrupt', 'stops this task'] };
@@ -1127,7 +1127,7 @@ function renderDock() {
   else for (const b of (S.ctx.mem ? S.ctx.mem.bots : []).slice(0, 4)) chips.append($('button', { className: 'chip', onclick: () => insert('@' + b.handle + ' ') }, icon('bot', 15), $('span', { textContent: 'Ask ' + b.name })));
   chips.append($('button', { className: 'chip', onclick: atButton }, icon('at', 15), $('span', { textContent: 'See what you can add' })));
   dock.replaceChildren($('button', { id: 'jump', title: 'Jump to the latest message', ariaLabel: 'Jump to the latest message', onclick: () => { el('view').scrollTop = el('view').scrollHeight; } }, icon('down', 16)), box, chips,
-    $('div', { className: 'foot', textContent: (c.kind === 'dm' || c.kind === 'home') ? 'Bots can be wrong. Check what matters before you allow or use it.' : 'Everyone in this channel reads what is said here.' }));
+    $('div', { className: 'foot', textContent: (c.kind === 'dm' || c.kind === 'home') ? 'Bots can be wrong. Check what matters before you allow or use it.' : 'Everyone in this team chat reads what is said here.' }));
   sync(); S.dockSync(); if (!isNarrow()) ta.focus();
 }
 
@@ -1253,17 +1253,17 @@ async function openDrawer(bot, tab = 'setup') {
 function openPalette() {
   if (!S.me || document.querySelector('dialog.palette')) return;
   closePop();
-  const input = $('input', { placeholder: 'Search bots, channels, projects and actions', ariaLabel: 'Search' }), list = $('div', { className: 'plist' });
+  const input = $('input', { placeholder: 'Search bots, team chats, projects and actions', ariaLabel: 'Search' }), list = $('div', { className: 'plist' });
   const go = fn => () => { d.close(); guard(fn)(); };
   const all = [
     ...S.bots.map(b => ({ g: 'Bots', icon: 'bot', label: b.name, hint: '@' + b.handle, run: () => openBot(b) })),
-    ...S.channels.map(c => ({ g: 'Channels', icon: 'hash', label: c.name, run: () => openConv(c, null) })),
+    ...S.channels.map(c => ({ g: 'Team chats', icon: 'hash', label: c.name, run: () => openConv(c, null) })),
     ...S.bots.filter(b => b.is_team && b.published).map(b => ({ g: 'Activity', icon: 'pulse', label: b.name + ' activity', run: () => openFeed(b) })),
     ...S.teams.filter(t => !S.team || t.id !== S.team.id).map(t => ({ g: 'Projects', icon: 'grid', label: (t.client ? t.client + ' / ' : '') + t.name, hint: 'Switch', run: () => switchTeam(t.id) })),
     { g: 'Actions', icon: 'grid', label: 'Home', run: showHome },
     { g: 'Actions', icon: 'clock', label: 'Routines', run: showRoutines },
     ...(S.me && S.me.can_view_costs ? [{ g: 'Actions', icon: 'coin', label: 'Costs', run: showCosts }] : []),
-    ...(S.team ? [{ g: 'Actions', icon: 'plus', label: 'New bot', run: newBot }, { g: 'Actions', icon: 'plus', label: 'New channel', run: newChannel }, { g: 'Actions', icon: 'plug', label: 'New endpoint', run: newEndpoint }, { g: 'Actions', icon: 'users', label: 'People and invite code', run: projectDialog }] : []),
+    ...(S.team ? [{ g: 'Actions', icon: 'plus', label: 'New bot', run: newBot }, { g: 'Actions', icon: 'plus', label: 'New team chat', run: newChannel }, { g: 'Actions', icon: 'plug', label: 'New endpoint', run: newEndpoint }, { g: 'Actions', icon: 'users', label: 'People and invite code', run: projectDialog }] : []),
     { g: 'Actions', icon: 'plus', label: 'New project', run: newProject }, { g: 'Actions', icon: 'key', label: 'Join a project with an invite code', run: joinProject }, { g: 'Actions', icon: 'out', label: 'Sign out', run: signOut }];
   let shown = [], sel = 0;
   const draw = () => {
