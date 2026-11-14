@@ -19,7 +19,7 @@ from zoneinfo import ZoneInfo
 from . import config, llm, mcp_client, sandbox, screen, secrets_http
 from .access import bot_role
 from .db import (Approval, ApprovalRule, Bot, ChannelMember, Conversation, Endpoint, McpServer, Memory,
-                 Message, Routine, Secret, Skill, User, select, session)
+                 Message, Routine, Secret, Skill, Team, User, select, session)
 from .events import publish
 
 log = logging.getLogger("teambots.agent")
@@ -346,6 +346,8 @@ def system_prompt(bot: Bot, conv: Conversation, user: User, ctx: Ctx) -> str:
         personal = [] if ctx.is_channel else s.exec(select(Memory).where(
             Memory.bot_id == bot.id, Memory.scope == "personal", Memory.user_id == user.id)).all()
         skills = s.exec(select(Skill).where(Skill.bot_id == bot.id)).all()
+        ep = s.get(Endpoint, bot.endpoint_id) if bot.endpoint_id else None
+        team = s.get(Team, bot.team_id) if bot.team_id else None
         if bot.is_home:
             from . import home as home_mod
             others = []
@@ -405,6 +407,15 @@ def system_prompt(bot: Bot, conv: Conversation, user: User, ctx: Ctx) -> str:
                      "\n".join(f"- [{m.id}] {m.content}" for m in personal[-100:]))
     if skills:
         parts.append("## Skills\n" + "\n".join(f"- {k.name}: {k.description}" for k in skills))
+    setup = [f"- Model: {bot.model or (ep.default_model if ep else '') or 'the endpoint default'}"]
+    if ep:
+        setup.append(f"- Endpoint: {ep.name} (provider: {ep.provider})")
+    if team and not bot.is_home:
+        setup.append(f"- Project: {team.name}" + (f" (client: {team.client})" if team.client else ""))
+    setup.append(f"- Kind: {'Team Bot' if bot.is_team else 'personal bot'}" + (", published" if bot.published else ""))
+    setup.append(f"- Computer use: {'on' if bot.computer_use else 'off'} · Approval mode: {bot.approval_mode}")
+    parts.append("## Your setup\nThis is your own configuration; you may read it and share these facts when asked.\n"
+                 + "\n".join(setup))
     if others and ctx.depth == 0:
         parts.append("## Other bots (ask_bot)\n" + "\n".join(other_lines))
     return "\n\n".join(p for p in parts if p)
