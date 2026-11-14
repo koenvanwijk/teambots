@@ -750,6 +750,12 @@ function endpointDialog(e) {
     } catch (x) { out.style.color = 'var(--bad)'; out.textContent = x.message; }
     modelsBtn.disabled = false;
   }});
+  const copyBtn = $('button', { className: 'btn', textContent: 'Copy to project…', onclick: ev => {
+    const targets = (S.teams || []).filter(t => !S.team || t.id !== S.team.id);
+    if (!targets.length) return toast('You have no other project to copy into');
+    popmenu(ev.currentTarget, [{ head: 'Copy to' }, ...targets.map(t => ({ icon: 'grid', label: (t.client ? t.client + ' / ' : '') + t.name,
+      onclick: guard(async () => { await api('POST', `/endpoints/${e.id}/copy`, { team_id: t.id }); toast(`Copied "${e.name}" to ${t.name}`); }) }))]);
+  } });
   const d = openDialog('', $('div', { className: 'pad' }, $('h2', { textContent: e.name }),
     $('dl', { className: 'kv', style: 'margin-top:14px' },
       $('dt', { textContent: 'Provider' }), $('dd', { textContent: router ? 'Router' : cli ? 'Claude CLI (local)' : copilot ? 'GitHub Copilot' : 'OpenAI-compatible' }),
@@ -763,7 +769,7 @@ function endpointDialog(e) {
     $('div', { className: 'dfoot' }, mine && $('button', { className: 'btn danger', textContent: 'Remove', onclick: guard(async () => { if (!await confirmBox({ title: 'Remove endpoint?', text: `"${e.name}" is removed for everyone. Bots must be moved to another endpoint first.`, ok: 'Remove', danger: true })) return; await api('DELETE', `/endpoints/${e.id}`); d.close(); await loadTeam(); }) }),
       mine && $('button', { className: 'btn', textContent: 'Edit', onclick: () => { d.close(); guard(editEndpoint)(e); } }),
       mine && router && $('button', { className: 'btn', textContent: 'Edit rules', onclick: () => { d.close(); guard(editRouterRules)(e); } }),
-      mine && test, mine && modelsBtn, $('button', { className: 'btn primary', textContent: 'Done', onclick: () => d.close() }))));
+      (S.teams || []).length > 1 && copyBtn, mine && test, mine && modelsBtn, $('button', { className: 'btn primary', textContent: 'Done', onclick: () => d.close() }))));
 }
 async function newBot() {
   if (!S.endpoints.length) { toast('Add a model endpoint first'); return newEndpoint(); }

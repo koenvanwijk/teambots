@@ -681,6 +681,30 @@ def delete_endpoint(endpoint_id: int, user: User = Depends(current_user)):
     return {"ok": True}
 
 
+class EndpointCopy(BaseModel):
+    team_id: int  # the project to copy this endpoint into
+
+
+@router.post("/endpoints/{endpoint_id}/copy")
+def copy_endpoint(endpoint_id: int, body: EndpointCopy, user: User = Depends(current_user)):
+    """Duplicate an endpoint into another project as an independent copy. The encrypted
+    key is copied on the server and never leaves it. You must be able to use the source
+    (own it, or it is shared in its project where you are a member) and be a member of the
+    target project."""
+    with session() as s:
+        e = s.get(Endpoint, endpoint_id)
+        _need(e and (e.owner_id == user.id or (e.shared and team_role(s, user.id, e.team_id))),
+              404, "endpoint not found")
+        _need(team_role(s, user.id, body.team_id), 403, "you are not a member of that project")
+        copy = Endpoint(team_id=body.team_id, owner_id=user.id, shared=e.shared, name=e.name,
+                        base_url=e.base_url, api_key_enc=e.api_key_enc, default_model=e.default_model,
+                        provider=getattr(e, "provider", None) or "openai",
+                        github_domain=getattr(e, "github_domain", None) or "")
+        s.add(copy)
+        s.commit()
+    return _ep_out(copy)
+
+
 @router.post("/endpoints/{endpoint_id}/test")
 async def test_endpoint(endpoint_id: int, user: User = Depends(current_user)):
     """Checks reachability and whether the model answers with a tool call."""
