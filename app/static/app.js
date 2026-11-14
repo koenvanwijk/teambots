@@ -154,7 +154,8 @@ function popmenu(anchor, items) {
 // ---------------------------------------------------------------- sign in
 function signOut() { stopConv(); store.set('tb_token', null); S.token = null; S.me = null; closePop(); showAuth(); }
 function showAuth() {
-  let create = false;
+  const invite = (new URLSearchParams(location.search).get('invite') || '').trim();
+  let create = !!invite;  // an invite link means a new person joining
   const u = $('input', { placeholder: 'Username', autocomplete: 'username', autocapitalize: 'none', required: true }), p = $('input', { type: 'password', placeholder: 'Password', autocomplete: 'current-password', required: true });
   const d = $('input', { placeholder: 'Display name', autocomplete: 'name' }), dWrap = $('label', { className: 'field', hidden: true }, d);
   const err = $('div', { className: 'err', role: 'alert' }), title = $('h1'), sub = $('p'), go = $('button', { className: 'btn primary', type: 'submit' }), swapText = $('span'), swapBtn = $('button', { type: 'button' });
@@ -169,8 +170,9 @@ function showAuth() {
     catch (x) { err.textContent = x.message; go.disabled = false; } };
   // Sign in with GitHub or Google, when configured. A new person pastes the invite code they were given.
   (async () => { try { const info = await api('GET', '/auth/providers'); if (!info.providers || !info.providers.length) return;
-    const inv = $('input', { placeholder: 'Invite code (new? paste it here)', autocapitalize: 'none', autocomplete: 'off' });
+    const inv = $('input', { placeholder: 'Invite code (new? paste it here)', autocapitalize: 'none', autocomplete: 'off', value: invite });
     providers.append($('div', { className: 'authsep' }, $('span', { textContent: 'or' })),
+      invite && $('p', { className: 'hint', textContent: 'You have been invited to a project. Continue with a provider below to join.' }),
       ...info.providers.map(p => $('button', { className: 'btn', type: 'button', textContent: 'Continue with ' + p.name,
         onclick: () => { const code = inv.value.trim(); location.href = '/api/auth/' + p.id + '/start' + (code ? '?invite=' + encodeURIComponent(code) : ''); } })),
       $('label', { className: 'field', style: 'margin-top:6px' }, inv));
@@ -445,10 +447,13 @@ async function joinProject() {
 }
 function projectDialog() {
   const t = S.team, admin = t.role === 'admin';
+  const inviteUrl = location.origin + '/?invite=' + encodeURIComponent(t.invite_code);
   const sharing = $('select', { onchange: guard(async () => { await api('PATCH', `/teams/${t.id}`, { bot_sharing: sharing.value }); t.bot_sharing = sharing.value; toast('Saved'); }) },
     $('option', { value: 'everyone', textContent: 'Every member can publish Team Bots', selected: t.bot_sharing === 'everyone' }), $('option', { value: 'admins', textContent: 'Only admins can publish Team Bots', selected: t.bot_sharing === 'admins' }));
   const d = openDialog('', $('div', { className: 'pad' }, $('h2', { textContent: t.name }), $('p', { className: 'intro', textContent: (t.client ? t.client + ' · ' : '') + `${S.members.length} ${S.members.length === 1 ? 'person' : 'people'}` }),
-    admin && $('div', { className: 'field' }, $('span', { textContent: 'Invite code' }), $('div', { className: 'copyrow' }, $('code', { textContent: t.invite_code }), $('button', { className: 'btn sm', textContent: 'Copy', onclick: () => copyText(t.invite_code, 'Invite code copied') }))),
+    admin && $('div', { className: 'field' }, $('span', { textContent: 'Invite link' }),
+      $('div', { className: 'copyrow' }, $('code', { textContent: inviteUrl }), $('button', { className: 'btn sm', textContent: 'Copy', onclick: () => copyText(inviteUrl, 'Invite link copied') })),
+      $('small', { className: 'muted' }, 'Share this link to invite someone. Or give just the code: ', $('code', { textContent: t.invite_code }))),
     admin && $('label', { className: 'field' }, $('span', { textContent: 'Bot sharing' }), sharing),
     $('div', { className: 'field' }, $('span', { textContent: 'People' }), S.members.map(m => $('div', { className: 'li' }, avatar(m.display_name), $('div', { className: 'tx' }, m.display_name, $('small', { textContent: '@' + m.username })), m.role === 'admin' && $('span', { className: 'tag', textContent: 'admin' })))),
     $('div', { className: 'dfoot' }, admin && $('button', { className: 'btn', textContent: 'Rename', onclick: () => { d.close(); guard(renameProject)(); } }), $('button', { className: 'btn primary', textContent: 'Done', onclick: () => d.close() }))));
