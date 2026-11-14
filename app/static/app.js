@@ -445,6 +445,22 @@ async function joinProject() {
   await form({ title: 'Join a project', intro: 'Ask a project admin for the invite code.', ok: 'Join', fields: [{ name: 'invite_code', label: 'Invite code', required: true, mono: true }],
     onSubmit: async v => { const t = await api('POST', '/teams/join', v); store.set('tb_team', String(t.id)); await boot(); } });
 }
+function backupsSection(t) {
+  const mb = n => (n / 1048576).toFixed(n >= 10485760 ? 1 : 2) + ' MB';
+  const list = $('div', { className: 'bklist' }, $('small', { className: 'muted', textContent: 'Loading…' }));
+  (async () => {
+    try {
+      const rows = await api('GET', `/teams/${t.id}/backups`);
+      list.replaceChildren(rows.length
+        ? rows.map(r => $('div', { className: 'li' },
+            $('div', { className: 'tx' }, new Date(r.created_at).toLocaleString(), $('small', { textContent: mb(r.size) })),
+            $('a', { className: 'btn sm', href: withToken(`/teams/${t.id}/backups/${encodeURIComponent(r.name)}`), download: r.name, textContent: 'Download' })))
+        : $('small', { className: 'muted', textContent: 'No exports yet. Create one with scripts/export_project.py.' }));
+    } catch { list.replaceChildren($('small', { className: 'muted', textContent: 'Could not load backups.' })); }
+  })();
+  return $('div', { className: 'field' }, $('span', { textContent: 'Backups' }), list,
+    $('small', { className: 'muted', textContent: 'Per-project exports (messages, bots, settings, workspace). Downloads contain secrets — keep them private.' }));
+}
 function projectDialog() {
   const t = S.team, admin = t.role === 'admin';
   const inviteUrl = location.origin + '/?invite=' + encodeURIComponent(t.invite_code);
@@ -455,6 +471,7 @@ function projectDialog() {
       $('div', { className: 'copyrow' }, $('code', { textContent: inviteUrl }), $('button', { className: 'btn sm', textContent: 'Copy', onclick: () => copyText(inviteUrl, 'Invite link copied') })),
       $('small', { className: 'muted' }, 'Share this link to invite someone. Or give just the code: ', $('code', { textContent: t.invite_code }))),
     admin && $('label', { className: 'field' }, $('span', { textContent: 'Bot sharing' }), sharing),
+    admin && backupsSection(t),
     $('div', { className: 'field' }, $('span', { textContent: 'People' }), S.members.map(m => $('div', { className: 'li' }, avatar(m.display_name), $('div', { className: 'tx' }, m.display_name, $('small', { textContent: '@' + m.username })), m.role === 'admin' && $('span', { className: 'tag', textContent: 'admin' })))),
     $('div', { className: 'dfoot' }, admin && $('button', { className: 'btn', textContent: 'Rename', onclick: () => { d.close(); guard(renameProject)(); } }), $('button', { className: 'btn primary', textContent: 'Done', onclick: () => d.close() }))));
 }

@@ -8,6 +8,9 @@ from cryptography.fernet import Fernet
 DATA_DIR = os.environ.get("TB_DATA_DIR", "./data")
 os.makedirs(DATA_DIR, exist_ok=True)
 DB_URL = os.environ.get("TB_DB_URL", f"sqlite:///{DATA_DIR}/teambots.db")
+# Where per-project export archives (scripts/export_project.py) live; the UI lists and serves them.
+EXPORTS_DIR = os.environ.get("TB_EXPORTS_DIR",
+                             os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "exports"))
 SECRET_KEY = os.environ.get("TB_SECRET_KEY", "dev-insecure-change-me")
 # "docker" = one container per sandbox key; "local" = plain subprocess (development only).
 SANDBOX_BACKEND = os.environ.get("TB_SANDBOX", "local")

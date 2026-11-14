@@ -2,6 +2,7 @@
 import asyncio
 import hashlib
 import json
+import os
 import re
 import secrets
 from datetime import datetime, timezone
@@ -412,6 +413,39 @@ async def team_files(team_id: int, user: User = Depends(current_user)):
         return await sandbox.list_files(f"p{team_id}")
     except Exception:  # noqa: BLE001 - the menu simply shows no files
         return []
+
+
+@router.get("/teams/{team_id}/backups")
+def list_team_backups(team_id: int, user: User = Depends(current_user)):
+    """Per-project export archives (made by scripts/export_project.py). Project admins only."""
+    with session() as s:
+        _need(team_role(s, user.id, team_id) == "admin", 403, "project admins only")
+    prefix, out = f"teambots-project-p{team_id}-", []
+    d = config.EXPORTS_DIR
+    if os.path.isdir(d):
+        for name in os.listdir(d):
+            if name.startswith(prefix) and name.endswith(".tgz"):
+                try:
+                    st = os.stat(os.path.join(d, name))
+                except OSError:
+                    continue
+                out.append({"name": name, "size": st.st_size,
+                            "created_at": datetime.fromtimestamp(st.st_mtime, timezone.utc).isoformat()})
+    out.sort(key=lambda r: r["name"], reverse=True)
+    return out
+
+
+@router.get("/teams/{team_id}/backups/{name}")
+def download_team_backup(team_id: int, name: str, user: User = Depends(current_user)):
+    """Serve one of this project's export archives. Admins only; the name is validated strictly."""
+    with session() as s:
+        _need(team_role(s, user.id, team_id) == "admin", 403, "project admins only")
+    prefix = f"teambots-project-p{team_id}-"
+    _need("/" not in name and "\\" not in name and ".." not in name
+          and name.startswith(prefix) and name.endswith(".tgz"), 404, "not found")
+    path = os.path.join(config.EXPORTS_DIR, name)
+    _need(os.path.isfile(path), 404, "not found")
+    return FileResponse(path, media_type="application/gzip", filename=name)
 
 
 class TeamPatch(BaseModel):
@@ -1164,7 +1198,7 @@ def patch_conversation(conv_id: int, body: ConversationPatch, user: User = Depen
             c.share_activity = body.share_activity
         if body.name is not None:
             _need(c.kind == "channel", 400, "only a channel can be renamed here")
-            _need(body.name.strip(), 400, "the channel needs a name")
+            _need(body.name.strip(), 400, "the team chat needs a name")
             c.name = body.name.strip()
         s.add(c)
         s.commit()
