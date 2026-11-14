@@ -338,6 +338,7 @@ function projectMenu(anchor) {
     S.teams.length && { head: 'Projects' },
     ...S.teams.map(t => ({ icon: 'grid', label: (t.client ? t.client + ' / ' : '') + t.name, checked: S.team && t.id === S.team.id, onclick: () => switchTeam(t.id) })),
     S.teams.length && { sep: true },
+    S.team && S.team.role === 'admin' && { icon: 'edit', label: 'Rename project', onclick: guard(renameProject) },
     S.team && { icon: 'users', label: 'People and invite code', onclick: guard(projectDialog) },
     { icon: 'plus', label: 'New project', onclick: guard(newProject) },
     { icon: 'key', label: 'Join with an invite code', onclick: guard(joinProject) }]);
