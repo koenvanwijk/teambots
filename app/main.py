@@ -10,6 +10,7 @@ from uvicorn.middleware.proxy_headers import ProxyHeadersMiddleware
 
 from . import routines
 from .api import router
+from .costs_api import router as costs_router
 from .home_api import home_router, openai_router, tokens_router
 from .db import init_db
 
@@ -29,6 +30,7 @@ app = FastAPI(title="TeamBots", lifespan=lifespan)
 # Honour X-Forwarded-Proto / X-Forwarded-Host when sitting behind Caddy, Brev, cloudflared, etc.
 app.add_middleware(ProxyHeadersMiddleware, trusted_hosts="*")
 app.include_router(router)
+app.include_router(costs_router)
 app.include_router(tokens_router)
 app.include_router(home_router)
 app.include_router(openai_router)

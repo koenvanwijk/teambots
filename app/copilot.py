@@ -287,6 +287,7 @@ async def chat(ep: Endpoint, model: str, messages: list[dict], tools: list[dict]
                max_tokens: int | None = None, *, client: httpx.AsyncClient | None = None,
                token_endpoint: str | None = None) -> dict:
     """Chat completions through Copilot, returning {content, tool_calls}."""
+    from . import usage
     budget = max_tokens or config.LLM_MAX_TOKENS
     body: dict = {"model": model or ep.default_model, "messages": messages, "max_tokens": budget}
     if tools:
@@ -295,36 +296,52 @@ async def chat(ep: Endpoint, model: str, messages: list[dict], tools: list[dict]
     own = client is None
     if own:
         client = httpx.AsyncClient(timeout=config.LLM_TIMEOUT)
+    timer = usage.Timer()
+    used: dict = {}
+    retried = False
+    model_id = body["model"]
     try:
-        sess = await _session(ep, client, token_endpoint=token_endpoint)
-        headers = {**completions_headers(messages), "Authorization": f"Bearer {sess['token']}"}
-        url = None
-        r = None
-        last_status = None
-        for path in ("chat/completions", "v1/chat/completions"):
-            url = _join(sess["base_url"], path)
-            r = await client.post(url, json=body, headers=headers)
-            last_status = r.status_code
-            if r.status_code != 404:
-                break
-        if r is None:
-            raise LLMError(f"cannot reach Copilot completions at '{ep.name}'")
-        if r.status_code >= 400:
-            raise LLMError(
-                f"endpoint '{ep.name}' returned HTTP {r.status_code}: {redact(r.text)}")
-        msg, finish = _choice(r.json(), ep.name)
-        parsed = parse_message(msg, finish)
-        if parsed["truncated"]:
-            body["max_tokens"] = max(budget * 2, 16384)
-            r = await client.post(url, json=body, headers=headers)
+        try:
+            sess = await _session(ep, client, token_endpoint=token_endpoint)
+            headers = {**completions_headers(messages), "Authorization": f"Bearer {sess['token']}"}
+            url = r = None
+            for path in ("chat/completions", "v1/chat/completions"):
+                url = _join(sess["base_url"], path)
+                r = await client.post(url, json=body, headers=headers)
+                if r.status_code != 404:
+                    break
+            if r is None:
+                raise LLMError(f"cannot reach Copilot completions at '{ep.name}'")
             if r.status_code >= 400:
                 raise LLMError(
                     f"endpoint '{ep.name}' returned HTTP {r.status_code}: {redact(r.text)}")
-            msg, finish = _choice(r.json(), ep.name)
+            data = r.json()
+            used = usage.parse_usage(data)
+            msg, finish = _choice(data, ep.name)
             parsed = parse_message(msg, finish)
-        return {"content": parsed["content"], "tool_calls": parsed["tool_calls"]}
-    except httpx.HTTPError as e:
-        raise LLMError(f"cannot reach endpoint '{ep.name}': {e.__class__.__name__}") from e
+            if parsed["truncated"]:
+                usage.log_call(endpoint=ep, model=model_id, tokens=used,
+                               latency_ms=timer.ms(), success=True, retry=False)
+                retried = True
+                timer = usage.Timer()
+                body["max_tokens"] = max(budget * 2, 16384)
+                r = await client.post(url, json=body, headers=headers)
+                if r.status_code >= 400:
+                    raise LLMError(
+                        f"endpoint '{ep.name}' returned HTTP {r.status_code}: {redact(r.text)}")
+                data = r.json()
+                used = usage.parse_usage(data)
+                msg, finish = _choice(data, ep.name)
+                parsed = parse_message(msg, finish)
+        except httpx.HTTPError as e:
+            raise LLMError(f"cannot reach endpoint '{ep.name}': {e.__class__.__name__}") from e
+        except LLMError as err:
+            usage.log_call(endpoint=ep, model=model_id, tokens=used, latency_ms=timer.ms(),
+                           success=False, error=str(err), retry=retried)
+            raise
+        usage.log_call(endpoint=ep, model=model_id, tokens=used, latency_ms=timer.ms(),
+                       success=True, retry=retried)
+        return {"content": parsed["content"], "tool_calls": parsed["tool_calls"], "usage": used}
     finally:
         if own:
             await client.aclose()

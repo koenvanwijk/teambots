@@ -96,7 +96,11 @@ def login(body: Credentials):
 
 @router.get("/me")
 def me(user: User = Depends(current_user)):
-    return {"id": user.id, "username": user.username, "display_name": user.display_name}
+    from . import usage
+    with session() as s:
+        can_costs = usage.user_can_view_costs(s, user.id)
+    return {"id": user.id, "username": user.username, "display_name": user.display_name,
+            "can_view_costs": can_costs}
 
 
 # ---------------------------------------------------------------- sign in with GitHub or Google
@@ -359,6 +363,9 @@ def my_teams(user: User = Depends(current_user)):
             d = {"id": t.id, "name": t.name, "client": t.client, "role": m.role, "bot_sharing": t.bot_sharing}
             if m.role == "admin":
                 d["invite_code"] = t.invite_code
+                d["monthly_budget"] = getattr(t, "monthly_budget", None)
+                d["budget_currency"] = getattr(t, "budget_currency", None) or "USD"
+                d["budget_block"] = bool(getattr(t, "budget_block", False))
             out.append(d)
     return out
 
@@ -411,12 +418,20 @@ class TeamPatch(BaseModel):
     bot_sharing: Optional[str] = None
     name: Optional[str] = None
     client: Optional[str] = None
+    monthly_budget: Optional[float] = None
+    budget_currency: Optional[str] = None
+    budget_block: Optional[bool] = None
 
 
 @router.patch("/teams/{team_id}")
 def patch_team(team_id: int, body: TeamPatch, user: User = Depends(current_user)):
     _need(body.bot_sharing in (None, "everyone", "admins"), 400, "bot_sharing: everyone | admins")
     _need(body.name is None or body.name.strip(), 400, "the project needs a name")
+    data = body.model_dump(exclude_unset=True)
+    if "budget_currency" in data:
+        _need(data["budget_currency"] in ("USD", "EUR"), 400, "budget_currency: USD | EUR")
+    if "monthly_budget" in data and data["monthly_budget"] is not None:
+        _need(data["monthly_budget"] >= 0, 400, "monthly_budget must be 0 or more")
     with session() as s:
         _need(team_role(s, user.id, team_id) == "admin")
         t = s.get(Team, team_id)
@@ -426,6 +441,12 @@ def patch_team(team_id: int, body: TeamPatch, user: User = Depends(current_user)
             t.name = body.name.strip()
         if body.client is not None:
             t.client = body.client.strip()
+        if "monthly_budget" in data:
+            t.monthly_budget = data["monthly_budget"]
+        if "budget_currency" in data:
+            t.budget_currency = data["budget_currency"]
+        if "budget_block" in data:
+            t.budget_block = bool(data["budget_block"])
         s.add(t)
         s.commit()
     return {"ok": True}
@@ -447,7 +468,9 @@ def _ep_out(e: Endpoint) -> dict:  # the key never leaves the server
     return {"id": e.id, "name": e.name, "base_url": e.base_url, "default_model": e.default_model,
             "shared": e.shared, "owner_id": e.owner_id, "has_key": bool(e.api_key_enc),
             "provider": getattr(e, "provider", None) or "openai",
-            "github_domain": getattr(e, "github_domain", None) or ""}
+            "github_domain": getattr(e, "github_domain", None) or "",
+            "models": __import__("app.usage", fromlist=["cached_models"]).cached_models(e),
+            "models_fetched_at": e.models_fetched_at.isoformat() if getattr(e, "models_fetched_at", None) else None}
 
 
 def _normalize_provider(value: str) -> str:
@@ -573,7 +596,10 @@ async def test_endpoint(endpoint_id: int, user: User = Depends(current_user)):
     tool = {"type": "function", "function": {"name": "ping", "description": "Call this tool.", "parameters": {
         "type": "object", "properties": {"ok": {"type": "boolean"}}, "required": ["ok"]}}}
     try:
-        reply = await llm.chat(e, "", [{"role": "user", "content": "Call the ping tool with ok=true."}], [tool])
+        from . import usage
+        with usage.bind(origin="test", user_id=user.id, team_id=e.team_id, endpoint_id=e.id,
+                        billable_request=True):
+            reply = await llm.chat(e, "", [{"role": "user", "content": "Call the ping tool with ok=true."}], [tool])
     except llm.LLMError as err:
         return {"reachable": False, "tool_calling": False, "detail": str(err)}
     return {"reachable": True, "tool_calling": bool(reply["tool_calls"]),

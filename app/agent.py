@@ -585,10 +585,22 @@ async def _run_locked(conv_id: int, bot_id: int, requester_id: int, run: Run | N
         specs, mcp_map = await build_tools(bot, ctx)
         messages = [{"role": "system", "content": system_prompt(bot, conv, user, ctx)}] + build_history(conv, bot, run=run)
         common = dict(author_bot_id=bot_id, requester_id=requester_id)
+        from . import usage
+        origin = (usage.current().origin if usage.current() else None) or ("overview" if bot.is_home else "chat")
+        if "usage_first" not in locals():
+            usage_first = True
+            block = usage.should_block(bot.team_id)
+            if block:
+                _post(conv_id, role="assistant", content=block, **common)
+                return
         try:
             if ep is None:
                 raise llm.LLMError("this bot has no endpoint configured")
-            reply = await llm.chat(ep, bot.model, messages, specs)
+            with usage.bind(origin=origin, user_id=requester_id, team_id=bot.team_id, bot_id=bot_id,
+                            conversation_id=conv_id, endpoint_id=ep.id if ep else None,
+                            billable_request=usage_first):
+                usage_first = False
+                reply = await llm.chat(ep, bot.model, messages, specs)
         except llm.LLMError as e:
             _post(conv_id, role="assistant", content=f"Endpoint error: {e}", **common)
             return
@@ -682,9 +694,15 @@ async def run_subagent(ctx: Ctx, message: str, asked_by: str) -> str:
     specs, mcp_map = await build_tools(bot, ctx)
     messages = [{"role": "system", "content": system_prompt(bot, conv, user, ctx)},
                 {"role": "user", "content": f"[handed over by bot {asked_by}, working for {user.display_name}]\n{message}"}]
+    from . import usage
+    first = True
     for _ in range(config.MAX_STEPS):
         try:
-            reply = await llm.chat(ep, bot.model, messages, specs)
+            with usage.bind(origin="ask_bot", user_id=ctx.requester_id, team_id=bot.team_id,
+                            bot_id=bot.id, conversation_id=ctx.conv_id,
+                            endpoint_id=ep.id if ep else None, billable_request=first):
+                first = False
+                reply = await llm.chat(ep, bot.model, messages, specs)
         except llm.LLMError as e:
             return f"error: {e}"
         if not reply["tool_calls"]:

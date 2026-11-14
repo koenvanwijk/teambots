@@ -32,7 +32,10 @@ async def fire(routine_id: int, *, force: bool = False) -> None:
         s.commit()
     agent._post(r.conversation_id, role="user", content=f"[Routine: {r.name}] {r.prompt}", author_user_id=r.owner_id)
     agent.cancel_pending(r.conversation_id, r.bot_id)
-    await agent.run_agent(r.conversation_id, r.bot_id, r.owner_id)
+    from . import usage
+    with usage.bind(origin="routine", user_id=r.owner_id, team_id=bot.team_id, bot_id=r.bot_id,
+                    conversation_id=r.conversation_id, endpoint_id=bot.endpoint_id):
+        await agent.run_agent(r.conversation_id, r.bot_id, r.owner_id)
 
 
 def sync(r: Routine) -> None:

@@ -58,27 +58,10 @@ def _choice(data: dict, ep_name: str) -> tuple[dict, str]:
         raise LLMError(f"endpoint '{ep_name}' returned an unexpected response") from e
 
 
-async def list_models(ep: Endpoint) -> list[dict]:
-    """Best-effort model catalog. Empty if the endpoint has no /models."""
-    if getattr(ep, "provider", "openai") == "github_copilot":
-        from . import copilot
-        return await copilot.list_models(ep)
-    headers = {"Accept": "application/json"}
-    key = config.decrypt(ep.api_key_enc)
-    if key:
-        headers["Authorization"] = f"Bearer {key}"
-    url = ep.base_url.rstrip("/") + "/models"
-    try:
-        async with httpx.AsyncClient(timeout=config.LLM_TIMEOUT) as client:
-            r = await client.get(url, headers=headers)
-            if r.status_code == 404:
-                return []
-            if r.status_code >= 400:
-                raise LLMError(f"endpoint '{ep.name}' /models returned HTTP {r.status_code}: {r.text[:300]}")
-            data = r.json()
-    except httpx.HTTPError as e:
-        raise LLMError(f"cannot reach endpoint '{ep.name}': {e.__class__.__name__}") from e
+def _parse_model_list(data) -> list[dict]:
     rows = data.get("data") if isinstance(data, dict) else data
+    if isinstance(data, dict) and not rows:
+        rows = data.get("models")
     if not isinstance(rows, list):
         return []
     out = []
@@ -90,9 +73,60 @@ async def list_models(ep: Endpoint) -> list[dict]:
     return out
 
 
+def _store_models(ep: Endpoint, models: list[dict]) -> None:
+    if not models or not getattr(ep, "id", None):
+        return
+    from . import usage
+    from .db import session
+    with session() as s:
+        row = s.get(Endpoint, ep.id)
+        if not row:
+            return
+        usage.cache_models(row, models)
+        s.add(row)
+        s.commit()
+        ep.models_json = row.models_json
+        ep.models_fetched_at = row.models_fetched_at
+
+
+async def list_models(ep: Endpoint, *, refresh: bool = False) -> list[dict]:
+    """Best-effort model catalog. Falls back to the last cached list if /models fails."""
+    from . import usage
+    cached = usage.cached_models(ep)
+    try:
+        if getattr(ep, "provider", "openai") == "github_copilot":
+            from . import copilot
+            out = await copilot.list_models(ep)
+        else:
+            headers = {"Accept": "application/json"}
+            key = config.decrypt(ep.api_key_enc)
+            if key:
+                headers["Authorization"] = f"Bearer {key}"
+            url = ep.base_url.rstrip("/") + "/models"
+            async with httpx.AsyncClient(timeout=config.LLM_TIMEOUT) as client:
+                r = await client.get(url, headers=headers)
+                if r.status_code == 404:
+                    out = []
+                elif r.status_code >= 400:
+                    raise LLMError(f"endpoint '{ep.name}' /models returned HTTP {r.status_code}: {r.text[:300]}")
+                else:
+                    out = _parse_model_list(r.json())
+        if out:
+            _store_models(ep, out)
+            return out
+        return cached
+    except (LLMError, httpx.HTTPError):
+        if cached and not refresh:
+            return cached
+        if isinstance(cached, list) and not refresh:
+            return cached
+        raise
+
+
 async def chat(ep: Endpoint, model: str, messages: list[dict], tools: list[dict] | None = None,
                max_tokens: int | None = None) -> dict:
     """Return the assistant message dict ({'content': ..., 'tool_calls': [...]})."""
+    from . import usage
     if getattr(ep, "provider", "openai") == "github_copilot":
         from . import copilot
         return await copilot.chat(ep, model, messages, tools, max_tokens=max_tokens)
@@ -106,21 +140,39 @@ async def chat(ep: Endpoint, model: str, messages: list[dict], tools: list[dict]
     if key:
         headers["Authorization"] = f"Bearer {key}"
     url = ep.base_url.rstrip("/") + "/chat/completions"
+    timer = usage.Timer()
+    used = {}
+    retried = False
     try:
-        async with httpx.AsyncClient(timeout=config.LLM_TIMEOUT) as client:
-            r = await client.post(url, json=body, headers=headers)
-            if r.status_code >= 400:
-                raise LLMError(f"endpoint '{ep.name}' returned HTTP {r.status_code}: {r.text[:300]}")
-            msg, finish = _choice(r.json(), ep.name)
-            parsed = parse_message(msg, finish)
-            # Thinking used up the budget: one retry with a larger cap, still never surface reasoning.
-            if parsed["truncated"]:
-                body["max_tokens"] = max(budget * 2, 16384)
+        try:
+            async with httpx.AsyncClient(timeout=config.LLM_TIMEOUT) as client:
                 r = await client.post(url, json=body, headers=headers)
                 if r.status_code >= 400:
                     raise LLMError(f"endpoint '{ep.name}' returned HTTP {r.status_code}: {r.text[:300]}")
-                msg, finish = _choice(r.json(), ep.name)
+                data = r.json()
+                used = usage.parse_usage(data)
+                msg, finish = _choice(data, ep.name)
                 parsed = parse_message(msg, finish)
-    except httpx.HTTPError as e:
-        raise LLMError(f"cannot reach endpoint '{ep.name}': {e.__class__.__name__}") from e
-    return {"content": parsed["content"], "tool_calls": parsed["tool_calls"]}
+                # Thinking used up the budget: one retry with a larger cap, still never surface reasoning.
+                if parsed["truncated"]:
+                    usage.log_call(endpoint=ep, model=body["model"], tokens=used,
+                                   latency_ms=timer.ms(), success=True, retry=False)
+                    retried = True
+                    timer = usage.Timer()
+                    body["max_tokens"] = max(budget * 2, 16384)
+                    r = await client.post(url, json=body, headers=headers)
+                    if r.status_code >= 400:
+                        raise LLMError(f"endpoint '{ep.name}' returned HTTP {r.status_code}: {r.text[:300]}")
+                    data = r.json()
+                    used = usage.parse_usage(data)
+                    msg, finish = _choice(data, ep.name)
+                    parsed = parse_message(msg, finish)
+        except httpx.HTTPError as e:
+            raise LLMError(f"cannot reach endpoint '{ep.name}': {e.__class__.__name__}") from e
+    except LLMError as err:
+        usage.log_call(endpoint=ep, model=body["model"], tokens=used, latency_ms=timer.ms(),
+                       success=False, error=str(err), retry=retried)
+        raise
+    usage.log_call(endpoint=ep, model=body["model"], tokens=used, latency_ms=timer.ms(),
+                   success=True, retry=retried)
+    return {"content": parsed["content"], "tool_calls": parsed["tool_calls"], "usage": used}

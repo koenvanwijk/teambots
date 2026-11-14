@@ -29,7 +29,7 @@ const ICONS = {
   term: 'M4 5h16v14H4zM8 10l3 2.5L8 15M13 15h3', file: 'M7 3h7l4 4v14H7zM14 3v4h4', key: 'M8 15a4 4 0 1 0 0-8 4 4 0 0 0 0 8zM12 11h9M18 11v3M15 11v2',
   zap: 'M13 3L5 13h6l-1 8 8-10h-6z', grid: 'M4 4h7v7H4zM13 4h7v7h-7zM4 13h7v7H4zM13 13h7v7h-7z',
   home: 'M4 11l8-7 8 7v9H15v-6h-6v6H4z', trash: 'M5 7h14M10 7V4h4v3M7 7l1 13h8l1-13',
-  play: 'M8 5l11 7-11 7z', clock: 'M12 21a9 9 0 1 0 0-18 9 9 0 0 0 0 18zM12 7v5l3 2', screen: 'M3 5h18v11H3zM9 20h6M12 16v4',
+  play: 'M8 5l11 7-11 7z', clock: 'M12 21a9 9 0 1 0 0-18 9 9 0 0 0 0 18zM12 7v5l3 2', coin: 'M12 21a9 9 0 1 0 0-18 9 9 0 0 0 0 18zM8 12h8M12 8v8', screen: 'M3 5h18v11H3zM9 20h6M12 16v4',
   globe: 'M12 21a9 9 0 1 0 0-18 9 9 0 0 0 0 18zM3 12h18M12 3c3 3 3 15 0 18M12 3c-3 3-3 15 0 18', book: 'M5 4h13v16H7a2 2 0 0 1-2-2zM5 18a2 2 0 0 1 2-2h11',
   lock: 'M6 11h12v9H6zM9 11V8a3 3 0 0 1 6 0v3', edit: 'M4 20h4L19 9l-4-4L4 16zM13 7l4 4', stop: 'M7 7h10v10H7z', menu: 'M4 7h16M4 12h16M4 17h16', dots: 'M5 12h.01M12 12h.01M19 12h.01', pause: 'M9 6v12M15 6v12',
 };
@@ -203,6 +203,13 @@ async function boot() {
 async function loadTeam() {
   if (S.team) [S.bots, S.channels, S.members, S.endpoints] = await Promise.all(['bots', 'channels', 'members', 'endpoints'].map(x => api('GET', `/teams/${S.team.id}/${x}`)));
   else S.bots = S.channels = S.members = S.endpoints = [];
+  S.botCosts = {};
+  if (S.me && S.me.can_view_costs) {
+    try {
+      const c = await api('GET', '/costs/bots?period=30d');
+      for (const b of c.bots || []) S.botCosts[b.id] = b;
+    } catch { /* cost badges are optional */ }
+  }
   renderSide();
 }
 const switchTeam = guard(async id => { store.set('tb_team', String(id)); await boot(); });
@@ -211,6 +218,57 @@ function toggleSide() { const a = el('app'); if (isNarrow()) a.classList.toggle(
 const sideHidden = () => isNarrow() || el('app').classList.contains('noside');
 const afterNav = () => el('app') && el('app').classList.remove('sideopen');
 const botTag = b => !b.is_team ? null : !b.published ? $('span', { className: 'tag warn', textContent: 'draft' }) : $('span', { className: 'tag', textContent: 'team' });
+const botCostTag = b => {
+  const c = S.botCosts && S.botCosts[b.id];
+  if (!c) return null;
+  const label = (!c.cost || c.cost.amount == null) && c.unknown_calls ? 'cost ?' : (c.cost && c.cost.amount != null ? fmtMoney(c.cost) : null);
+  return label ? $('span', { className: 'tag', title: 'Last 30 days', textContent: label }) : null;
+};
+function fmtMoney(d) {
+  if (!d || d.amount == null) return 'Price unknown';
+  const sym = d.currency === 'EUR' ? '€' : '$';
+  const n = Number(d.amount), a = Math.abs(n);
+  const digits = a >= 100 ? 2 : a >= 1 ? 3 : a > 0 ? 4 : 2;
+  return sym + n.toLocaleString(undefined, { minimumFractionDigits: digits, maximumFractionDigits: digits });
+}
+function modelCombo({ value, placeholder, getEndpointId }) {
+  const input = $('input', { value: value || '', placeholder: placeholder || '', className: 'mono', autocomplete: 'off', spellcheck: false });
+  const list = $('div', { className: 'combo-list', hidden: true });
+  const status = $('small', { className: 'combo-status' });
+  const box = $('div', { className: 'combo' }, input, list);
+  let models = [], open = false;
+  const idsOf = arr => (arr || []).map(m => typeof m === 'string' ? m : (m && m.id)).filter(Boolean);
+  const paint = () => {
+    const q = input.value.trim().toLowerCase();
+    const ids = idsOf(models);
+    const def = { id: '', label: 'Default — the endpoint’s default model' };
+    const rows = [def, ...ids.map(id => ({ id, label: id }))].filter(r => !q || r.label.toLowerCase().includes(q) || !r.id);
+    fill(list, rows.length ? rows.map(r => $('button', { type: 'button', className: 'combo-opt' + (r.id === input.value.trim() ? ' on' : ''), onclick: ev => { ev.preventDefault(); input.value = r.id; close(); input.dispatchEvent(new Event('change')); } }, r.label)) : $('div', { className: 'combo-empty', textContent: q ? 'No match — you can still use this model id.' : 'No catalog yet. Type a model id.' }));
+  };
+  const close = () => { open = false; list.hidden = true; };
+  const load = async () => {
+    const id = getEndpointId && getEndpointId();
+    if (!id) { models = []; status.textContent = ''; paint(); return; }
+    const ep = [...(S.endpoints || []), ...((S.home && S.home.endpoints) || [])].find(e => e.id === +id);
+    if (ep && ep.models && ep.models.length) { models = ep.models; status.textContent = ep.models.length + ' models from the last catalog. You can also type another id.'; paint(); }
+    else status.textContent = 'Loading models…';
+    try {
+      const r = await api('GET', `/endpoints/${id}/models`);
+      models = r.models || [];
+      if (ep) ep.models = models;
+      status.textContent = models.length ? (models.length + ' models from the endpoint. You can also type another id.') : (r.detail && r.detail !== 'ok' ? r.detail : 'No catalog from this endpoint — type a model id.');
+    } catch (e) {
+      if (!models.length) status.textContent = e.message || 'Could not list models. Type a model id.';
+    }
+    paint();
+  };
+  input.addEventListener('focus', () => { open = true; list.hidden = false; load(); });
+  input.addEventListener('input', () => { if (open) paint(); });
+  input.addEventListener('keydown', e => { if (e.key === 'Escape') close(); });
+  document.addEventListener('mousedown', e => { if (open && !box.contains(e.target)) close(); });
+  return { box, input, status, reload: load };
+}
+
 
 function renderSide() {
   const side = el('side'); if (!side) return;
@@ -221,7 +279,7 @@ function renderSide() {
     list.append(sec('Bots', 'New bot', newBot));
     if (!S.bots.length) list.append($('div', { className: 'emptyhint', textContent: S.endpoints.length ? 'No bots yet.' : 'Add an endpoint, then create a bot.' }));
     const more = items => ib('dots', 'Rename and more', e => { e.stopPropagation(); popmenu(e.currentTarget, items); }, 15);
-    for (const b of S.bots) list.append(item(c && c.kind === 'dm' && c.bot_id === b.id, () => openBot(b), avatar(b.name, 'bot'), b.name, botTag(b),
+    for (const b of S.bots) list.append(item(c && c.kind === 'dm' && c.bot_id === b.id, () => openBot(b), avatar(b.name, 'bot'), b.name, botTag(b), botCostTag(b),
       more([b.role !== 'collaborator' && { icon: 'edit', label: 'Rename', onclick: guard(() => renameBot(b)) }, { icon: 'sliders', label: 'Settings', onclick: guard(async () => { await openBot(b); openDrawer(b); }) }])));
     list.append(sec('Channels', 'New channel', newChannel));
     if (!S.channels.length) list.append($('div', { className: 'emptyhint', textContent: 'Work with people and bots together.' }));
@@ -237,8 +295,9 @@ function renderSide() {
     $('div', { className: 'brand' }, logo(), $('strong', { textContent: 'TeamBots' }), ib('side', 'Hide sidebar', toggleSide)),
     $('button', { className: 'nav', onclick: openPalette }, icon('search'), $('span', { className: 'grow', textContent: 'Search' }), $('kbd', { textContent: 'Ctrl K' })),
     $('button', { className: 'nav' + (c && c.kind === 'home' ? ' on' : ''), onclick: guard(openOverview) }, icon('home'), $('span', { className: 'grow', textContent: 'Overview' })),
-    $('button', { className: 'nav' + (!c && S.page !== 'routines' ? ' on' : ''), onclick: guard(showHome) }, icon('grid'), $('span', { className: 'grow', textContent: 'Projects' })),
+    $('button', { className: 'nav' + (!c && S.page === 'projects' ? ' on' : ''), onclick: guard(showHome) }, icon('grid'), $('span', { className: 'grow', textContent: 'Projects' })),
     $('button', { className: 'nav' + (!c && S.page === 'routines' ? ' on' : ''), onclick: guard(showRoutines) }, icon('clock'), $('span', { className: 'grow', textContent: 'Routines' })),
+    S.me && S.me.can_view_costs && $('button', { className: 'nav' + (!c && S.page === 'costs' ? ' on' : ''), onclick: guard(showCosts) }, icon('coin'), $('span', { className: 'grow', textContent: 'Costs' })),
     $('button', { className: 'project', title: 'Switch project', onclick: e => projectMenu(e.currentTarget) }, $('span', { className: 'pname' }, $('small', { textContent: t ? (t.client || 'Project') : 'No project yet' }), $('b', { textContent: t ? t.name : 'Create a project' })), icon('chev', 16)),
     list,
     $('button', { className: 'me', onclick: e => userMenu(e.currentTarget) }, avatar(S.me.display_name), $('span', { className: 'grow', textContent: S.me.display_name }), icon('dots', 16)));
@@ -427,9 +486,150 @@ async function showRoutines() {
           ib('trash', 'Remove', guard(async () => {
             if (!await confirmBox({ title: 'Remove this routine?', text: 'This cannot be undone.', ok: 'Remove', danger: true })) return;
             await api('DELETE', `/routines/${r.id}`); again();
-          }), 15))));
-    }
+
+}
+
+async function showCosts() {
+  store.set('tb_last_home', null);
+  stopConv(); closeDrawer(); S.conv = null; S.bot = null; S.page = 'costs'; if (S.team) store.set('tb_last_' + S.team.id, null);
+  renderSide(); afterNav(); renderTop();
+  const page = $('div', { className: 'home costs' }, $('h1', { textContent: 'Costs' }),
+    $('p', { className: 'muted', textContent: 'What the models actually used, with official prices where we have them. Unknown models are not guessed.' }));
+  el('col').replaceChildren(page);
+  let period = store.get('tb_costs_period') || '30d';
+  let teamFilter = store.get('tb_costs_team') || '';
+  const body = $('div', { className: 'costs-body' });
+  put(page, body);
+  const again = () => { if (S.page === 'costs' && !S.conv) showCosts(); };
+  const table = (headers, rows, empty) => {
+    if (!rows.length) return $('div', { className: 'none', textContent: empty || 'Nothing in this period.' });
+    return $('div', { className: 'ctable-wrap' }, $('table', { className: 'ctable' },
+      $('thead', {}, $('tr', {}, headers.map(h => $('th', { textContent: h })))),
+      $('tbody', {}, rows.map(r => $('tr', {}, r.map(c => $('td', typeof c === 'string' || typeof c === 'number' ? { textContent: String(c) } : c)))))));
+  };
+  const moneyCell = (row) => {
+    if (row.cost_usd == null || row.unknown_calls === row.calls && row.calls) return { className: 'unk', textContent: 'Price unknown' };
+    const d = disp(row.cost_usd);
+    const label = fmtMoney(d);
+    return { className: row.unknown_calls ? 'partial' : '', textContent: label + (row.unknown_calls ? ' + unknown' : '') };
+  };
+  let data;
+  const disp = usd => data && data.display ? (data.settings && data.settings.display_currency === 'EUR' && data.settings.eur_per_usd
+    ? { amount: usd * Number(data.settings.eur_per_usd), currency: 'EUR' } : { amount: usd, currency: (data.display && data.display.currency) || 'USD' }) : { amount: usd, currency: 'USD' };
+  const draw = async () => {
+    body.textContent = 'Loading…';
+    const q = `/costs?period=${encodeURIComponent(period)}` + (teamFilter ? `&team_id=${encodeURIComponent(teamFilter)}` : '');
+    try { data = await api('GET', q); } catch (e) { body.textContent = e.message; return; }
+    if (S.page !== 'costs' || S.conv) return;
+    const t = data.totals || {}, cur = (data.display && data.display.currency) || 'USD';
+    const periods = [['today', 'Today'], ['7d', '7 days'], ['30d', '30 days']];
+    const teamSel = $('select', { onchange: () => { teamFilter = teamSel.value; store.set('tb_costs_team', teamFilter || null); draw(); } },
+      $('option', { value: '', textContent: 'All my projects', selected: !teamFilter }),
+      (S.teams || []).filter(x => x.role === 'admin').map(x => $('option', { value: String(x.id), textContent: x.name, selected: String(x.id) === String(teamFilter) })));
+    const periodBtns = $('div', { className: 'seg' }, periods.map(([id, label]) => $('button', { type: 'button', className: 'btn sm' + (period === id ? ' primary' : ''), textContent: label, onclick: () => { period = id; store.set('tb_costs_period', id); draw(); } })));
+    const totalLabel = t.unknown_calls && (t.cost_usd == null || t.cost_usd === 0) && t.calls ? 'Price unknown' : fmtMoney(data.display || { amount: t.cost_usd, currency: cur });
+    const cards = $('div', { className: 'ccards' },
+      $('div', { className: 'ccard featured' }, $('div', { className: 'clabel', textContent: 'Spend' }), $('div', { className: 'cval', textContent: totalLabel }), t.unknown_calls ? $('div', { className: 'csub', textContent: t.unknown_calls + ' calls have no official price' }) : null),
+      $('div', { className: 'ccard' }, $('div', { className: 'clabel', textContent: 'Calls' }), $('div', { className: 'cval', textContent: String(t.calls || 0) }), $('div', { className: 'csub', textContent: (t.errors || 0) + ' errors' })),
+      $('div', { className: 'ccard' }, $('div', { className: 'clabel', textContent: 'Tokens in / out' }), $('div', { className: 'cval', textContent: `${t.prompt_tokens || 0} / ${t.completion_tokens || 0}` }), (t.cached_tokens || t.reasoning_tokens) && $('div', { className: 'csub', textContent: `Cached ${t.cached_tokens || 0} · reasoning ${t.reasoning_tokens || 0}` })),
+      (t.premium_requests ? $('div', { className: 'ccard' }, $('div', { className: 'clabel', textContent: 'Premium requests' }), $('div', { className: 'cval', textContent: String(t.premium_requests) })) : null));
+    const maxDay = Math.max(0, ...((data.by_day || []).map(d => d.cost_usd || 0)));
+    const chart = $('div', { className: 'cchart', role: 'img', ariaLabel: 'Spend per day' },
+      (data.by_day || []).map(d => {
+        const h = maxDay ? Math.max(3, Math.round(100 * (d.cost_usd || 0) / maxDay)) : 3;
+        return $('div', { className: 'cbar', title: `${d.date}: ${fmtMoney(disp(d.cost_usd || 0))} · ${d.calls} calls` },
+          $('div', { className: 'cbar-fill', style: `height:${d.calls ? h : 3}%` }),
+          $('span', { textContent: d.date.slice(5) }));
+      }));
+    const budgets = $('div', { className: 'cbudgets' }, (data.budgets || []).map(b => {
+      const pct = b.ratio != null ? Math.min(100, Math.round(b.ratio * 100)) : 0;
+      const spentLabel = b.spent == null ? 'set an EUR/USD rate to compare' : `${b.spent} ${b.currency}`;
+      return $('div', { className: 'cbudget ' + (b.level || 'ok') },
+        $('div', { className: 'crow' }, $('b', { textContent: b.name }), $('span', { textContent: b.budget != null ? `${spentLabel} of ${b.budget} ${b.currency}` : 'No monthly budget' })),
+        b.budget != null && $('div', { className: 'cbarline' }, $('div', { style: `width:${pct}%` })),
+        b.level === 'warn' && $('div', { className: 'cwarn', textContent: 'This project has used 80% of its monthly budget.' }),
+        b.level === 'over' && $('div', { className: 'cwarn', textContent: b.block ? 'Budget reached — new model calls are blocked.' : 'This project is over its monthly budget. Calls are not blocked.' }));
+    }));
+    const admin = (S.teams || []).some(x => x.role === 'admin');
+    const budgetEdits = admin && S.team && S.team.role === 'admin' && (() => {
+      const amt = $('input', { type: 'number', min: '0', step: '0.01', value: S.team.monthly_budget == null ? '' : S.team.monthly_budget, placeholder: 'No budget' });
+      const curSel = $('select', {}, ['USD', 'EUR'].map(c => $('option', { value: c, textContent: c, selected: (S.team.budget_currency || 'USD') === c })));
+      const block = $('input', { type: 'checkbox', checked: !!S.team.budget_block });
+      return $('div', { className: 'csettings' }, $('h2', { textContent: 'Budget for ' + S.team.name }),
+        $('p', { className: 'hint', textContent: 'A warning is shown at 80% and 100%. Blocking new calls at 100% is off by default.' }),
+        $('div', { className: 'crow' }, $('label', { className: 'field' }, $('span', { textContent: 'Monthly budget' }), amt), $('label', { className: 'field' }, $('span', { textContent: 'Currency' }), curSel),
+          $('label', { className: 'check' }, block, $('span', { textContent: 'Block new calls when the budget is reached' }))),
+        $('button', { className: 'btn sm', textContent: 'Save budget', onclick: guard(async () => {
+          const monthly_budget = amt.value === '' ? null : Number(amt.value);
+          const body = { monthly_budget, budget_currency: curSel.value, budget_block: block.checked };
+          await api('PATCH', `/teams/${S.team.id}`, body);
+          Object.assign(S.team, body); toast('Budget saved'); again();
+        }) }));
+    })();
+    const s = data.settings || {};
+    const settingsBox = admin && (() => {
+      const bill = $('select', {}, [['token', 'Token prices (current official Copilot billing)'], ['premium_request', 'Legacy premium requests']].map(([v, l]) => $('option', { value: v, textContent: l, selected: s.copilot_billing === v })));
+      const pr = $('input', { type: 'number', min: '0', step: '0.001', value: s.premium_request_price_usd || '', className: 'mono' });
+      const curr = $('select', {}, ['USD', 'EUR'].map(c => $('option', { value: c, textContent: c, selected: s.display_currency === c })));
+      const fx = $('input', { type: 'number', min: '0', step: '0.0001', value: s.eur_per_usd || '', placeholder: 'e.g. 0.92', className: 'mono' });
+      const elecOn = $('input', { type: 'checkbox', checked: s.electricity_enabled === '1' });
+      const elec = $('input', { type: 'number', min: '0', step: '0.01', value: s.electricity_per_hour || '', placeholder: 'Off' });
+      const elecCur = $('select', {}, ['EUR', 'USD'].map(c => $('option', { value: c, textContent: c, selected: (s.electricity_currency || 'EUR') === c })));
+      return $('details', { className: 'csettings' }, $('summary', { textContent: 'Prices and display' }),
+        $('p', { className: 'hint', textContent: 'Since 1 June 2026 GitHub Copilot (Business/Enterprise included) bills per token. Premium-request multipliers apply only to leftover annual Copilot Pro/Pro+ plans. Local endpoints (Spark, mock) are 0. Electricity estimates are off unless you set a rate. Official prices are USD; euros need a rate you enter yourself.' }),
+        $('label', { className: 'field' }, $('span', { textContent: 'Copilot billing' }), bill),
+        $('label', { className: 'field' }, $('span', { textContent: 'Price per premium request (USD)' }), pr),
+        $('label', { className: 'field' }, $('span', { textContent: 'Display currency' }), curr),
+        $('label', { className: 'field' }, $('span', { textContent: 'EUR per 1 USD' }), fx, $('small', { textContent: 'Required to show euros. Not filled in for you.' })),
+        $('label', { className: 'check' }, elecOn, $('span', { textContent: 'Estimate electricity for local endpoints' })),
+        $('div', { className: 'crow' }, $('label', { className: 'field' }, $('span', { textContent: 'Electricity per GPU-hour' }), elec), $('label', { className: 'field' }, $('span', { textContent: 'Currency' }), elecCur)),
+        $('button', { className: 'btn sm', textContent: 'Save settings', onclick: guard(async () => {
+          await api('PATCH', '/costs/settings', {
+            copilot_billing: bill.value, premium_request_price_usd: pr.value === '' ? undefined : Number(pr.value),
+            display_currency: curr.value, eur_per_usd: fx.value, electricity_enabled: elecOn.checked,
+            electricity_per_hour: elec.value, electricity_currency: elecCur.value });
+          toast('Saved'); again();
+        }) }),
+        $('p', { className: 'hint' }, 'The price table is editable under ', $('button', { className: 'link', type: 'button', textContent: 'Edit prices', onclick: guard(editPrices) }), '.'));
+    })();
+    fill(body,
+      $('div', { className: 'cbar-head' }, periodBtns, teamSel),
+      cards, budgets, budgetEdits,
+      $('h2', { textContent: 'Per day' }), chart,
+      $('h2', { textContent: 'Per bot' }), table(['Bot', 'Calls', 'Cost'], (data.by_bot || []).map(r => [r.name, r.calls, moneyCell(r)])),
+      $('h2', { textContent: 'Per model' }), table(['Model', 'Provider', 'Calls', 'Cost'], (data.by_model || []).map(r => [r.model, r.provider, r.calls, moneyCell(r)])),
+      $('h2', { textContent: 'Per endpoint' }), table(['Endpoint', 'Calls', 'Cost'], (data.by_endpoint || []).map(r => [r.name, r.calls, moneyCell(r)])),
+      $('h2', { textContent: 'Per origin' }), table(['Origin', 'Calls', 'Cost'], (data.by_origin || []).map(r => [r.origin, r.calls, moneyCell(r)])),
+      $('h2', { textContent: 'Most expensive conversations' }), table(['Conversation', 'Calls', 'Cost'], (data.expensive_conversations || []).map(r => [r.name, r.calls, moneyCell(r)])),
+      settingsBox);
+  };
+  async function editPrices() {
+    const { prices } = await api('GET', '/costs/prices');
+    const rows = prices.map(p => {
+      const inp = (name, val, step) => $('input', { type: 'number', step: step || '0.01', value: val == null ? '' : val, className: 'mono', data: { k: name } });
+      return $('tr', { data: { id: p.id } },
+        $('td', { textContent: p.provider }), $('td', { className: 'mono', textContent: p.model }), $('td', { textContent: p.billing_mode }),
+        $('td', {}, inp('input_per_million', p.input_per_million)),
+        $('td', {}, inp('output_per_million', p.output_per_million)),
+        $('td', {}, inp('cached_per_million', p.cached_per_million)),
+        $('td', {}, inp('premium_multiplier', p.premium_multiplier, '0.01')),
+        $('td', {}, $('a', { href: p.source_url, target: '_blank', rel: 'noopener', textContent: p.source_date || '—' })));
+    });
+    const d = openDialog('wide', $('div', { className: 'pad' }, $('h2', { textContent: 'Model prices' }),
+      $('p', { className: 'intro', textContent: 'Official USD prices per 1 million tokens, or a premium-request multiplier. Editing marks the row as yours so a later official refresh will not overwrite it.' }),
+      $('div', { className: 'ctable-wrap', style: 'max-height:60vh' }, $('table', { className: 'ctable' },
+        $('thead', {}, $('tr', {}, ['Provider', 'Model', 'Mode', 'Input / 1M', 'Output / 1M', 'Cached / 1M', 'Multiplier', 'Source'].map(h => $('th', { textContent: h })))),
+        $('tbody', {}, rows))),
+      $('div', { className: 'dfoot' }, $('button', { className: 'btn primary', textContent: 'Save changes', onclick: guard(async () => {
+        for (const tr of rows) {
+          const id = +tr.dataset.id, body = {};
+          for (const i of tr.querySelectorAll('input')) { const v = i.value.trim(); body[i.dataset.k] = v === '' ? null : Number(v); }
+          await api('PATCH', `/costs/prices/${id}`, body);
+        }
+        d.close(); toast('Prices saved'); again();
+      }) }), $('button', { className: 'btn', textContent: 'Close', onclick: () => d.close() }))));
   }
+  await draw();
 }
 
 // ---------------------------------------------------------------- create things
@@ -537,7 +737,7 @@ async function doRefresh() {
 function renderTop() {
   const top = el('top'); if (!top) return;
   const c = S.conv, lead = topLead();
-  if (!c) return fill(top, ...lead, $('span', { className: 'title', textContent: S.page === 'routines' ? 'Routines' : 'Projects' }), $('span', { className: 'grow' }), $('button', { className: 'btn sm', onclick: openPalette }, icon('search', 15), 'Search'));
+  if (!c) return fill(top, ...lead, $('span', { className: 'title', textContent: S.page === 'routines' ? 'Routines' : S.page === 'costs' ? 'Costs' : 'Projects' }), $('span', { className: 'grow' }), $('button', { className: 'btn sm', onclick: openPalette }, icon('search', 15), 'Search'));
   if (c.kind === 'feed') return fill(top, ...lead, icon('pulse'), $('span', { className: 'title', textContent: c.name }), $('span', { className: 'sub grow', textContent: 'Short summaries of finished tasks. The private chats stay private.' }));
   if (c.kind === 'dm' || c.kind === 'home') {
     const b = S.bot, shared = b && b.is_team && b.published && c.kind === 'dm';
@@ -928,13 +1128,17 @@ async function openDrawer(bot, tab = 'setup') {
 
   if (tab === 'setup') {
     if (!manage) { put(body, head('Instructions'), $('p', { className: 'hint', style: 'white-space:pre-wrap', textContent: bot.instructions || 'No instructions written.' }), hint('Only the owner and managers can change this bot.')); return; }
-    const ins = $('textarea', { rows: 9, value: bot.instructions, placeholder: 'What this bot does and how it should behave.' }), model = $('input', { value: bot.model, placeholder: 'Empty = the default model of the endpoint', className: 'mono' });
+    const ins = $('textarea', { rows: 9, value: bot.instructions, placeholder: 'What this bot does and how it should behave.' });
     const eps = (bot.is_home && S.home && S.home.endpoints) ? S.home.endpoints : S.endpoints;
     const name = $('input', { value: bot.name }), ep = $('select', {}, (eps || []).map(e => $('option', { value: e.id, textContent: `${e.name}${e.project ? ' (' + e.project + ')' : ''} · ${e.default_model}`, selected: e.id === bot.endpoint_id })));
     if (!(eps || []).some(e => e.id === bot.endpoint_id)) ep.prepend($('option', { value: bot.endpoint_id, textContent: 'Endpoint of another member', selected: true }));
+    const combo = modelCombo({ value: bot.model, placeholder: 'Empty = the default model of the endpoint', getEndpointId: () => ep.value });
+    const model = combo.input;
+    ep.addEventListener('change', () => combo.reload());
+    combo.reload();
     const mode = $('select', {}, $('option', { value: 'ask', textContent: 'Ask before risky actions', selected: bot.approval_mode === 'ask' }), $('option', { value: 'auto', textContent: 'Run everything without asking', selected: bot.approval_mode === 'auto' }));
     const cu = $('input', { type: 'checkbox', checked: bot.computer_use }), fld = (label, input, small) => $('label', { className: 'field' }, $('span', { textContent: label }), input, small && $('small', { textContent: small }));
-    put(body, fld('Name', name), fld('Instructions', ins), fld('Model endpoint', ep), fld('Model override', model), fld('Approvals', mode, 'Risky: shell commands, writing files, HTTP requests, routines, untrusted MCP tools and acting on the screen.'),
+    put(body, fld('Name', name), fld('Instructions', ins), fld('Model endpoint', ep), $('label', { className: 'field' }, $('span', { textContent: 'Model override' }), combo.box, combo.status), fld('Approvals', mode, 'Risky: shell commands, writing files, HTTP requests, routines, untrusted MCP tools and acting on the screen.'),
       $('label', { className: 'check' }, cu, $('span', {}, 'Own screen and computer use', $('small', { textContent: 'A virtual screen with a browser. Needs a model with image input and the Docker sandbox.' }))),
       $('div', { className: 'rowbtns' }, $('button', { className: 'btn primary', textContent: 'Save', onclick: guard(async () => {
         if (bot.is_home) {
@@ -1009,6 +1213,7 @@ function openPalette() {
     ...S.teams.filter(t => !S.team || t.id !== S.team.id).map(t => ({ g: 'Projects', icon: 'grid', label: (t.client ? t.client + ' / ' : '') + t.name, hint: 'Switch', run: () => switchTeam(t.id) })),
     { g: 'Actions', icon: 'grid', label: 'Home', run: showHome },
     { g: 'Actions', icon: 'clock', label: 'Routines', run: showRoutines },
+    ...(S.me && S.me.can_view_costs ? [{ g: 'Actions', icon: 'coin', label: 'Costs', run: showCosts }] : []),
     ...(S.team ? [{ g: 'Actions', icon: 'plus', label: 'New bot', run: newBot }, { g: 'Actions', icon: 'plus', label: 'New channel', run: newChannel }, { g: 'Actions', icon: 'plug', label: 'New endpoint', run: newEndpoint }, { g: 'Actions', icon: 'users', label: 'People and invite code', run: projectDialog }] : []),
     { g: 'Actions', icon: 'plus', label: 'New project', run: newProject }, { g: 'Actions', icon: 'key', label: 'Join a project with an invite code', run: joinProject }, { g: 'Actions', icon: 'out', label: 'Sign out', run: signOut }];
   let shown = [], sel = 0;

@@ -75,6 +75,8 @@ async def chat(request: Request, authorization: str = Header("")):
         return {"choices": [{"finish_reason": "tool_calls", "message": {
             "role": "assistant", "content": None,
             "tool_calls": [{"id": "c1", "type": "function",
-                            "function": {"name": "ping", "arguments": '{"ok": true}'}}]}}]}
+                            "function": {"name": "ping", "arguments": '{"ok": true}'}}]}}],
+                "usage": {"prompt_tokens": 9, "completion_tokens": 5, "total_tokens": 14}}
     return {"choices": [{"finish_reason": "stop", "message": {
-        "role": "assistant", "content": "hello from mock copilot"}}]}
+        "role": "assistant", "content": "hello from mock copilot"}}],
+            "usage": {"prompt_tokens": 9, "completion_tokens": 5, "total_tokens": 14}}

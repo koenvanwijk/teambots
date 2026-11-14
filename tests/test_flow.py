@@ -642,3 +642,52 @@ def test_home_voice_api_tokens(c):
     assert c.post("/api/v1/home/message", json={"text": "again"}, headers=Hapi).status_code == 401
     # a already-revoked token stays rejected; a typo token is rejected
     assert c.post("/api/v1/home/message", json={"text": "x"}, headers={"Authorization": "Bearer tbh_not-a-real-token"}).status_code == 401
+
+
+def test_cost_tracking_summary(c):
+    """Mock usage is logged and totals/budget warnings show up. Does not touch a real model."""
+    from datetime import datetime, timezone
+    from app.db import LlmUsage, session
+
+    h = H("alice")
+    # Alice already admins a project; she can open Costs.
+    me = c.get("/api/me", headers=h).json()
+    assert me["can_view_costs"] is True
+    with session() as s:
+        s.add(LlmUsage(
+            created_at=datetime.now(timezone.utc), user_id=S["alice"]["user"]["id"], team_id=S["team"],
+            provider="github_copilot", model="claude-sonnet-5",
+            prompt_tokens=1_000_000, completion_tokens=500_000, success=True, origin="chat",
+            billing_mode="token", cost_usd=7.0, cost_unknown=False, notes="test"))
+        s.add(LlmUsage(
+            created_at=datetime.now(timezone.utc), user_id=S["alice"]["user"]["id"], team_id=S["team"],
+            provider="github_copilot", model="gpt-4-o-preview",
+            prompt_tokens=100, completion_tokens=20, success=True, origin="routine",
+            billing_mode="token", cost_usd=None, cost_unknown=True, notes="price unknown"))
+        s.commit()
+    body = c.get("/api/costs?period=today", headers=h).json()
+    assert body["totals"]["calls"] >= 2
+    assert body["totals"]["cost_usd"] >= 7.0
+    assert body["totals"]["unknown_calls"] >= 1
+    origins = {r["origin"] for r in body["by_origin"]}
+    assert "chat" in origins and "routine" in origins
+    assert any(r["model"] == "claude-sonnet-5" for r in body["by_model"])
+    prices = c.get("/api/costs/prices", headers=h)
+    assert prices.status_code == 200
+    assert any(p["model"] == "claude-sonnet-5" and p["provider"] == "github_copilot"
+               for p in prices.json()["prices"])
+    assert c.patch(f"/api/teams/{S['team']}", headers=h,
+                   json={"monthly_budget": 1.0, "budget_currency": "USD"}).status_code == 200
+    lab = next(b for b in c.get("/api/costs?period=today", headers=h).json()["budgets"] if b["team_id"] == S["team"])
+    assert lab["level"] in ("warn", "over") and lab["block"] is False
+    # Someone with no project and no bot cannot open Costs.
+    outsider = c.post("/api/register", json={"username": "cost_outsider", "password": "password123",
+                                             "display_name": "Cost Outsider"})
+    assert outsider.status_code == 200, outsider.text
+    assert c.get("/api/costs?period=today", headers={"Authorization": f"Bearer {outsider.json()['token']}"}).status_code == 403
+    # A connection test against the mock endpoint leaves a usage row with origin=test.
+    before = body["totals"]["calls"]
+    assert c.post(f"/api/endpoints/{S['ep']}/test", headers=h).status_code == 200
+    later = c.get("/api/costs?period=today", headers=h).json()
+    assert later["totals"]["calls"] >= before
+    assert any(r["origin"] == "test" for r in later["by_origin"])

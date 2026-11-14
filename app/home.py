@@ -535,7 +535,11 @@ async def run_home_turn(user_id: int, content: str, *, source: str = "chat",
             bot, conv = ensure_home(s, user)
             conv_id, bot_id = conv.id, bot.id
         msg = agent.handle_user_message(conv_id, user_id, content)
-        await agent.run_agent(conv_id, bot_id, user_id)
+        from . import usage
+        origin = "voice" if style == "voice" else "overview"
+        with usage.bind(origin=origin, user_id=user_id, team_id=None, bot_id=bot_id,
+                        conversation_id=conv_id, endpoint_id=bot.endpoint_id):
+            await agent.run_agent(conv_id, bot_id, user_id)
         with session() as s:
             last = s.exec(select(Message).where(Message.conversation_id == conv_id,
                                                 Message.role == "assistant",

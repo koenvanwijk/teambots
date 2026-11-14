@@ -57,7 +57,10 @@ async def completions(request: Request, authorization: str = Header(default=""))
         if slow:
             await asyncio.sleep(min(int(slow[1]), 60))
         msg = {"role": "assistant", "content": f"ECHO[{body['model']}]: {text}"}
-    return {"id": "x", "object": "chat.completion", "choices": [{"index": 0, "message": msg, "finish_reason": "stop"}]}
+    return {"id": "x", "object": "chat.completion", "choices": [{"index": 0, "message": msg, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 11, "completion_tokens": 7, "total_tokens": 18,
+                      "prompt_tokens_details": {"cached_tokens": 2},
+                      "completion_tokens_details": {"reasoning_tokens": 1}}}
 
 
 @app.api_route("/echo", methods=["GET", "POST"])

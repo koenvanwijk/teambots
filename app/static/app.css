@@ -302,3 +302,51 @@ dialog.palette { margin-top:12vh; width:min(580px, calc(100vw - 28px)); }
   .mrow .mt { display:none; }
 }
 @media (prefers-reduced-motion: reduce) { * { animation-duration:.01ms !important; transition:none !important; } }
+
+/* ---------- model combobox */
+.combo { position: relative; }
+.combo input { width: 100%; }
+.combo-list { position: absolute; z-index: 6; left: 0; right: 0; top: calc(100% + 4px); max-height: 220px; overflow: auto; background: var(--s1); border: 1px solid var(--line); border-radius: 12px; box-shadow: var(--shadow); padding: 4px; }
+.combo-opt { display: block; width: 100%; text-align: left; padding: 8px 10px; border-radius: 8px; font-family: var(--mono); font-size: 13px; }
+.combo-opt:hover, .combo-opt.on { background: var(--s2); }
+.combo-empty { padding: 10px; color: var(--muted); font-size: 13px; }
+.combo-status { display: block; margin-top: 4px; }
+
+/* ---------- costs */
+.costs .cbar-head { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; margin: 16px 0 18px; }
+.costs .seg { display: flex; gap: 6px; flex-wrap: wrap; }
+.costs .ccards { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px; margin-bottom: 18px; }
+.costs .ccard { background: var(--s1); border: 1px solid var(--line); border-radius: 14px; padding: 14px 16px; }
+.costs .ccard.featured { grid-column: 1 / -1; }
+.costs .clabel { color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: .04em; }
+.costs .cval { font-size: 26px; font-weight: 600; letter-spacing: -.03em; margin-top: 4px; word-break: break-word; }
+.costs .csub { color: var(--muted); font-size: 13px; margin-top: 4px; }
+.costs .cchart { display: flex; align-items: flex-end; gap: 4px; height: 140px; padding: 8px 0 22px; overflow-x: auto; }
+.costs .cbar { flex: 1 0 16px; min-width: 16px; height: 100%; display: flex; flex-direction: column; justify-content: flex-end; align-items: center; position: relative; }
+.costs .cbar-fill { width: 100%; max-width: 22px; background: var(--tok); border-radius: 4px 4px 0 0; min-height: 2px; }
+.costs .cbar span { position: absolute; bottom: -18px; font-size: 10px; color: var(--muted); }
+.costs .ctable-wrap { overflow-x: auto; margin: 0 0 8px; }
+.costs .ctable { width: 100%; border-collapse: collapse; font-size: 14px; }
+.costs .ctable th, .dlg .ctable th { text-align: left; color: var(--muted); font-weight: 500; font-size: 12px; padding: 8px 10px; border-bottom: 1px solid var(--line); }
+.costs .ctable td, .dlg .ctable td { padding: 8px 10px; border-bottom: 1px solid var(--line); vertical-align: top; }
+.costs .ctable .unk, .costs .ctable .partial { color: var(--warn); }
+.costs .cbudgets { display: flex; flex-direction: column; gap: 10px; margin: 8px 0 16px; }
+.costs .cbudget { background: var(--s1); border: 1px solid var(--line); border-radius: 12px; padding: 12px 14px; }
+.costs .cbudget.warn { border-color: var(--warn); }
+.costs .cbudget.over { border-color: var(--bad); }
+.costs .cbarline { height: 8px; background: var(--s2); border-radius: 99px; overflow: hidden; margin-top: 8px; }
+.costs .cbarline > div { height: 100%; background: var(--tok); border-radius: 99px; }
+.costs .cbudget.warn .cbarline > div { background: var(--warn); }
+.costs .cbudget.over .cbarline > div { background: var(--bad); }
+.costs .cwarn { margin-top: 8px; color: var(--warn); font-size: 13px; }
+.costs .cbudget.over .cwarn { color: var(--bad); }
+.costs .csettings { margin: 18px 0; padding: 14px; border: 1px solid var(--line); border-radius: 14px; background: var(--s1); }
+.costs .csettings .crow, .csettings .crow { display: flex; flex-wrap: wrap; gap: 12px; align-items: flex-end; margin: 8px 0; }
+.costs .csettings .field { flex: 1; min-width: 140px; }
+.btn.link, button.link { background: none; border: 0; color: var(--tok); padding: 0; height: auto; font: inherit; cursor: pointer; }
+.btn.link:hover, button.link:hover { text-decoration: underline; }
+dialog.wide { width: min(960px, calc(100vw - 24px)); }
+@media (max-width: 500px) {
+  .costs .cval { font-size: 22px; }
+  .costs .cchart { height: 110px; }
+}

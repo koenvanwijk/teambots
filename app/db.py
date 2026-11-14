@@ -70,6 +70,9 @@ class Team(SQLModel, table=True):
     client: str = ""  # optional customer name; one client can have several projects
     invite_code: str = Field(index=True, unique=True)
     bot_sharing: str = "everyone"  # everyone | admins
+    monthly_budget: Optional[float] = None  # amount in budget_currency; None = no budget
+    budget_currency: str = "USD"  # USD | EUR
+    budget_block: bool = False  # if True, new LLM calls are refused once the month is over budget
 
 
 class TeamMember(SQLModel, table=True):
@@ -91,6 +94,8 @@ class Endpoint(SQLModel, table=True):
     default_model: str
     provider: str = "openai"  # openai | github_copilot
     github_domain: str = ""  # github.com or org.ghe.com; unused for openai
+    models_json: str = ""  # last successful /models list, cached for the UI
+    models_fetched_at: Optional[datetime] = None
 
 
 class Bot(SQLModel, table=True):
@@ -139,6 +144,54 @@ class ChannelMember(SQLModel, table=True):
 class AppSetting(SQLModel, table=True):
     key: str = Field(primary_key=True)
     value: str = ""
+
+
+class LlmUsage(SQLModel, table=True):
+    """One attempt at an LLM call. Tokens and a cost snapshot at write time; never contains secrets."""
+    id: Optional[int] = Field(default=None, primary_key=True)
+    created_at: datetime = Field(default_factory=now, index=True)
+    user_id: Optional[int] = Field(default=None, index=True)
+    team_id: Optional[int] = Field(default=None, index=True)
+    bot_id: Optional[int] = Field(default=None, index=True)
+    conversation_id: Optional[int] = Field(default=None, index=True)
+    endpoint_id: Optional[int] = Field(default=None, index=True)
+    provider: str = "openai"
+    model: str = ""
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    cached_tokens: int = 0
+    cache_write_tokens: int = 0
+    reasoning_tokens: int = 0
+    latency_ms: int = 0
+    success: bool = True
+    error: str = ""
+    retry: bool = False
+    origin: str = "chat"  # chat, routine, ask_bot, voice, overview, test, feed, route
+    billing_mode: str = "token"  # token | premium_request | zero | electricity
+    premium_requests: float = 0
+    cost_usd: Optional[float] = None
+    cost_unknown: bool = False
+    notes: str = ""
+
+
+class ModelPrice(SQLModel, table=True):
+    """Editable price for one model in one billing mode. Seeded from official pages; user edits win."""
+    id: Optional[int] = Field(default=None, primary_key=True)
+    provider: str = Field(index=True)  # openai, anthropic, github_copilot, ...
+    model: str = Field(index=True)
+    billing_mode: str = "token"  # token | premium_request
+    currency: str = "USD"
+    input_per_million: Optional[float] = None
+    output_per_million: Optional[float] = None
+    cached_per_million: Optional[float] = None
+    cache_write_per_million: Optional[float] = None
+    premium_multiplier: Optional[float] = None
+    source_url: str = ""
+    source_date: str = ""  # YYYY-MM-DD
+    notes: str = ""
+    aliases_json: str = "[]"
+    user_edited: bool = False
+    updated_at: datetime = Field(default_factory=now)
 
 
 class Message(SQLModel, table=True):
@@ -238,6 +291,9 @@ def init_db() -> None:
     _ensure_home_columns()
     _ensure_endpoint_provider_columns()
     _ensure_oauth_columns()
+    _ensure_costs_columns()
+    from .usage import seed_prices
+    seed_prices()
     migrate_channel_bots()
     from .home import migrate_home_bots
     migrate_home_bots()
@@ -301,6 +357,25 @@ def _ensure_endpoint_provider_columns() -> None:
             conn.exec_driver_sql("ALTER TABLE endpoint ADD COLUMN provider VARCHAR DEFAULT 'openai'")
         if "github_domain" not in cols:
             conn.exec_driver_sql("ALTER TABLE endpoint ADD COLUMN github_domain VARCHAR DEFAULT ''")
+        if "models_json" not in cols:
+            conn.exec_driver_sql("ALTER TABLE endpoint ADD COLUMN models_json VARCHAR DEFAULT ''")
+        if "models_fetched_at" not in cols:
+            conn.exec_driver_sql("ALTER TABLE endpoint ADD COLUMN models_fetched_at DATETIME")
+        conn.commit()
+
+
+def _ensure_costs_columns() -> None:
+    """Add project budget columns on databases created before cost tracking existed."""
+    if not config.DB_URL.startswith("sqlite"):
+        return
+    with engine.connect() as conn:
+        cols = [r[1] for r in conn.exec_driver_sql("PRAGMA table_info(team)").fetchall()]
+        if "monthly_budget" not in cols:
+            conn.exec_driver_sql("ALTER TABLE team ADD COLUMN monthly_budget FLOAT")
+        if "budget_currency" not in cols:
+            conn.exec_driver_sql("ALTER TABLE team ADD COLUMN budget_currency VARCHAR DEFAULT 'USD'")
+        if "budget_block" not in cols:
+            conn.exec_driver_sql("ALTER TABLE team ADD COLUMN budget_block BOOLEAN NOT NULL DEFAULT 0")
         conn.commit()
 
 
