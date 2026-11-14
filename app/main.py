@@ -1,10 +1,12 @@
 """Application entry point: `uvicorn app.main:app`."""
+import hashlib
 import logging
 import os
+import re
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from uvicorn.middleware.proxy_headers import ProxyHeadersMiddleware
 
@@ -53,9 +55,26 @@ app.include_router(openai_router)
 app.mount("/static", StaticFiles(directory=STATIC), name="static")
 
 
+def _asset_version() -> str:
+    """A short hash of the shell assets, so index.html can cache-bust them automatically:
+    every build gets a new app.js?v=... URL, which no CDN or browser can serve stale."""
+    h = hashlib.sha1()
+    for name in ("app.js", "app.css"):
+        try:
+            with open(os.path.join(STATIC, name), "rb") as f:
+                h.update(f.read())
+        except OSError:
+            pass
+    return h.hexdigest()[:10]
+
+
 @app.get("/")
 def index():
-    return FileResponse(os.path.join(STATIC, "index.html"))
+    with open(os.path.join(STATIC, "index.html"), encoding="utf-8") as f:
+        html = f.read()
+    ver = _asset_version()
+    html = re.sub(r'(/static/app\.(?:js|css))(?:\?v=[^"\']*)?', rf'\1?v={ver}', html)
+    return HTMLResponse(html)
 
 
 @app.get("/sw.js")
