@@ -4,7 +4,9 @@ import hashlib
 import json
 import re
 import secrets
+from datetime import datetime, timezone
 from typing import Optional
+from urllib.parse import quote
 
 from fastapi import APIRouter, Cookie, Depends, Header, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, RedirectResponse, Response, StreamingResponse
@@ -12,10 +14,10 @@ from pydantic import BaseModel
 import httpx
 import websockets
 
-from . import agent, config, copilot, events, home, llm, mcp_client, routines, sandbox, screen, secrets_http
+from . import agent, config, copilot, events, home, llm, mcp_client, oauth, routines, sandbox, screen, secrets_http
 from .access import bot_role, can_manage, can_read_conversation, team_role
-from .db import (Approval, AuthToken, Bot, BotAccess, ChannelMember, Conversation, Endpoint, McpServer, Memory,
-                 Message, Routine, Secret, Skill, Team, TeamMember, User, select, session)
+from .db import (Approval, AuthToken, Bot, BotAccess, ChannelMember, Conversation, Endpoint, Identity, McpServer,
+                 Memory, Message, OAuthState, Routine, Secret, Skill, Team, TeamMember, User, now, select, session)
 
 router = APIRouter(prefix="/api")
 
@@ -95,6 +97,179 @@ def login(body: Credentials):
 @router.get("/me")
 def me(user: User = Depends(current_user)):
     return {"id": user.id, "username": user.username, "display_name": user.display_name}
+
+
+# ---------------------------------------------------------------- sign in with GitHub or Google
+#
+# A person signs in with their own GitHub or Google account; the identity is not tied to any client.
+# A valid project invite code is the gate for creating a new account: no invite (and no allowlisted
+# email) means no new account. Membership stays per project, so one person can work across clients.
+
+_OAUTH_STATE_TTL = 600  # seconds a sign-in round trip may take
+
+
+def _aware(dt: datetime) -> datetime:
+    return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+
+
+def _issue_token(s, user_id: int) -> str:
+    tok = secrets.token_urlsafe(32)
+    s.add(AuthToken(token=tok, user_id=user_id, created_at=now()))
+    return tok
+
+
+def _signup_allowed_email(email: str) -> bool:
+    """Whether an email may create a new account without an invite (TB_OAUTH_ALLOWLIST)."""
+    al = config.OAUTH_ALLOWLIST
+    if not al or not email:
+        return False
+    email = email.lower()
+    domain = email.rsplit("@", 1)[-1]
+    return email in al or f"@{domain}" in al or domain in al
+
+
+def _unique_username(s, email: str, name: str) -> str:
+    base = re.sub(r"[^a-z0-9_.-]", "", (email.split("@")[0] or name).lower()) or "user"
+    base = base[:28] if len(base) >= 2 else (base + "user")[:28]
+    cand, n = base, 0
+    while s.exec(select(User).where(User.username == cand)).first():
+        n += 1
+        cand = f"{base[:28 - len(str(n))]}{n}"
+    return cand
+
+
+def _maybe_join(s, user_id: int, invite_code: str) -> None:
+    if not invite_code:
+        return
+    t = s.exec(select(Team).where(Team.invite_code == invite_code)).first()
+    if t and not team_role(s, user_id, t.id):
+        s.add(TeamMember(team_id=t.id, user_id=user_id))
+
+
+def _find_or_create_user(s, email: str, name: str, invite_code: str) -> User:
+    # One person, one account: reuse an account that already owns this verified email.
+    if email:
+        same = s.exec(select(User).where(User.email == email)).first()
+        if same:
+            return same
+    has_invite = bool(invite_code and s.exec(select(Team).where(Team.invite_code == invite_code)).first())
+    if not has_invite and not _signup_allowed_email(email):
+        raise oauth.OAuthError("You need an invite link to create a TeamBots account. "
+                               "Ask a project admin for one.")
+    user = User(username=_unique_username(s, email, name),
+                display_name=name or (email.split("@")[0] if email else "user"),
+                password_hash="!", email=email)  # "!" never matches a password hash: sign in via the provider
+    s.add(user)
+    s.flush()
+    return user
+
+
+def _complete_signin(s, provider: str, ident: dict, link_user_id: Optional[int], invite_code: str) -> str:
+    subject, email = ident["subject"], (ident.get("email") or "").lower()
+    name = ident.get("name") or ""
+    existing = s.exec(select(Identity).where(Identity.provider == provider,
+                                             Identity.subject == subject)).first()
+    if existing:
+        if link_user_id and link_user_id != existing.user_id:
+            raise oauth.OAuthError("This account is already linked to another TeamBots user.")
+        user = s.get(User, existing.user_id)
+        if not user:
+            raise oauth.OAuthError("The linked account no longer exists.")
+        existing.last_login_at = now()
+        if email and not existing.email:
+            existing.email = email
+        s.add(existing)
+    else:
+        if link_user_id is not None:
+            user = s.get(User, link_user_id)
+            if not user:
+                raise oauth.OAuthError("Your session has expired. Sign in again, then link the account.")
+        else:
+            user = _find_or_create_user(s, email, name, invite_code)
+        s.add(Identity(provider=provider, subject=subject, user_id=user.id, email=email, last_login_at=now()))
+        s.flush()
+    if email and not user.email:
+        user.email = email
+        s.add(user)
+    _maybe_join(s, user.id, invite_code)
+    return _issue_token(s, user.id)
+
+
+def _oauth_redirect(request: Request, token: str = "", error: str = "") -> RedirectResponse:
+    # The token rides back in the URL fragment (never sent to a server, so it stays out of access logs);
+    # the frontend moves it into localStorage. A cookie is set too, for the noVNC websocket.
+    frag = f"#tb_oauth={token}" if token else (f"#tb_oauth_error={quote(error)}" if error else "")
+    resp = RedirectResponse(f"/{frag}", status_code=302)
+    if token:
+        resp.set_cookie("tb_token", token, max_age=60 * 60 * 24 * 30, **_cookie_flags(request))
+    return resp
+
+
+@router.get("/auth/providers")
+def auth_providers():
+    """Which sign-in providers are configured, for the login screen."""
+    return {"providers": oauth.providers_public(), "public_url_set": bool(config.PUBLIC_URL)}
+
+
+@router.get("/auth/{provider}/start")
+def auth_start(provider: str, request: Request, invite: str = Query(default=""), link: int = Query(default=0),
+               authorization: str = Header(default=""), token: str = Query(default=""),
+               tb_token: str = Cookie(default="")):
+    """Begin a sign-in. ?invite=CODE lets a new person create an account and join that project.
+    ?link=1 (from an account-settings action, while signed in) attaches the new identity to the
+    caller's own account; without it an ambient session is ignored, so no identity is linked by surprise."""
+    link_user = None
+    if link:
+        link_user = _user_for_token(authorization.removeprefix("Bearer ").strip() or token or tb_token)
+        if link_user is None:
+            return _oauth_redirect(request, error="Sign in first, then link another account.")
+    try:
+        state = secrets.token_urlsafe(24)
+        url = oauth.authorize_url(provider, state)
+    except oauth.OAuthError as e:
+        return _oauth_redirect(request, error=str(e))
+    with session() as s:
+        s.add(OAuthState(state=state, provider=provider, invite_code=invite.strip(),
+                         link_user_id=link_user.id if link_user else None))
+        s.commit()
+    return RedirectResponse(url, status_code=302)
+
+
+@router.get("/auth/{provider}/callback")
+def auth_callback(provider: str, request: Request, code: str = Query(default=""),
+                  state: str = Query(default=""), error: str = Query(default="")):
+    if error:
+        return _oauth_redirect(request, error=f"{oauth.NAMES.get(provider, provider)} sign-in was cancelled.")
+    with session() as s:  # consume the one-time state; copy what we need before it expires on commit
+        st = s.get(OAuthState, state) if state else None
+        if not st or st.provider != provider:
+            return _oauth_redirect(request, error="This sign-in link has expired. Please start again.")
+        created, link_user_id, invite_code = st.created_at, st.link_user_id, st.invite_code
+        s.delete(st)
+        s.commit()
+    if (now() - _aware(created)).total_seconds() > _OAUTH_STATE_TTL:
+        return _oauth_redirect(request, error="This sign-in link has expired. Please start again.")
+    if not code:
+        return _oauth_redirect(request, error="The sign-in provider returned no code.")
+    try:
+        ident = oauth.exchange_code(provider, code)
+        with session() as s:
+            tok = _complete_signin(s, provider, ident, link_user_id, invite_code)
+            s.commit()
+    except oauth.OAuthError as e:
+        return _oauth_redirect(request, error=str(e))
+    return _oauth_redirect(request, token=tok)
+
+
+@router.get("/auth/identities")
+def auth_identities(user: User = Depends(current_user)):
+    """The sign-in methods linked to the caller's account, for an account-settings view."""
+    with session() as s:
+        rows = s.exec(select(Identity).where(Identity.user_id == user.id)).all()
+        has_password = bool(user.password_hash) and user.password_hash != "!"
+    return {"has_password": has_password,
+            "identities": [{"id": i.id, "provider": i.provider, "name": oauth.NAMES.get(i.provider, i.provider),
+                            "email": i.email} for i in rows]}
 
 
 # ---------------------------------------------------------------- overview bot (per user, not tied to a project)

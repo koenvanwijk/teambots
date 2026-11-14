@@ -69,6 +69,8 @@ input[type=checkbox] { width:16px; height:16px; accent-color:var(--btn); flex:no
 .authbox .btn { width:100%; justify-content:center; height:42px; margin-top:4px; }
 .authbox .swap { text-align:center; margin-top:16px; font-size:14px; color:var(--muted); }
 .authbox .swap button { color:var(--ink); text-decoration:underline; text-underline-offset:3px; }
+.authsep { display:flex; align-items:center; gap:10px; margin:16px 0 10px; color:var(--muted); font-size:12.5px; }
+.authsep::before, .authsep::after { content:""; flex:1; height:1px; background:var(--line); }
 .logo { width:30px; height:30px; border-radius:9px; background:var(--btn); color:var(--btn-ink); display:grid; place-items:center; flex:none; }
 
 /* ---------- shell */

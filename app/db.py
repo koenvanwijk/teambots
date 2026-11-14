@@ -3,6 +3,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
+from sqlalchemy import UniqueConstraint
 from sqlmodel import Field, Session, SQLModel, create_engine, select
 
 from . import config
@@ -17,13 +18,36 @@ class User(SQLModel, table=True):
     username: str = Field(index=True, unique=True)
     display_name: str
     password_hash: str
+    email: str = Field(default="", index=True)  # verified address from an OAuth identity, if any
     home_endpoint_id: Optional[int] = None  # model endpoint for the overview bot
     home_model: str = ""  # empty = endpoint default
+
+
+class Identity(SQLModel, table=True):
+    """One sign-in identity (GitHub / Google). A user may have several; membership stays per project."""
+    __table_args__ = (UniqueConstraint("provider", "subject", name="uq_identity_provider_subject"),)
+    id: Optional[int] = Field(default=None, primary_key=True)
+    provider: str = Field(index=True)  # "google" | "github"
+    subject: str = Field(index=True)  # the provider's stable user id
+    user_id: int = Field(index=True)
+    email: str = ""
+    created_at: datetime = Field(default_factory=now)
+    last_login_at: Optional[datetime] = None
+
+
+class OAuthState(SQLModel, table=True):
+    """Short-lived state for an OAuth round trip (CSRF protection, optional account linking)."""
+    state: str = Field(primary_key=True)
+    provider: str
+    link_user_id: Optional[int] = None  # set when an already signed-in user links another identity
+    invite_code: str = ""  # a project invite that grants account creation and membership on sign-up
+    created_at: datetime = Field(default_factory=now)
 
 
 class AuthToken(SQLModel, table=True):
     token: str = Field(primary_key=True)
     user_id: int = Field(index=True)
+    created_at: Optional[datetime] = None  # None for tokens issued before this column existed
 
 
 class ApiToken(SQLModel, table=True):
@@ -213,6 +237,7 @@ def init_db() -> None:
     _ensure_channelmember_mention_only()
     _ensure_home_columns()
     _ensure_endpoint_provider_columns()
+    _ensure_oauth_columns()
     migrate_channel_bots()
     from .home import migrate_home_bots
     migrate_home_bots()
@@ -228,6 +253,26 @@ def _ensure_channelmember_mention_only() -> None:
             conn.exec_driver_sql(
                 "ALTER TABLE channelmember ADD COLUMN mention_only BOOLEAN NOT NULL DEFAULT 0")
             conn.commit()
+
+
+def _ensure_oauth_columns() -> None:
+    """Add User.email and AuthToken.created_at on databases created before OAuth sign-in."""
+    if not config.DB_URL.startswith("sqlite"):
+        return
+    with engine.connect() as conn:
+        user_cols = [r[1] for r in conn.exec_driver_sql("PRAGMA table_info(user)").fetchall()]
+        if "email" not in user_cols:
+            conn.exec_driver_sql("ALTER TABLE user ADD COLUMN email VARCHAR NOT NULL DEFAULT ''")
+        token_cols = [r[1] for r in conn.exec_driver_sql("PRAGMA table_info(authtoken)").fetchall()]
+        if "created_at" not in token_cols:
+            conn.exec_driver_sql("ALTER TABLE authtoken ADD COLUMN created_at DATETIME")
+        state_tbl = conn.exec_driver_sql(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='oauthstate'").fetchall()
+        if state_tbl:
+            state_cols = [r[1] for r in conn.exec_driver_sql("PRAGMA table_info(oauthstate)").fetchall()]
+            if "invite_code" not in state_cols:
+                conn.exec_driver_sql("ALTER TABLE oauthstate ADD COLUMN invite_code VARCHAR NOT NULL DEFAULT ''")
+        conn.commit()
 
 
 def _ensure_home_columns() -> None:

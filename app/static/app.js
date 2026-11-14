@@ -161,11 +161,21 @@ function showAuth() {
     go.textContent = create ? 'Create account' : 'Sign in'; dWrap.hidden = !create; p.placeholder = create ? 'Password (8+ characters)' : 'Password'; p.autocomplete = create ? 'new-password' : 'current-password';
     swapText.textContent = create ? 'Already have an account? ' : 'New here? '; swapBtn.textContent = create ? 'Sign in' : 'Create an account'; err.textContent = ''; };
   swapBtn.onclick = () => { create = !create; paint(); u.focus(); };
-  const fm = $('form', { className: 'authbox' }, logo(), title, sub, $('label', { className: 'field' }, u), $('label', { className: 'field' }, p), dWrap, err, go, $('div', { className: 'swap' }, swapText, swapBtn));
+  const swap = $('div', { className: 'swap' }, swapText, swapBtn), providers = $('div', { className: 'providers' });
+  const fm = $('form', { className: 'authbox' }, logo(), title, sub, $('label', { className: 'field' }, u), $('label', { className: 'field' }, p), dWrap, err, go, providers, swap);
   fm.onsubmit = async e => { e.preventDefault(); go.disabled = true;
     try { const r = await api('POST', create ? '/register' : '/login', { username: u.value.trim().toLowerCase(), password: p.value, display_name: d.value.trim() }); S.token = r.token; store.set('tb_token', r.token); await boot(); }
     catch (x) { err.textContent = x.message; go.disabled = false; } };
-  paint(); document.body.replaceChildren($('div', { id: 'auth' }, fm)); u.focus();
+  // Sign in with GitHub or Google, when configured. A new person pastes the invite code they were given.
+  (async () => { try { const info = await api('GET', '/auth/providers'); if (!info.providers || !info.providers.length) return;
+    const inv = $('input', { placeholder: 'Invite code (new? paste it here)', autocapitalize: 'none', autocomplete: 'off' });
+    providers.append($('div', { className: 'authsep' }, $('span', { textContent: 'or' })),
+      ...info.providers.map(p => $('button', { className: 'btn', type: 'button', textContent: 'Continue with ' + p.name,
+        onclick: () => { const code = inv.value.trim(); location.href = '/api/auth/' + p.id + '/start' + (code ? '?invite=' + encodeURIComponent(code) : ''); } })),
+      $('label', { className: 'field', style: 'margin-top:6px' }, inv));
+  } catch (e) { /* providers not configured: password sign-in only */ } })();
+  paint(); if (S.authError) { err.textContent = S.authError; S.authError = null; }
+  document.body.replaceChildren($('div', { id: 'auth' }, fm)); u.focus();
 }
 
 // ---------------------------------------------------------------- shell and sidebar
@@ -1025,5 +1035,13 @@ matchMedia('(max-width: 860px)').addEventListener('change', () => { if (el('app'
 addEventListener('beforeinstallprompt', e => { e.preventDefault(); S.install = e; });
 addEventListener('appinstalled', () => { S.install = null; toast('TeamBots is installed'); });
 if ('serviceWorker' in navigator) addEventListener('load', () => navigator.serviceWorker.register('/sw.js').catch(() => {}));
+
+// After a sign-in redirect the token (or an error) arrives in the URL fragment; take it, then clean the URL.
+(() => { try { if (!location.hash) return; const h = new URLSearchParams(location.hash.slice(1));
+  const t = h.get('tb_oauth'), e = h.get('tb_oauth_error');
+  if (t) { store.set('tb_token', t); S.token = t; }
+  if (e) S.authError = e;
+  if (t || e) history.replaceState(null, '', location.pathname + location.search);
+} catch (x) { /* ignore */ } })();
 
 boot().catch(e => { document.body.replaceChildren($('div', { id: 'auth' }, $('div', { className: 'authbox' }, $('h1', { textContent: 'TeamBots is not reachable' }), $('p', { textContent: e.message }), $('button', { className: 'btn primary', textContent: 'Try again', onclick: () => location.reload() })))); });

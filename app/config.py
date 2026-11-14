@@ -23,6 +23,22 @@ LLM_TIMEOUT = float(os.environ.get("TB_LLM_TIMEOUT", "180"))
 # too low a cap yields an empty visible answer.
 LLM_MAX_TOKENS = int(os.environ.get("TB_MAX_TOKENS", "8192"))
 
+# --- Sign in with GitHub or Google (OAuth2 / OIDC).
+# A provider is enabled when both its client id and secret are set.
+# TB_PUBLIC_URL is the browser-facing base URL; it builds the OAuth redirect URI and must match
+# what you registered with the provider (e.g. https://bots.example.com).
+PUBLIC_URL = os.environ.get("TB_PUBLIC_URL", "").rstrip("/")
+GOOGLE_CLIENT_ID = os.environ.get("TB_GOOGLE_CLIENT_ID", "")
+GOOGLE_CLIENT_SECRET = os.environ.get("TB_GOOGLE_CLIENT_SECRET", "")
+GITHUB_CLIENT_ID = os.environ.get("TB_GITHUB_CLIENT_ID", "")
+GITHUB_CLIENT_SECRET = os.environ.get("TB_GITHUB_CLIENT_SECRET", "")
+# Only these emails or @domains may create a new account through OAuth. Existing users and
+# already-linked identities can always sign in. Empty list = no automatic account creation.
+OAUTH_ALLOWLIST = [x.strip().lower() for x in os.environ.get("TB_OAUTH_ALLOWLIST", "").split(",") if x.strip()]
+# Login tokens (password or OAuth) expire after this many days. 0 = never. Tokens created before
+# this setting existed have no timestamp and stay valid.
+TOKEN_TTL_DAYS = int(os.environ.get("TB_TOKEN_TTL_DAYS", "30"))
+
 _fernet = Fernet(base64.urlsafe_b64encode(hashlib.sha256(SECRET_KEY.encode()).digest()))
 
 
