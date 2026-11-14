@@ -15,7 +15,7 @@ capabilities that every teammate or client talks to in private.
 | Bots | Several bots per project; every project member can make one. Personal bots and Team Bots |
 | Team Bots | Draft, publish, share with the whole project or selected people; roles owner / manager / collaborator |
 | Privacy | A private chat is readable only by its user, also not by the bot's owner |
-| Activity feed | Per Team Bot a shared feed: after a task in a private chat the bot posts a summary of at most three sentences. Only turns that used a tool count; a person can switch it off per chat |
+| Activity feed | One shared feed per project: after a published Team Bot completes a task in a private chat, it posts a summary of at most three sentences. Only turns that used a tool count; a person can switch it off per chat |
 | Memory | Personal memory per user, shared team memory, learnings from collaborators wait for review |
 | Skills, routines | Saved by owner or manager; cron-scheduled prompts per user and conversation |
 | Computer | One sandbox per project, shared by its people and bots: shell and files. Each person also has an Overview bot with its own private chat and sandbox (`tb-home-u{user id}`), not tied to a project. The image includes git and the official GitHub CLI (`gh`); no credentials are baked in, so sign in per project with `gh auth login` |
@@ -82,7 +82,13 @@ safe: it encrypts the stored API keys and secrets, and losing it makes them unre
 1. Create an account, then a team. Share the invite code with teammates.
 2. Add an endpoint and click it to run the connection test. "tool calling: true" is required (the Claude CLI uses a JSON tool-call fallback). For GitHub Copilot, pick that provider type and enter the GitHub domain (for example `ictgroup.ghe.com`) plus a GitHub OAuth token; TeamBots exchanges it for a short-lived Copilot session and does not store that session token. For **Claude CLI**, pick that provider and set the default model to an alias (`fable`, `haiku`, `sonnet`, `opus`) or an id such as `claude-fable-5-2`; no base URL or key is needed. It shells out to the local `claude` binary (`-p --output-format json`, one turn, no host MCP tools), reusing that host's Claude Code login. Tokens and `total_cost_usd` from the CLI JSON are logged; if the CLI reports no cost, the call is stored as a subscription with unknown price. Every bot shares that one account and its rate/spend limits; the binary plus a valid login must be present on the host that runs TeamBots. Override the binary with `TB_CLAUDE_CLI` and its working directory with `TB_CLAUDE_CLI_CWD`. Using a Claude Code / subscription login as a shared bot backend is a licensing question for your organization to clear. For a **Router**, pick that provider; default rules use Spark, cheap/normal/heavy Copilot models, and Claude CLI when one exists. Edit the rules from the endpoint dialog. Do not point existing bots at it unless you mean to; a Router endpoint is added for you to choose.
 3. Create a bot. For a Team Bot: write instructions, add secrets / MCP servers / skills, then
-   tick Published under Sharing.
+   tick Published under Sharing. An MCP server can use a static token or OAuth (each member
+   signs in). For OAuth, set the authorize and token URLs, a pre-registered Client ID, an
+   optional Client secret (stored encrypted, never shown again) and scopes; `TB_PUBLIC_URL`
+   must match the redirect URI you register with the provider
+   (`{TB_PUBLIC_URL}/api/mcp/oauth/callback`). The bot tool `add_mcp_server` accepts the same
+   fields (`client_id`, `client_secret`, `scopes`, `authorize_url`, `token_url`). Dynamic
+   client registration is not used.
 4. Chat. Create a channel and all project bots join it automatically and reply to every message; remove a bot or set it to mention-only if you do not want that. On a bot with computer use, **Open scherm** opens the interactive screen (sign in to Chromium there; the profile is kept in the project's Docker volume). To use `gh` in the sandbox, run `gh auth login` there (config is stored on the project volume); TeamBots secrets never enter the sandbox, so a `GH_TOKEN` secret cannot be used as an environment variable inside it.
 
 5. **Overview** at the top of the sidebar is your personal bot: it sees every project, bot and channel you can access, can ask a project bot a question and relay the answer, and has its own computer (**Open scherm**). It uses the first model endpoint it finds in your projects; change that under the Overview bot's settings.
@@ -161,6 +167,7 @@ app/sandbox.py     the project computer (docker / local)
 app/screen.py      a virtual screen per bot: screenshot, mouse, keyboard
 app/secrets_http.py  secrets filled in outside the sandbox, masking
 app/mcp_client.py  MCP tool discovery and calls
+app/mcp_oauth.py   MCP OAuth (authorization code + PKCE, per user)
 app/routines.py    cron scheduler
 app/api.py         REST API + SSE
 app/static/        web UI without a build step: index.html, app.css, app.js
@@ -183,8 +190,8 @@ docs/router.md     model router (Option A implemented; B/C still described)
   unless `TB_HTTP_ALLOW_PRIVATE=1`.
 - One sandbox per project means every project member and bot can read and change the same files,
   and can see every bot's screen. Do not put two clients in one project.
-- The activity feed publishes a model-written summary of private-chat tasks to everyone with
-  access to the bot. The summary can still reveal what someone worked on; people can switch it
+- The activity feed publishes a model-written summary of private-chat tasks to everyone in the
+  project. The summary can still reveal what someone worked on; people can switch it
   off per chat.
 - A model can be steered by text in files and tool results (prompt injection). Keep approval mode
   on "ask" for bots that read untrusted content and can act.

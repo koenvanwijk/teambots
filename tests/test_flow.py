@@ -346,10 +346,15 @@ def test_secrets_stay_outside_sandbox_and_model(c):
 
 
 def test_activity_feed_and_overview(c):
-    fid = c.get(f"/api/bots/{S['bot']}/feed", headers=H("carol")).json()["id"]
+    feed = c.get(f"/api/teams/{S['team']}/feed", headers=H("carol")).json()
+    fid = feed["id"]
+    assert feed["bot_id"] is None
+    assert c.get(f"/api/teams/{S['team']}/feed", headers=H("carol")).json()["id"] == fid
+    # The old per-bot URL is only a compatibility alias for this project's one feed.
+    assert c.get(f"/api/bots/{S['bot']}/feed", headers=H("carol")).json()["id"] == fid
     entries = c.get(f"/api/conversations/{fid}/messages", headers=H("carol")).json()
     # Carol never saw Bob's chat, but reads what the bot did for him, as a summary
-    assert any(e["content"] == "For Bob: did run_command" for e in entries)
+    assert any(e["author_bot_id"] == S["bot"] and "for Bob: did run_command" in e["content"] for e in entries)
     assert all("hi-from-bob" not in e["content"] for e in entries)
     assert c.post(f"/api/conversations/{fid}/messages", json={"content": "x"}, headers=H("carol")).status_code == 400
     # plain chat without tools is not activity
@@ -366,7 +371,7 @@ def test_activity_feed_and_overview(c):
     wait_for(lambda: len(c.get(f"/api/conversations/{fid}/messages", headers=H("carol")).json()) == before + 1)
     ov = c.get("/api/overview", headers=H("carol")).json()
     assert ov[0]["client"] == "Acme" and ov[0]["name"] == "Project X" and ov[0]["people"] == 3
-    assert ov[0]["activity"][0]["content"] == "For Bob: did read_file"
+    assert "for Bob: did read_file" in ov[0]["activity"][0]["content"]
 
 
 def test_own_screen_and_computer_use(c):

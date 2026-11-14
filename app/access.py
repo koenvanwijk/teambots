@@ -31,8 +31,10 @@ def can_read_conversation(s: Session, user_id: int, conv: Conversation) -> bool:
     """DMs are private to their user: owners and managers of the bot cannot read them."""
     if conv.kind in ("dm", "home"):
         return conv.user_id == user_id
-    if conv.kind == "feed":  # everyone who can use the bot sees its activity summaries
-        bot = s.get(Bot, conv.bot_id)
+    if conv.kind == "feed":  # activity summaries
+        if conv.bot_id is None:  # project-wide feed: any member of the project
+            return team_role(s, user_id, conv.team_id) is not None
+        bot = s.get(Bot, conv.bot_id)  # legacy per-bot feed: anyone who can use the bot
         return bot is not None and bot_role(s, user_id, bot) is not None
     return s.exec(select(ChannelMember).where(
         ChannelMember.conversation_id == conv.id, ChannelMember.user_id == user_id)).first() is not None

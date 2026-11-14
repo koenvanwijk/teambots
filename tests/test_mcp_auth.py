@@ -20,13 +20,16 @@ from app.db import McpCredential, McpServer, session  # noqa: E402
 def _engine():
     # Own database, so collection order and other suites' engine rebinding cannot touch it.
     import app.db as db
+    import app.home as home
     from sqlmodel import create_engine
-    saved = db.engine
-    db.engine = create_engine(f"sqlite:///{tempfile.mkdtemp(prefix='teambots-mcpauth-db-')}/t.db",
-                              connect_args={"check_same_thread": False})
+    saved_db_engine, saved_home_engine = db.engine, home.engine
+    test_engine = create_engine(f"sqlite:///{tempfile.mkdtemp(prefix='teambots-mcpauth-db-')}/t.db",
+                                connect_args={"check_same_thread": False})
+    db.engine = home.engine = test_engine
     db.init_db()
     yield
-    db.engine = saved
+    db.engine = saved_db_engine
+    home.engine = saved_home_engine
 
 
 def _server(**kw):

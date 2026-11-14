@@ -129,9 +129,9 @@ class Conversation(SQLModel, table=True):
     team_id: int = Field(index=True)
     kind: str  # dm | channel | feed | home (the per-user overview chat)
     name: str = ""
-    share_activity: bool = True  # dm only: summaries of finished tasks go to the bot's feed
+    share_activity: bool = True  # dm only: summaries of finished tasks go to the project's activity feed
     user_id: Optional[int] = Field(default=None, index=True)  # dm only
-    bot_id: Optional[int] = Field(default=None, index=True)  # dm only
+    bot_id: Optional[int] = Field(default=None, index=True)  # dm/home; None for channels and project activity
 
 
 class ChannelMember(SQLModel, table=True):
@@ -291,17 +291,36 @@ class McpServer(SQLModel, table=True):
     auth_header: str = "Authorization"  # header the token goes in
     auth_prefix: str = "Bearer"  # scheme word joined to the token with a space ("" for a bare API key)
     token_enc: str = ""  # the shared token (auth_scope == "shared"), encrypted
+    # OAuth (auth_mode == "oauth", always per user). The admin configures the client once;
+    # each member authorizes and gets their own access/refresh tokens in McpCredential.
+    oauth_authorize_url: str = ""
+    oauth_token_url: str = ""
+    oauth_client_id: str = ""
+    oauth_client_secret_enc: str = ""  # encrypted; may be empty for a public client (PKCE only)
+    oauth_scopes: str = ""  # space-separated
 
 
 class McpCredential(SQLModel, table=True):
-    """A per-user credential for an MCP server (auth_scope == "user"): each person connects
-    their own token, so a shared team bot uses the requester's own access."""
+    """A per-user credential for an MCP server (auth_scope == "user" or OAuth): each person
+    connects their own account, so a shared team bot uses the requester's own access."""
     __table_args__ = (UniqueConstraint("mcp_server_id", "user_id", name="uq_mcpcred_server_user"),)
     id: Optional[int] = Field(default=None, primary_key=True)
     mcp_server_id: int = Field(index=True)
     user_id: int = Field(index=True)
-    value_enc: str = ""  # the user's token, encrypted
+    value_enc: str = ""  # the user's token (static) or OAuth access token, encrypted
+    refresh_enc: str = ""  # OAuth refresh token, encrypted
+    expires_at: Optional[datetime] = None  # OAuth access-token expiry; None = no expiry known
     updated_at: datetime = Field(default_factory=now)
+
+
+class McpOAuthState(SQLModel, table=True):
+    """Short-lived state for an MCP OAuth authorization (CSRF state + PKCE verifier)."""
+    id: Optional[int] = Field(default=None, primary_key=True)
+    state: str = Field(index=True)
+    mcp_server_id: int
+    user_id: int
+    code_verifier: str
+    created_at: datetime = Field(default_factory=now)
 
 
 _connect_args = {"check_same_thread": False} if config.DB_URL.startswith("sqlite") else {}
@@ -310,6 +329,7 @@ engine = create_engine(config.DB_URL, connect_args=_connect_args)
 
 def init_db() -> None:
     SQLModel.metadata.create_all(engine)
+    _ensure_project_activity_feed_index()
     _ensure_channelmember_mention_only()
     _ensure_home_columns()
     _ensure_endpoint_provider_columns()
@@ -322,6 +342,35 @@ def init_db() -> None:
     migrate_channel_bots()
     from .home import migrate_home_bots
     migrate_home_bots()
+
+
+def _ensure_project_activity_feed_index() -> None:
+    """Keep exactly one new-style activity feed per project.
+
+    Old activity feeds have a bot_id and deliberately stay untouched: moving those
+    historic summaries into a project-wide feed would broaden their audience.
+    """
+    with Session(engine) as s:
+        feeds = s.exec(select(Conversation).where(
+            Conversation.kind == "feed", Conversation.bot_id.is_(None)
+        ).order_by(Conversation.team_id, Conversation.id)).all()
+        primary_by_team: dict[int, Conversation] = {}
+        for feed in feeds:
+            primary = primary_by_team.setdefault(feed.team_id, feed)
+            if primary is feed:
+                continue
+            for message in s.exec(select(Message).where(Message.conversation_id == feed.id)).all():
+                message.conversation_id = primary.id
+                s.add(message)
+            s.delete(feed)
+        s.commit()
+    # NULL values are normally distinct in a composite unique constraint, so use
+    # a partial index for just the bot-less, project-wide feeds.
+    with engine.begin() as conn:
+        conn.exec_driver_sql(
+            "CREATE UNIQUE INDEX IF NOT EXISTS uq_conversation_project_activity_feed "
+            "ON conversation (team_id) WHERE kind = 'feed' AND bot_id IS NULL"
+        )
 
 
 def _ensure_channelmember_mention_only() -> None:
@@ -427,9 +476,24 @@ def _ensure_mcp_auth_columns() -> None:
             "auth_prefix": "VARCHAR NOT NULL DEFAULT 'Bearer'",
             "token_enc": "VARCHAR NOT NULL DEFAULT ''",
         }
-        for name, decl in adds.items():
+        oauth_adds = {
+            "oauth_authorize_url": "VARCHAR NOT NULL DEFAULT ''",
+            "oauth_token_url": "VARCHAR NOT NULL DEFAULT ''",
+            "oauth_client_id": "VARCHAR NOT NULL DEFAULT ''",
+            "oauth_client_secret_enc": "VARCHAR NOT NULL DEFAULT ''",
+            "oauth_scopes": "VARCHAR NOT NULL DEFAULT ''",
+        }
+        for name, decl in {**adds, **oauth_adds}.items():
             if name not in cols:
                 conn.exec_driver_sql(f"ALTER TABLE mcpserver ADD COLUMN {name} {decl}")
+        cred_tbl = conn.exec_driver_sql(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='mcpcredential'").fetchall()
+        if cred_tbl:
+            cred_cols = [r[1] for r in conn.exec_driver_sql("PRAGMA table_info(mcpcredential)").fetchall()]
+            if "refresh_enc" not in cred_cols:
+                conn.exec_driver_sql("ALTER TABLE mcpcredential ADD COLUMN refresh_enc VARCHAR NOT NULL DEFAULT ''")
+            if "expires_at" not in cred_cols:
+                conn.exec_driver_sql("ALTER TABLE mcpcredential ADD COLUMN expires_at DATETIME")
         conn.commit()
 
 

@@ -15,6 +15,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
+from sqlalchemy.exc import IntegrityError
 
 from . import config, llm, mcp_client, sandbox, screen, secrets_http
 from .access import bot_role
@@ -124,11 +125,22 @@ BUILTIN_TOOLS = [
          "hosts": {"type": "string", "description": "comma-separated host names it may be sent to"}},
         ["name", "value", "hosts"]),
     _fn("add_mcp_server", "Attach a streamable-HTTP MCP server to yourself; its tools become your tools. "
-        "trusted=false (default) makes its tools ask for approval each time. Owner or manager only.",
+        "trusted=false (default) makes its tools ask for approval each time. For OAuth, pass client_id "
+        "(a pre-registered client — dynamic registration is not used), optional client_secret, scopes, "
+        "and the provider's authorize_url and token_url; each member then signs in themselves. "
+        "Owner or manager only.",
         {"name": {"type": "string", "description": "1-24 chars of a-z, 0-9, _ or -"},
          "url": {"type": "string"}, "trusted": {"type": "boolean"},
          "headers": {"type": "object", "additionalProperties": {"type": "string"},
-                     "description": "optional request headers, e.g. an auth token"}},
+                     "description": "optional static request headers (not for secrets you should store as OAuth)"},
+         "client_id": {"type": "string", "description": "OAuth client id of a pre-registered app. When set, "
+                       "authorize_url and token_url are required."},
+         "client_secret": {"type": "string", "description": "OAuth client secret, if the provider issues one. "
+                           "Stored encrypted; never returned to you or the sandbox."},
+         "scopes": {"description": "OAuth scopes: a space-separated string, or a list of scope names.",
+                    "anyOf": [{"type": "string"}, {"type": "array", "items": {"type": "string"}}]},
+         "authorize_url": {"type": "string", "description": "OAuth authorize URL (required with client_id)."},
+         "token_url": {"type": "string", "description": "OAuth token URL (required with client_id)."}},
         ["name", "url"]),
 ]
 
@@ -344,11 +356,36 @@ async def _execute(ctx: Ctx, name: str, args: dict, mcp_map: dict) -> str:
             if not re.fullmatch(r"[a-z0-9_-]{1,24}", mname):
                 return "error: name must be 1-24 chars of a-z, 0-9, _ or -"
             headers = args.get("headers") or {}
+            if headers is not None and not isinstance(headers, dict):
+                return "error: headers must be an object of string values"
+            from . import mcp_oauth
+            client_id = (args.get("client_id") or "").strip()
+            authorize_url = (args.get("authorize_url") or args.get("oauth_authorize_url") or "").strip()
+            token_url = (args.get("token_url") or args.get("oauth_token_url") or "").strip()
+            scopes = mcp_oauth.normalize_scopes(args.get("scopes") or args.get("oauth_scopes"))
+            secret = (args.get("client_secret") or args.get("oauth_client_secret") or "").strip()
+            auth_mode, auth_scope = "none", "shared"
+            oauth_kw = dict(oauth_authorize_url="", oauth_token_url="", oauth_client_id="",
+                            oauth_client_secret_enc="", oauth_scopes="")
+            if client_id or authorize_url or token_url or secret or scopes:
+                if not (client_id and authorize_url and token_url):
+                    return ("error: OAuth needs client_id, authorize_url and token_url "
+                            "(a pre-registered client; dynamic registration is not used)")
+                if not config.PUBLIC_URL:
+                    return "error: TB_PUBLIC_URL must be set before you can add an OAuth MCP server"
+                auth_mode, auth_scope = "oauth", "user"
+                oauth_kw = dict(
+                    oauth_authorize_url=authorize_url, oauth_token_url=token_url,
+                    oauth_client_id=client_id,
+                    oauth_client_secret_enc=config.encrypt(secret) if secret else "",
+                    oauth_scopes=scopes)
             new_mcp = McpServer(bot_id=bot.id, name=mname, url=args["url"], trusted=bool(args.get("trusted")),
-                                headers_enc=config.encrypt(json.dumps(headers)) if headers else "")
+                                headers_enc=config.encrypt(json.dumps(headers)) if headers else "",
+                                auth_mode=auth_mode, auth_scope=auth_scope, **oauth_kw)
             s.add(new_mcp)
             s.commit()
             s.refresh(new_mcp)
+            new_mcp_oauth = auth_mode == "oauth"
         if name == "ask_bot":
             if ctx.depth >= 1:
                 return "error: a bot that was handed a task cannot hand it on again"
@@ -375,6 +412,9 @@ async def _execute(ctx: Ctx, name: str, args: dict, mcp_map: dict) -> str:
                   is_channel=ctx.is_channel, depth=ctx.depth + 1, team_id=target_team, is_home=target_home)
         return await run_subagent(sub, args["message"], asked_by=bot.name)
     if name == "add_mcp_server":
+        if new_mcp_oauth:
+            return (f"MCP server '{new_mcp.name}' added with OAuth. Members connect their own account "
+                    "in the bot's settings; the client secret (if any) is stored encrypted and is not shown.")
         try:
             tools = [t["name"] for t in await asyncio.wait_for(mcp_client.list_tools(new_mcp, ctx.requester_id, ttl=0), 20)]
             return f"MCP server '{new_mcp.name}' added. New tools: {', '.join(tools) or 'none listed yet'}."
@@ -716,14 +756,24 @@ async def _run_locked(conv_id: int, bot_id: int, requester_id: int, run: Run | N
           "if you want me to carry on.", author_bot_id=bot_id, requester_id=requester_id)
 
 
-def feed_conversation(bot: Bot) -> Conversation:
-    """The shared activity feed of a Team Bot (created on first use)."""
+def project_feed(team_id: int) -> Conversation:
+    """The project-wide activity feed (one per project): summaries from published Team Bots."""
     with session() as s:
-        c = s.exec(select(Conversation).where(Conversation.kind == "feed", Conversation.bot_id == bot.id)).first()
+        c = s.exec(select(Conversation).where(Conversation.kind == "feed", Conversation.team_id == team_id,
+                                              Conversation.bot_id.is_(None))).first()
         if not c:
-            c = Conversation(team_id=bot.team_id, kind="feed", name=f"{bot.name} activity", bot_id=bot.id)
+            c = Conversation(team_id=team_id, kind="feed", name="Activity", bot_id=None)
             s.add(c)
-            s.commit()
+            try:
+                s.commit()
+            except IntegrityError:
+                # Another request created it between our lookup and insert.
+                s.rollback()
+                c = s.exec(select(Conversation).where(Conversation.kind == "feed",
+                                                       Conversation.team_id == team_id,
+                                                       Conversation.bot_id.is_(None))).first()
+                if c is None:
+                    raise
     return c
 
 
@@ -735,7 +785,7 @@ FEED_PROMPT = (
 
 
 async def share_activity(conv: Conversation, bot: Bot, user: User, ep: Endpoint) -> None:
-    """After a finished task in a private chat, post a short summary to the bot's shared feed.
+    """After a finished task in a private chat, post a short summary to the project's activity feed.
 
     Only turns in which the bot used a tool count as activity, and the person can switch it off per chat.
     """
@@ -764,7 +814,8 @@ async def share_activity(conv: Conversation, bot: Bot, user: User, ep: Endpoint)
         return
     summary = secrets_http.mask(reply["content"].strip(), bot.id)
     if summary and summary != "SKIP":
-        _post(feed_conversation(bot).id, role="assistant", content=f"For {user.display_name}: {summary}",
+        _post(project_feed(bot.team_id).id, role="assistant",
+              content=f"**{bot.name}** — for {user.display_name}: {summary}",
               author_bot_id=bot.id, requester_id=user.id)
 
 

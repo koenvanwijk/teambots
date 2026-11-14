@@ -386,12 +386,11 @@ def overview(user: User = Depends(current_user)):
         for m in s.exec(select(TeamMember).where(TeamMember.user_id == user.id)).all():
             t = s.get(Team, m.team_id)
             bots = [b for b in s.exec(select(Bot).where(Bot.team_id == t.id)).all() if bot_role(s, user.id, b)]
-            feeds = {c.id: c.bot_id for c in s.exec(select(Conversation).where(
-                Conversation.team_id == t.id, Conversation.kind == "feed")).all()
-                if c.bot_id in {b.id for b in bots}}
-            recent = s.exec(select(Message).where(Message.conversation_id.in_(list(feeds) or [0]))
+            feed = s.exec(select(Conversation).where(
+                Conversation.team_id == t.id, Conversation.kind == "feed", Conversation.bot_id.is_(None))).first()
+            recent = s.exec(select(Message).where(Message.conversation_id == (feed.id if feed else 0))
                             .order_by(Message.id.desc()).limit(5)).all()
-            names = {b.id: b.name for b in bots}
+            names = {b.id: b.name for b in s.exec(select(Bot).where(Bot.team_id == t.id)).all()}
             out.append({"id": t.id, "name": t.name, "client": t.client, "role": m.role,
                         "people": len(s.exec(select(TeamMember).where(TeamMember.team_id == t.id)).all()),
                         "bots": [{"id": b.id, "name": b.name, "handle": b.handle} for b in bots],
@@ -896,10 +895,11 @@ def patch_bot(bot_id: int, body: BotPatch, user: User = Depends(current_user)):
         for k, v in data.items():
             setattr(b, k, v.strip() if k == "name" else v)
         s.add(b)
-        if renamed:  # the bot's chats and its activity feed carry its name
+        if renamed:  # only private chats are named after a bot; activity belongs to the project
             for c in s.exec(select(Conversation).where(Conversation.bot_id == b.id)).all():
-                c.name = f"{b.name} activity" if c.kind == "feed" else b.name
-                s.add(c)
+                if c.kind != "feed":
+                    c.name = b.name
+                    s.add(c)
         s.commit()
         return _bot_out(s, b, user)
 
@@ -1120,22 +1120,36 @@ class McpIn(BaseModel):
     url: str
     headers: dict[str, str] = {}
     trusted: bool = False
-    auth_mode: str = "none"       # none | token
+    auth_mode: str = "none"       # none | token | oauth
     auth_scope: str = "shared"    # shared (one token for the bot) | user (each member connects their own)
     auth_header: str = "Authorization"
     auth_prefix: str = "Bearer "
     token: str = ""               # the shared token, when auth_mode=token and auth_scope=shared
+    # OAuth client config (auth_mode == oauth); each member then authorizes their own account.
+    oauth_authorize_url: str = ""
+    oauth_token_url: str = ""
+    oauth_client_id: str = ""
+    oauth_client_secret: str = ""
+    oauth_scopes: str | list[str] = ""
 
 
 def _mcp_out(r: McpServer, user_id: int, s) -> dict:
-    """The token value is never returned; `connected` says whether this user has a per-user token."""
-    per_user = r.auth_mode == "token" and r.auth_scope == "user"
+    """The token value is never returned; `connected` says whether this user has their own credential."""
+    mode = getattr(r, "auth_mode", "none") or "none"
+    per_user = mode == "oauth" or (mode == "token" and r.auth_scope == "user")
     connected = bool(s.exec(select(McpCredential).where(
         McpCredential.mcp_server_id == r.id, McpCredential.user_id == user_id)).first()) if per_user else None
     return {"id": r.id, "name": r.name, "url": r.url, "trusted": r.trusted,
-            "auth_mode": getattr(r, "auth_mode", "none") or "none", "auth_scope": getattr(r, "auth_scope", "shared"),
+            "auth_mode": mode, "auth_scope": getattr(r, "auth_scope", "shared"),
             "auth_header": getattr(r, "auth_header", "Authorization"), "auth_prefix": getattr(r, "auth_prefix", ""),
-            "has_shared_token": bool(getattr(r, "token_enc", "")), "connected": connected}
+            "has_shared_token": bool(getattr(r, "token_enc", "")),
+            "oauth_configured": bool(getattr(r, "oauth_client_id", "")),
+            "oauth_authorize_url": getattr(r, "oauth_authorize_url", "") or "",
+            "oauth_token_url": getattr(r, "oauth_token_url", "") or "",
+            "oauth_client_id": getattr(r, "oauth_client_id", "") or "",
+            "oauth_scopes": getattr(r, "oauth_scopes", "") or "",
+            "has_oauth_secret": bool(getattr(r, "oauth_client_secret_enc", "")),
+            "connected": connected}
 
 
 @router.get("/bots/{bot_id}/mcp")
@@ -1151,25 +1165,38 @@ def list_mcp(bot_id: int, user: User = Depends(current_user)):
 @router.post("/bots/{bot_id}/mcp")
 async def add_mcp(bot_id: int, body: McpIn, user: User = Depends(current_user)):
     _need(re.fullmatch(r"[a-z0-9_-]{1,24}", body.name), 400, "name: 1-24 chars of a-z 0-9 _ -")
-    _need(body.auth_mode in ("none", "token"), 400, "auth_mode: none | token")
+    _need(body.auth_mode in ("none", "token", "oauth"), 400, "auth_mode: none | token | oauth")
     _need(body.auth_scope in ("shared", "user"), 400, "auth_scope: shared | user")
-    token_enc = ""
+    token_enc, oauth_secret_enc = "", ""
+    scope = body.auth_scope
     if body.auth_mode == "token" and body.auth_scope == "shared":
         _need(body.token.strip(), 400, "a shared-token server needs a token")
         token_enc = config.encrypt(body.token.strip())
+    if body.auth_mode == "oauth":
+        _need(body.oauth_authorize_url.strip() and body.oauth_token_url.strip() and body.oauth_client_id.strip(),
+              400, "OAuth needs an authorize URL, a token URL and a client id")
+        _need(config.PUBLIC_URL, 400, "TB_PUBLIC_URL must be set to use OAuth")
+        from . import mcp_oauth
+        body.oauth_scopes = mcp_oauth.normalize_scopes(body.oauth_scopes)
+        oauth_secret_enc = config.encrypt(body.oauth_client_secret.strip()) if body.oauth_client_secret.strip() else ""
+        scope = "user"  # OAuth is always per user
     with session() as s:
         _bot(s, bot_id, user, manage=True)
         r = McpServer(bot_id=bot_id, name=body.name, url=body.url, trusted=body.trusted,
                       headers_enc=config.encrypt(json.dumps(body.headers)) if body.headers else "",
-                      auth_mode=body.auth_mode, auth_scope=body.auth_scope,
+                      auth_mode=body.auth_mode, auth_scope=scope,
                       auth_header=(body.auth_header or "Authorization").strip(),
-                      auth_prefix=body.auth_prefix, token_enc=token_enc)
+                      auth_prefix=body.auth_prefix, token_enc=token_enc,
+                      oauth_authorize_url=body.oauth_authorize_url.strip(),
+                      oauth_token_url=body.oauth_token_url.strip(),
+                      oauth_client_id=body.oauth_client_id.strip(),
+                      oauth_client_secret_enc=oauth_secret_enc, oauth_scopes=body.oauth_scopes.strip())
         s.add(r)
         s.commit()
         r_id = r.id
-    # A per-user server has no credentials yet, so don't probe it as the adder.
+    # A per-user or OAuth server has no credentials yet, so don't probe it as the adder.
     try:
-        probe_user = user.id if body.auth_scope != "user" else None
+        probe_user = user.id if scope != "user" else None
         with session() as s:
             r = s.get(McpServer, r_id)
         tools = [t["name"] for t in await asyncio.wait_for(mcp_client.list_tools(r, probe_user, ttl=0), 20)]
@@ -1177,6 +1204,88 @@ async def add_mcp(bot_id: int, body: McpIn, user: User = Depends(current_user)):
     except Exception as e:  # noqa: BLE001
         tools, error = [], f"saved, but the server did not answer: {e.__class__.__name__}"
     return {"id": r_id, "name": body.name, "tools": tools, "error": error}
+
+
+
+class McpPatch(BaseModel):
+    name: str | None = None
+    url: str | None = None
+    trusted: bool | None = None
+    headers: dict[str, str] | None = None  # omitted = keep; {} = clear static headers
+    auth_mode: str | None = None
+    auth_scope: str | None = None
+    auth_header: str | None = None
+    auth_prefix: str | None = None
+    token: str | None = None  # omitted or empty = keep the stored shared token
+    oauth_authorize_url: str | None = None
+    oauth_token_url: str | None = None
+    oauth_client_id: str | None = None
+    oauth_client_secret: str | None = None  # omitted or empty = keep the stored secret
+    oauth_scopes: str | list[str] | None = None
+
+
+@router.patch("/mcp/{server_id}")
+async def patch_mcp(server_id: int, body: McpPatch, user: User = Depends(current_user)):
+    """Update an MCP server (owner or manager). The client secret is never returned."""
+    from . import mcp_oauth
+    data = body.model_dump(exclude_none=True)
+    if "auth_mode" in data:
+        _need(data["auth_mode"] in ("none", "token", "oauth"), 400, "auth_mode: none | token | oauth")
+    if "auth_scope" in data:
+        _need(data["auth_scope"] in ("shared", "user"), 400, "auth_scope: shared | user")
+    if "name" in data:
+        _need(re.fullmatch(r"[a-z0-9_-]{1,24}", data["name"]), 400, "name: 1-24 chars of a-z 0-9 _ -")
+    with session() as s:
+        r = s.get(McpServer, server_id)
+        _need(r, 404, "server not found")
+        _bot(s, r.bot_id, user, manage=True)
+        mode = data.get("auth_mode", getattr(r, "auth_mode", "none") or "none")
+        scope = data.get("auth_scope", getattr(r, "auth_scope", "shared") or "shared")
+        if mode == "oauth":
+            scope = "user"
+            authorize = (data.get("oauth_authorize_url", r.oauth_authorize_url) or "").strip()
+            token_url = (data.get("oauth_token_url", r.oauth_token_url) or "").strip()
+            client_id = (data.get("oauth_client_id", r.oauth_client_id) or "").strip()
+            _need(authorize and token_url and client_id, 400,
+                  "OAuth needs an authorize URL, a token URL and a client id")
+            _need(config.PUBLIC_URL, 400, "TB_PUBLIC_URL must be set to use OAuth")
+            r.oauth_authorize_url, r.oauth_token_url, r.oauth_client_id = authorize, token_url, client_id
+            if "oauth_scopes" in data:
+                r.oauth_scopes = mcp_oauth.normalize_scopes(data["oauth_scopes"])
+            if data.get("oauth_client_secret"):
+                r.oauth_client_secret_enc = config.encrypt(data["oauth_client_secret"].strip())
+            data.pop("oauth_authorize_url", None)
+            data.pop("oauth_token_url", None)
+            data.pop("oauth_client_id", None)
+            data.pop("oauth_scopes", None)
+            data.pop("oauth_client_secret", None)
+        else:
+            if "oauth_scopes" in data:
+                r.oauth_scopes = mcp_oauth.normalize_scopes(data.pop("oauth_scopes"))
+            if "oauth_client_secret" in data:
+                secret = (data.pop("oauth_client_secret") or "").strip()
+                if secret:
+                    r.oauth_client_secret_enc = config.encrypt(secret)
+        r.auth_mode, r.auth_scope = mode, scope
+        data.pop("auth_mode", None)
+        data.pop("auth_scope", None)
+        if mode == "token" and scope == "shared" and data.get("token"):
+            r.token_enc = config.encrypt(data.pop("token").strip())
+        else:
+            data.pop("token", None)
+        if "headers" in data:
+            headers = data.pop("headers") or {}
+            r.headers_enc = config.encrypt(json.dumps(headers)) if headers else ""
+        if "auth_header" in data:
+            r.auth_header = (data.pop("auth_header") or "Authorization").strip()
+        if "auth_prefix" in data:
+            r.auth_prefix = data.pop("auth_prefix")
+        for k, v in data.items():
+            setattr(r, k, v.strip() if isinstance(v, str) and k in ("name", "url", "oauth_authorize_url",
+                                                                    "oauth_token_url", "oauth_client_id") else v)
+        s.add(r)
+        s.commit()
+        return _mcp_out(r, user.id, s)
 
 
 class McpCredIn(BaseModel):
@@ -1220,6 +1329,61 @@ def clear_mcp_credential(server_id: int, user: User = Depends(current_user)):
             s.commit()
     mcp_client.invalidate(server_id)
     return {"ok": True, "connected": False}
+
+
+@router.get("/mcp/{server_id}/oauth/start")
+def mcp_oauth_start(server_id: int, user: User = Depends(current_user)):
+    """Begin OAuth for the current user: returns the provider authorize URL to redirect to."""
+    from . import mcp_oauth
+    with session() as s:
+        r = s.get(McpServer, server_id)
+        _need(r, 404, "server not found")
+        _bot(s, r.bot_id, user)
+        _need(getattr(r, "auth_mode", "") == "oauth", 400, "this server does not use OAuth")
+        try:
+            url = mcp_oauth.build_authorize_url(r, user.id)
+        except mcp_oauth.OAuthError as e:
+            raise HTTPException(400, str(e)) from e
+    return {"url": url}
+
+
+@router.get("/mcp/oauth/callback")
+async def mcp_oauth_callback(code: str = Query(default=""), state: str = Query(default=""),
+                            error: str = Query(default="")):
+    """Provider redirect: exchange the code for this user's tokens (identity comes from state)."""
+    from . import mcp_oauth
+
+    def back(flag: str) -> RedirectResponse:
+        return RedirectResponse(f"/#mcp={flag}", status_code=302)
+
+    if error or not code or not state:
+        return back("error")
+    st = mcp_oauth.take_state(state)
+    if not st:
+        return back("error")
+    with session() as s:
+        r = s.get(McpServer, st.mcp_server_id)
+    if not r or getattr(r, "auth_mode", "") != "oauth":
+        return back("error")
+    try:
+        access, refresh_tok, expires_at = await mcp_oauth.exchange_code(r, code, st.code_verifier)
+    except mcp_oauth.OAuthError:
+        return back("error")
+    with session() as s:
+        cred = s.exec(select(McpCredential).where(
+            McpCredential.mcp_server_id == r.id, McpCredential.user_id == st.user_id)).first()
+        if cred:
+            cred.value_enc = config.encrypt(access)
+            cred.refresh_enc = config.encrypt(refresh_tok or "")
+            cred.expires_at = expires_at
+            cred.updated_at = now()
+        else:
+            cred = McpCredential(mcp_server_id=r.id, user_id=st.user_id, value_enc=config.encrypt(access),
+                                 refresh_enc=config.encrypt(refresh_tok or ""), expires_at=expires_at)
+        s.add(cred)
+        s.commit()
+    mcp_client.invalidate(r.id)
+    return back("connected")
 
 
 @router.delete("/mcp/{server_id}")
@@ -1350,11 +1514,20 @@ def open_dm(bot_id: int, user: User = Depends(current_user)):
 
 @router.get("/bots/{bot_id}/feed")
 def open_feed(bot_id: int, user: User = Depends(current_user)):
-    """The Team Bot's shared activity feed: short summaries of finished tasks, for everyone with access."""
+    """Compatibility URL for old clients; activity is shared once per project, not per bot."""
     with session() as s:
         b = _bot(s, bot_id, user)
-        _need(b.is_team, 400, "only a Team Bot has an activity feed")
-    return agent.feed_conversation(b).model_dump()
+        _need(b.is_team, 400, "only a Team Bot has project activity")
+        _need(team_role(s, user.id, b.team_id), 404, "project not found")
+    return agent.project_feed(b.team_id).model_dump()
+
+
+@router.get("/teams/{team_id}/feed")
+def team_feed(team_id: int, user: User = Depends(current_user)):
+    """The project-wide activity feed: finished-task summaries from published Team Bots."""
+    with session() as s:
+        _need(team_role(s, user.id, team_id), 404, "project not found")
+    return agent.project_feed(team_id).model_dump()
 
 
 class ConversationPatch(BaseModel):

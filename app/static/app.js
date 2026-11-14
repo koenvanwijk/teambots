@@ -200,12 +200,16 @@ async function boot() {
   // store the opposite intent, which then re-collapses the block on the next redraw (new line).
   el('col').addEventListener('click', e => { const s = e.target.closest('summary'); if (!s) return; const d = s.parentElement; requestAnimationFrame(() => { d.dataset.user = d.open ? '1' : '0'; }); });
   await loadTeam();
+  if (S.mcpNotice) {
+    const n = S.mcpNotice; S.mcpNotice = null;
+    setTimeout(() => toast(n === 'connected' ? 'MCP account connected' : 'Could not connect the MCP account', n === 'connected' ? '' : 'bad'), 0);
+  }
   if (store.get('tb_last_home') === '1') {
     try { return await openOverview(); } catch { /* fall through */ }
   }
   const last = S.team && store.get('tb_last_' + S.team.id), [kind, id] = (last || '').split(':');
   const bot = S.bots.find(b => b.id === +id), ch = S.channels.find(c => c.id === +id);
-  try { if (kind === 'dm' && bot) return await openBot(bot); if (kind === 'feed' && bot) return await openFeed(bot); if (kind === 'ch' && ch) return await openConv(ch, null); } catch { /* fall through to projects */ }
+  try { if (kind === 'dm' && bot) return await openBot(bot); if (kind === 'feed') return await openProjectFeed(); if (kind === 'ch' && ch) return await openConv(ch, null); } catch { /* fall through to projects */ }
   await showHome();
 }
 async function loadTeam() {
@@ -307,6 +311,7 @@ function renderSide() {
   const item = (on, onclick, lead, text, ...tail) => $('div', { className: 'item' + (on ? ' on' : ''), role: 'button', tabIndex: 0, onclick: guard(onclick), onkeydown: e => { if (e.key === 'Enter' && e.target === e.currentTarget) e.currentTarget.click(); } }, lead, $('span', { className: 'grow', textContent: text }), tail);
   const list = $('div', { className: 'scroll' });
   if (t) {
+    list.append(item(c && c.kind === 'feed' && !c.bot_id, openProjectFeed, $('span', { className: 'lead' }, icon('pulse', 16)), 'Activity'));
     list.append(sec('Bots (private chat)', 'New bot', newBot));
     if (!S.bots.length) list.append($('div', { className: 'emptyhint', textContent: S.endpoints.length ? 'No bots yet.' : 'Add an endpoint, then create a bot.' }));
     const more = items => ib('dots', 'Rename and more', e => { e.stopPropagation(); popmenu(e.currentTarget, items); }, 15);
@@ -316,9 +321,6 @@ function renderSide() {
     if (!S.channels.length) list.append($('div', { className: 'emptyhint', textContent: 'Work with people and bots together.' }));
     for (const ch of S.channels) list.append(item(c && c.id === ch.id, () => openConv(ch, null), $('span', { className: 'lead' }, icon('hash', 16)), ch.name,
       more([{ icon: 'edit', label: 'Rename', onclick: guard(() => renameChannel(ch)) }, { icon: 'users', label: 'People and bots', onclick: guard(async () => { await openConv(ch, null); await channelMembers(); }) }])));
-    const feeds = S.bots.filter(b => b.is_team && b.published);
-    if (feeds.length) list.append(sec('Activity'));
-    for (const b of feeds) list.append(item(c && c.kind === 'feed' && c.bot_id === b.id, () => openFeed(b), $('span', { className: 'lead' }, icon('pulse', 16)), b.name));
     list.append(sec('Endpoints', 'New endpoint', newEndpoint));
     for (const e of S.endpoints) list.append(item(false, () => endpointDialog(e), $('span', { className: 'lead' }, icon('plug', 16)), e.name, $('span', { className: 'tag', textContent: e.default_model })));
   }
@@ -387,7 +389,7 @@ async function renameBot(b) {
     onSubmit: v => api('PATCH', `/bots/${b.id}`, v) });
   if (!r) return;
   Object.assign(b, r); if (S.bot && S.bot.id === b.id) Object.assign(S.bot, r);
-  if (S.conv && S.conv.bot_id === b.id) S.conv.name = S.conv.kind === 'feed' ? b.name + ' activity' : b.name;
+  if (S.conv && S.conv.bot_id === b.id) S.conv.name = b.name;
   renderSide(); renderTop(); if (S.conv && S.conv.bot_id === b.id && S.conv.kind === 'dm') renderDock();
   if (el('drawer').classList.contains('open') && S.bot && S.bot.id === b.id) openDrawer(S.bot);
 }
@@ -540,7 +542,7 @@ async function showHome() {
   put(page, $('h2', { textContent: 'All projects' }), $('div', { className: 'cards' }, projects.map(p => $('button', { className: 'card', onclick: () => p.id === S.team.id ? null : switchTeam(p.id) },
     $('div', { className: 'hd' }, $('span', { className: 'grow', textContent: p.name }), p.id === S.team.id && $('span', { className: 'tag ok', textContent: 'open' })),
     $('div', { className: 'ds', textContent: `${p.client || 'No client'} · ${p.people} ${p.people === 1 ? 'person' : 'people'} · ${p.bots.length ? p.bots.map(b => '@' + b.handle).join(' ') : 'no bots'}` }),
-    p.activity.slice(0, 2).map(a => $('div', { className: 'act', textContent: `${a.bot}: ${a.content}` }))))));
+    p.activity.slice(0, 2).map(a => $('div', { className: 'act' }, md(a.content)))))));
 }
 
 
@@ -807,7 +809,7 @@ async function newChannel() {
 // ---------------------------------------------------------------- conversation
 function stopConv() { if (S.es) { S.es.close(); S.es = null; } S.dockSync = null; clearInterval(S.screenTimer); clearInterval(S.previewTimer); }
 const openBot = async b => openConv(await api('POST', `/bots/${b.id}/dm`), b);
-const openFeed = async b => openConv(await api('GET', `/bots/${b.id}/feed`), b);
+const openProjectFeed = async () => openConv(await api('GET', `/teams/${S.team.id}/feed`), null);
 async function openOverview() {
   const h = await api('GET', '/home');
   S.home = h;
@@ -819,7 +821,7 @@ async function openConv(conv, bot) {
   if (conv.kind === 'home') store.set('tb_last_home', '1');
   else {
     store.set('tb_last_home', null);
-    store.set('tb_last_' + conv.team_id, (conv.kind === 'channel' ? 'ch:' + conv.id : conv.kind + ':' + conv.bot_id));
+    store.set('tb_last_' + conv.team_id, (conv.kind === 'channel' ? 'ch:' + conv.id : conv.kind === 'feed' ? 'feed:project' : conv.kind + ':' + conv.bot_id));
   }
   renderSide(); renderTop(); el('col').replaceChildren(); el('dock').replaceChildren(); el('stage').classList.remove('hero');
   await loadCtx(conv); if (S.conv !== conv) return;
@@ -969,7 +971,7 @@ function renderConv() {
 function updateJump() { const v = el('view'), j = el('jump'); if (j) j.classList.toggle('show', v.scrollHeight - v.scrollTop - v.clientHeight > 300); }
 function heroNode() {
   const c = S.conv, b = S.bot;
-  if (c.kind === 'feed') return $('div', { className: 'herobox', style: 'padding-top:16vh' }, $('p', { textContent: 'No shared activity yet. When this bot finishes a task for someone, a short summary shows up here.' }));
+  if (c.kind === 'feed') return $('div', { className: 'herobox', style: 'padding-top:16vh' }, $('p', { textContent: 'No shared activity yet. When a project bot finishes a task for someone, a short summary shows up here.' }));
   if (c.kind === 'dm' || c.kind === 'home') return $('div', { className: 'herobox' }, avatar(c.name, 'bot lg'), $('h1', { textContent: 'What can I do for you?' }),
     $('p', { textContent: c.kind === 'home' ? 'I can see every project, bot and team chat you have access to.' : ((b && b.instructions.trim().split('\n')[0]) || `${c.name} works on the project computer and remembers what matters.`)}));
   return $('div', { className: 'herobox' }, $('h1', { textContent: '# ' + c.name }), $('p', { textContent: (S.ctx.mem && S.ctx.mem.bots.length) ? 'The bots here reply to every message. Mention one with @ to address only that bot.' : 'There is no bot in this team chat. Type @ to add one.' }));
@@ -1345,27 +1347,44 @@ async function openDrawer(bot, tab = 'setup') {
         hint('Everyone who can use the bot can make requests with its secrets to the bound hosts.'),
         secrets.length ? secrets.map(s => li(s.name, s.hosts ? 'Only sent to ' + s.hosts : 'No host bound yet', del(`/secrets/${s.id}`, 'this secret'))) : none('No secrets.'));
     }
-    const addMcp = async () => { const r = await form({ title: 'New MCP server', intro: 'A streamable-HTTP MCP server. Its tools become tools of this bot.', ok: 'Add', fields: [
-        { name: 'name', label: 'Name', required: true, mono: true, placeholder: 'homey', hint: 'Lowercase letters, digits, - and _.' },
-        { name: 'url', label: 'URL', required: true, mono: true, value: 'https://' },
-        { name: 'trusted', label: 'Trusted', type: 'checkbox', hint: 'Its tools run without an approval card.' },
-        { name: 'auth_mode', label: 'Authentication', type: 'select', value: 'none', options: [{ value: 'none', label: 'None' }, { value: 'token', label: 'API key / token' }] },
-        { name: 'auth_scope', label: 'Token', type: 'select', value: 'user', when: v => v.auth_mode === 'token', options: [{ value: 'user', label: 'Each member connects their own' }, { value: 'shared', label: 'One shared token for the bot' }] },
-        { name: 'auth_header', label: 'Header name', mono: true, value: 'Authorization', when: v => v.auth_mode === 'token', hint: 'e.g. Authorization or X-API-Key.' },
-        { name: 'auth_prefix', label: 'Prefix', mono: true, value: 'Bearer', when: v => v.auth_mode === 'token', hint: 'Joined to the token with a space. Leave empty for a bare API key.' },
-        { name: 'token', label: 'Shared token', type: 'password', when: v => v.auth_mode === 'token' && v.auth_scope === 'shared', required: v => v.auth_mode === 'token' && v.auth_scope === 'shared', hint: 'Stored encrypted. Used for everyone who uses this bot.' },
-      ], onSubmit: v => api('POST', `/bots/${bot.id}/mcp`, v) }); if (r) { toast(r.error || (r.tools.length ? 'Tools: ' + r.tools.join(', ') : 'Saved. Members can connect their own token below.'), r.error ? 'bad' : ''); again(); } };
+    const mcpFields = (srv) => {
+      const oauth = srv && srv.auth_mode === 'oauth';
+      return [
+        { name: 'name', label: 'Name', required: true, mono: true, placeholder: 'homey', hint: 'Lowercase letters, digits, - and _.', value: srv ? srv.name : '' },
+        { name: 'url', label: 'URL', required: true, mono: true, value: srv ? srv.url : 'https://' },
+        { name: 'trusted', label: 'Trusted', type: 'checkbox', hint: 'Its tools run without an approval card.', value: srv ? !!srv.trusted : false },
+        { name: 'auth_mode', label: 'Authentication', type: 'select', value: srv ? (srv.auth_mode || 'none') : 'none', options: [{ value: 'none', label: 'None' }, { value: 'token', label: 'API key / token' }, { value: 'oauth', label: 'OAuth (each member signs in)' }] },
+        { name: 'auth_scope', label: 'Token', type: 'select', value: srv ? (srv.auth_scope || 'user') : 'user', when: v => v.auth_mode === 'token', options: [{ value: 'user', label: 'Each member connects their own' }, { value: 'shared', label: 'One shared token for the bot' }] },
+        { name: 'auth_header', label: 'Header name', mono: true, value: srv ? (srv.auth_header || 'Authorization') : 'Authorization', when: v => v.auth_mode === 'token', hint: 'e.g. Authorization or X-API-Key.' },
+        { name: 'auth_prefix', label: 'Prefix', mono: true, value: srv ? (srv.auth_prefix || 'Bearer') : 'Bearer', when: v => v.auth_mode === 'token', hint: 'Joined to the token with a space. Leave empty for a bare API key.' },
+        { name: 'token', label: 'Shared token', type: 'password', when: v => v.auth_mode === 'token' && v.auth_scope === 'shared', required: v => !srv && v.auth_mode === 'token' && v.auth_scope === 'shared', hint: srv && srv.has_shared_token ? 'Leave empty to keep the stored token. Stored encrypted.' : 'Stored encrypted. Used for everyone who uses this bot.' },
+        { name: '_oauth_note', type: 'note', when: v => v.auth_mode === 'oauth', hint: 'Register this redirect URI with the provider: ' + location.origin + '/api/mcp/oauth/callback' },
+        { name: 'oauth_authorize_url', label: 'Authorize URL', mono: true, when: v => v.auth_mode === 'oauth', required: v => v.auth_mode === 'oauth', placeholder: 'https://accounts.athom.com/oauth2/authorise', value: oauth ? (srv.oauth_authorize_url || '') : '' },
+        { name: 'oauth_token_url', label: 'Token URL', mono: true, when: v => v.auth_mode === 'oauth', required: v => v.auth_mode === 'oauth', placeholder: 'https://api.athom.com/oauth2/token', value: oauth ? (srv.oauth_token_url || '') : '' },
+        { name: 'oauth_client_id', label: 'Client ID', mono: true, when: v => v.auth_mode === 'oauth', required: v => v.auth_mode === 'oauth', value: oauth ? (srv.oauth_client_id || '') : '' },
+        { name: 'oauth_client_secret', label: 'Client secret', type: 'password', when: v => v.auth_mode === 'oauth', hint: srv && srv.has_oauth_secret ? 'Leave empty to keep the stored secret. Stored encrypted; it is never shown again.' : 'Optional for a public (PKCE-only) client. Stored encrypted.' },
+        { name: 'oauth_scopes', label: 'Scopes', mono: true, when: v => v.auth_mode === 'oauth', hint: 'Space-separated, if the provider needs them.', value: oauth ? (srv.oauth_scopes || '') : '' },
+      ];
+    };
+    const addMcp = async () => { const r = await form({ title: 'New MCP server', intro: 'A streamable-HTTP MCP server. Its tools become tools of this bot.', ok: 'Add', fields: mcpFields(), onSubmit: v => api('POST', `/bots/${bot.id}/mcp`, v) }); if (r) { toast(r.error || (r.tools.length ? 'Tools: ' + r.tools.join(', ') : 'Saved. Members can connect their own account below.'), r.error ? 'bad' : ''); again(); } };
+    const editMcp = async (srv) => { const r = await form({ title: 'Edit MCP server', intro: 'Change this server, including its OAuth client id, secret and scopes. The client secret is never shown.', ok: 'Save', fields: mcpFields(srv), onSubmit: v => api('PATCH', `/mcp/${srv.id}`, v) }); if (r) { toast(r.error || 'Saved', r.error ? 'bad' : ''); again(); } };
     const mcpRow = srv => {
+      const isOauth = srv.auth_mode === 'oauth';
       const perUser = srv.auth_mode === 'token' && srv.auth_scope === 'user';
       const tail = [$('span', { className: 'tag', textContent: srv.trusted ? 'trusted' : 'asks first' })];
       if (srv.auth_mode === 'token') tail.push($('span', { className: 'tag', textContent: perUser ? (srv.connected ? 'you: connected' : 'you: not connected') : 'shared token' }));
-      if (perUser) {
+      if (isOauth) tail.push($('span', { className: 'tag', textContent: srv.connected ? 'you: connected' : 'you: not connected' }));
+      if (isOauth) {
+        tail.push($('button', { className: 'btn sm', textContent: srv.connected ? 'Reconnect' : 'Connect', onclick: guard(async () => {
+          const r = await api('GET', `/mcp/${srv.id}/oauth/start`); location.href = r.url; }) }));
+        if (srv.connected) tail.push(ib('x', 'Disconnect', guard(async () => { await api('DELETE', `/mcp/${srv.id}/credential`); toast('Disconnected'); again(); }), 15));
+      } else if (perUser) {
         tail.push($('button', { className: 'btn sm', textContent: srv.connected ? 'Update token' : 'Connect', onclick: guard(async () => {
           const v = await form({ title: `Connect ${srv.name}`, intro: 'Paste your own token for this service. It is stored encrypted and used only for your own requests in this team.', ok: 'Save', fields: [{ name: 'value', label: 'Your token', type: 'password', required: true }], onSubmit: x => api('PUT', `/mcp/${srv.id}/credential`, x) });
           if (v) { toast('Connected'); again(); } }) }));
         if (srv.connected) tail.push(ib('x', 'Disconnect', guard(async () => { await api('DELETE', `/mcp/${srv.id}/credential`); toast('Disconnected'); again(); }), 15));
       }
-      if (manage) tail.push(del(`/mcp/${srv.id}`, 'this server'));
+      if (manage) { tail.push(ib('edit', 'Edit', guard(() => editMcp(srv)), 15)); tail.push(del(`/mcp/${srv.id}`, 'this server')); }
       return li(srv.name, srv.url, ...tail);
     };
     parts.push(head('MCP servers', manage && 'Add', manage ? addMcp : null),
@@ -1384,7 +1403,7 @@ function openPalette() {
   const all = [
     ...S.bots.map(b => ({ g: 'Bots', icon: 'bot', label: b.name, hint: '@' + b.handle, run: () => openBot(b) })),
     ...S.channels.map(c => ({ g: 'Team chats', icon: 'hash', label: c.name, run: () => openConv(c, null) })),
-    ...S.bots.filter(b => b.is_team && b.published).map(b => ({ g: 'Activity', icon: 'pulse', label: b.name + ' activity', run: () => openFeed(b) })),
+    ...(S.team ? [{ g: 'Activity', icon: 'pulse', label: 'Project activity', run: openProjectFeed }] : []),
     ...S.teams.filter(t => !S.team || t.id !== S.team.id).map(t => ({ g: 'Projects', icon: 'grid', label: (t.client ? t.client + ' / ' : '') + t.name, hint: 'Switch', run: () => switchTeam(t.id) })),
     { g: 'Actions', icon: 'grid', label: 'Home', run: showHome },
     { g: 'Actions', icon: 'clock', label: 'Routines', run: showRoutines },
@@ -1418,10 +1437,12 @@ if ('serviceWorker' in navigator) addEventListener('load', () => navigator.servi
 
 // After a sign-in redirect the token (or an error) arrives in the URL fragment; take it, then clean the URL.
 (() => { try { if (!location.hash) return; const h = new URLSearchParams(location.hash.slice(1));
-  const t = h.get('tb_oauth'), e = h.get('tb_oauth_error');
+  const t = h.get('tb_oauth'), e = h.get('tb_oauth_error'), mcp = h.get('mcp');
   if (t) { store.set('tb_token', t); S.token = t; }
   if (e) S.authError = e;
-  if (t || e) history.replaceState(null, '', location.pathname + location.search);
+  if (mcp === 'connected') S.mcpNotice = 'connected';
+  if (mcp === 'error') S.mcpNotice = 'error';
+  if (t || e || mcp) history.replaceState(null, '', location.pathname + location.search);
 } catch (x) { /* ignore */ } })();
 
 boot().catch(e => { document.body.replaceChildren($('div', { id: 'auth' }, $('div', { className: 'authbox' }, $('h1', { textContent: 'TeamBots is not reachable' }), $('p', { textContent: e.message }), $('button', { className: 'btn primary', textContent: 'Try again', onclick: () => location.reload() })))); });
