@@ -60,7 +60,7 @@ const S = { state: IDLE, details: store.get('tb_details') === '1', token: store.
   conv: null, bot: null, page: 'projects', msgs: [], approvals: [], ctx: { skills: [], secrets: [], mem: null }, files: { team: 0, at: 0, list: [] }, drafts: {}, es: null };
 
 async function api(method, path, body) {
-  const r = await fetch('/api' + path, { method, headers: { 'Content-Type': 'application/json', ...(S.token ? { Authorization: 'Bearer ' + S.token } : {}) }, body: body ? JSON.stringify(body) : undefined });
+  const r = await fetch('/api' + path, { method, cache: 'no-store', headers: { 'Content-Type': 'application/json', ...(S.token ? { Authorization: 'Bearer ' + S.token } : {}) }, body: body ? JSON.stringify(body) : undefined });
   const data = await r.json().catch(() => ({}));
   if (r.status === 401 && S.me) { signOut(); throw new Error('Your session ended. Sign in again.'); }
   if (!r.ok) throw Object.assign(new Error(typeof data.detail === 'string' ? data.detail : (data.detail && data.detail.message) || r.statusText || 'Request failed'), { detail: data.detail });
@@ -1211,7 +1211,7 @@ async function openDrawer(bot, tab = 'setup') {
       head('Who can use it'), acc, hint('Collaborators chat with the bot. Managers can also change it, see its secrets list and approve team learnings.'), rows.length ? rows : none('You are the only person in this project.'),
       $('div', { className: 'rowbtns', style: 'margin-top:14px' }, $('button', { className: 'btn primary', textContent: 'Save sharing', onclick: guard(async () => {
         await api('PUT', `/bots/${bot.id}/share`, { published: pub.checked, access: acc.value, members: rows.map(r => r.querySelector('select')).filter(s => s.value).map(s => ({ user_id: +s.dataset.uid, role: s.value })) });
-        bot.published = pub.checked; bot.access = acc.value; renderSide(); renderTop(); toast(pub.checked ? 'Published' : 'Saved as draft'); }) })));
+        bot.published = pub.checked; bot.access = acc.value; renderSide(); renderTop(); toast(pub.checked ? 'Published' : 'Saved as draft'); again(); }) })));
   }
   if (tab === 'knowledge') {
     const [mems, skills] = await Promise.all([get('memories'), get('skills')]);

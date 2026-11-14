@@ -3,7 +3,7 @@ import logging
 import os
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from uvicorn.middleware.proxy_headers import ProxyHeadersMiddleware
@@ -29,6 +29,18 @@ async def lifespan(_: FastAPI):
 app = FastAPI(title="TeamBots", lifespan=lifespan)
 # Honour X-Forwarded-Proto / X-Forwarded-Host when sitting behind Caddy, Brev, cloudflared, etc.
 app.add_middleware(ProxyHeadersMiddleware, trusted_hosts="*")
+
+
+@app.middleware("http")
+async def no_store_api(request: Request, call_next):
+    """Never let a browser or proxy serve a cached API response: a change (a new routine,
+    secret, ...) must show up immediately when the UI re-fetches."""
+    response = await call_next(request)
+    if request.url.path.startswith("/api"):
+        response.headers["Cache-Control"] = "no-store"
+    return response
+
+
 app.include_router(router)
 app.include_router(costs_router)
 app.include_router(tokens_router)
