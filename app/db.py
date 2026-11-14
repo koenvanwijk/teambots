@@ -330,6 +330,8 @@ engine = create_engine(config.DB_URL, connect_args=_connect_args)
 
 def init_db() -> None:
     SQLModel.metadata.create_all(engine)
+    # New columns must exist before any SELECT through the ORM model.
+    _ensure_handoff_columns()
     _ensure_project_activity_feed_index()
     _ensure_channelmember_mention_only()
     _ensure_home_columns()
@@ -338,7 +340,6 @@ def init_db() -> None:
     _ensure_costs_columns()
     _ensure_router_columns()
     _ensure_mcp_auth_columns()
-    _ensure_handoff_columns()
     from .usage import seed_prices
     seed_prices()
     migrate_channel_bots()
