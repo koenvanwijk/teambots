@@ -281,25 +281,35 @@ async def chat(ep: Endpoint, model: str, messages: list[dict], tools: list[dict]
         usage.log_call(endpoint=ep, model=chosen, tokens=tokens, latency_ms=timer.ms(),
                        success=False, error="claude CLI timed out")
         raise LLMError(f"endpoint '{ep.name}': the claude CLI timed out") from e
-    if proc.returncode != 0:
-        detail = (err or b"").decode(errors="replace").strip() or f"exit code {proc.returncode}"
-        usage.log_call(endpoint=ep, model=chosen, tokens=tokens, latency_ms=timer.ms(),
-                       success=False, error=detail[:300])
-        raise LLMError(f"endpoint '{ep.name}': claude CLI failed: {detail[:300]}")
-    try:
-        data = json.loads(out.decode(errors="replace"))
-    except ValueError as e:
+    # Parse the JSON result first: the CLI writes a structured result (with a
+    # helpful message) to stdout even on a non-zero exit — e.g. a rate or spend
+    # limit returns HTTP 429 with exit code 1 and the reason in `result`.
+    out_text = out.decode(errors="replace")
+    data = None
+    if out_text.strip():
+        try:
+            parsed = json.loads(out_text)
+        except ValueError:
+            parsed = None
+        if isinstance(parsed, dict):
+            data = parsed
+    if data is None:
+        # No usable JSON on stdout: fall back to stderr / exit code.
+        if proc.returncode != 0:
+            detail = (err or b"").decode(errors="replace").strip() or f"exit code {proc.returncode}"
+            usage.log_call(endpoint=ep, model=chosen, tokens=tokens, latency_ms=timer.ms(),
+                           success=False, error=detail[:300])
+            raise LLMError(f"endpoint '{ep.name}': claude CLI failed: {detail[:300]}")
         usage.log_call(endpoint=ep, model=chosen, tokens=tokens, latency_ms=timer.ms(),
                        success=False, error="claude CLI returned non-JSON output")
-        raise LLMError(f"endpoint '{ep.name}': claude CLI returned non-JSON output") from e
-    if not isinstance(data, dict):
-        usage.log_call(endpoint=ep, model=chosen, tokens=tokens, latency_ms=timer.ms(),
-                       success=False, error="unexpected claude CLI response")
-        raise LLMError(f"endpoint '{ep.name}': unexpected claude CLI response")
+        raise LLMError(f"endpoint '{ep.name}': claude CLI returned non-JSON output")
     tokens = parse_cli_usage(data)
     result = data.get("result")
-    if data.get("is_error"):
-        reason = result if isinstance(result, str) and result else (data.get("subtype") or "claude CLI error")
+    # A non-zero exit or an is_error flag both mean failure; prefer the CLI's own
+    # message (the spend-limit text, a model error, ...) over a bare exit code.
+    if data.get("is_error") or proc.returncode != 0:
+        reason = result if isinstance(result, str) and result else (
+            data.get("subtype") or f"claude CLI error (exit code {proc.returncode})")
         usage.log_call(endpoint=ep, model=chosen, tokens=tokens, latency_ms=timer.ms(),
                        success=False, error=str(reason)[:300],
                        reported_cost_usd=tokens.get("cost_usd"))

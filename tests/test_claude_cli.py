@@ -44,6 +44,13 @@ if model == "boom":
                        "result": "You've hit your spend limit",
                        "usage": usage}}))
     sys.exit(0)
+if model == "limited":
+    # Real spend/rate limit: JSON on stdout with is_error AND a non-zero exit code.
+    print(json.dumps({{"is_error": True, "subtype": "success",
+                       "api_error_status": 429,
+                       "result": "You've hit your individual spend limit. Fable limit resets Nov 17.",
+                       "usage": usage}}))
+    sys.exit(1)
 if model == "tools":
     print(json.dumps({{"is_error": False, "subtype": "success",
                        "total_cost_usd": 0.0123,
@@ -170,6 +177,16 @@ def test_chat_nonzero_exit_raises_with_stderr(mod):
     with pytest.raises(LLMError) as ei:
         asyncio.run(mod.chat(_ep(), "crash", [{"role": "user", "content": "hi"}]))
     assert "kaboom" in str(ei.value)
+
+
+def test_chat_nonzero_exit_with_json_surfaces_result(mod):
+    # A spend/rate limit exits non-zero but still prints the reason as JSON: show it,
+    # not a bare "exit code 1".
+    from app.llm import LLMError
+    with pytest.raises(LLMError) as ei:
+        asyncio.run(mod.chat(_ep(), "limited", [{"role": "user", "content": "hi"}]))
+    msg = str(ei.value)
+    assert "spend limit" in msg and "exit code" not in msg
 
 
 def test_chat_non_json_raises(mod):
