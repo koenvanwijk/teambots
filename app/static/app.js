@@ -1216,7 +1216,7 @@ function closeDrawer() { const d = el('drawer'); if (d) { d.classList.remove('op
 async function openDrawer(bot, tab = 'setup') {
   const p = el('drawer'), manage = bot.role !== 'collaborator', again = t => openDrawer(bot, t || tab);
   clearInterval(S.screenTimer); clearInterval(S.previewTimer);
-  const tabs = [['setup', 'Setup'], manage && bot.is_team && ['sharing', 'Sharing'], ['knowledge', 'Memory and skills'], ['routines', 'Routines'], manage && ['connections', 'Secrets and tools'], bot.computer_use && ['screen', 'Screen']].filter(Boolean);
+  const tabs = [['setup', 'Setup'], manage && bot.is_team && ['sharing', 'Sharing'], ['knowledge', 'Memory and skills'], ['routines', 'Routines'], manage && ['connections', 'Secrets and tools']].filter(Boolean);
   const body = $('div', { className: 'dbody' });
   // A live screen preview above the tabs, refreshed every 5s. Each bot has its own screen on
   // the project computer, so this shows only when the bot has computer use.
@@ -1307,12 +1307,6 @@ async function openDrawer(bot, tab = 'setup') {
       secrets.length ? secrets.map(s => li(s.name, s.hosts ? 'Only sent to ' + s.hosts : 'No host bound yet', del(`/secrets/${s.id}`, 'this secret'))) : none('No secrets.'),
       head('MCP servers', 'Add', async () => { const r = await form({ title: 'New MCP server', intro: 'A streamable-HTTP MCP server. Its tools become tools of this bot.', ok: 'Connect', fields: [{ name: 'name', label: 'Name', required: true, mono: true, placeholder: 'tickets', hint: 'Lowercase letters, digits, - and _.' }, { name: 'url', label: 'URL', required: true, mono: true, value: 'http://localhost:9000/mcp' }, { name: 'trusted', label: 'Trusted', type: 'checkbox', hint: 'Its tools run without an approval card.' }], onSubmit: v => api('POST', `/bots/${bot.id}/mcp`, v) }); if (r) { toast(r.error || (r.tools.length ? 'Tools: ' + r.tools.join(', ') : 'Connected, but the server lists no tools'), r.error ? 'bad' : ''); again(); } }),
       mcp.length ? mcp.map(s => li(s.name, s.url, $('span', { className: 'tag', textContent: s.trusted ? 'trusted' : 'asks first' }), del(`/mcp/${s.id}`, 'this server'))) : none('No MCP servers.'));
-  }
-  if (tab === 'screen') {
-    const img = $('img', { className: 'shot', alt: 'Live view of the bot screen' }), note = hint('Loading…');
-    const tick = () => { const n = new Image(); n.onload = () => { img.src = n.src; note.textContent = 'Live view, refreshed every 3 seconds. Everyone who can use this bot can watch.'; }; n.onerror = () => { note.textContent = 'The screen is not available. It needs the Docker sandbox.'; }; n.src = withToken(`/bots/${bot.id}/screen.jpg?t=${Date.now()}`); };
-    const open = $('button', { className: 'btn sm', title: 'Interactive screen with mouse and keyboard, for example to sign in to the browser yourself', onclick: () => window.open(withToken(`/bots/${bot.id}/screen/vnc/`), '_blank', 'noopener') }, icon('screen', 14), 'Open scherm');
-    put(body, $('h4', {}, 'Screen', open), img, note); tick(); S.screenTimer = setInterval(tick, 3000);
   }
 }
 
