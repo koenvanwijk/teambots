@@ -145,6 +145,26 @@ def test_parse_tool_reply():
     assert claude_cli.parse_tool_reply('{"tool_calls": [{"name": "nope"}]}', tools) == []
 
 
+def test_parse_tool_reply_accepts_native_invoke_format():
+    # Claude sometimes ignores the JSON protocol and emits its own tool-call text instead; if we
+    # do not parse it, the raw markup leaks into the chat and the call never runs.
+    from app import claude_cli
+    tools = [{"type": "function", "function": {"name": "run_command"}}]
+    leaked = ('<invoke name="run_command">\n'
+              '<parameter name="command">ls -la /tmp && cat /tmp/x.md</parameter>\n'
+              '</invoke>\n'
+              '</tool_calls>')
+    calls = claude_cli.parse_tool_reply(leaked, tools)
+    assert len(calls) == 1 and calls[0]["function"]["name"] == "run_command"
+    assert json.loads(calls[0]["function"]["arguments"])["command"] == "ls -la /tmp && cat /tmp/x.md"
+    # A value that is itself JSON is typed, not left as a string.
+    typed = claude_cli.parse_tool_reply(
+        '<invoke name="run_command"><parameter name="timeout">30</parameter></invoke>', tools)
+    assert json.loads(typed[0]["function"]["arguments"])["timeout"] == 30
+    # An <invoke> for a tool that was not offered is dropped, same as the JSON path.
+    assert claude_cli.parse_tool_reply('<invoke name="nope"><parameter name="x">1</parameter></invoke>', tools) == []
+
+
 def test_chat_success_passes_model_system_and_stdin(mod):
     out = asyncio.run(mod.chat(_ep(), "sonnet",
                                [{"role": "system", "content": "sys here"},

@@ -171,10 +171,19 @@ def parse_cli_usage(data: dict | None) -> dict:
     }
 
 
-def parse_tool_reply(text: str, tools: list[dict] | None) -> list[dict]:
-    """If the model answered with the JSON tool protocol, return OpenAI-style tool_calls."""
-    if not tools or not (text or "").strip():
-        return []
+def _tool_names(tools: list[dict]) -> set:
+    allowed = set()
+    for t in tools or []:
+        fn = t.get("function") if isinstance(t, dict) else None
+        if not isinstance(fn, dict):
+            fn = t if isinstance(t, dict) else {}
+        if fn.get("name"):
+            allowed.add(fn["name"])
+    return allowed
+
+
+def _json_calls(text: str) -> list:
+    """The tool protocol we ask for: {"tool_calls": [{"name", "arguments"}]} (optionally fenced)."""
     raw = text.strip()
     fence = re.match(r"^```(?:json)?\s*([\s\S]*?)\s*```$", raw)
     if fence:
@@ -195,17 +204,40 @@ def parse_tool_reply(text: str, tools: list[dict] | None) -> list[dict]:
     calls = data.get("tool_calls") or data.get("toolCalls")
     if data.get("name") and not calls:
         calls = [data]
-    if not isinstance(calls, list) or not calls:
-        return []
-    allowed = set()
-    for t in tools:
-        fn = t.get("function") if isinstance(t, dict) else None
-        if not isinstance(fn, dict):
-            fn = t if isinstance(t, dict) else {}
-        if fn.get("name"):
-            allowed.add(fn["name"])
+    return calls if isinstance(calls, list) else []
+
+
+_INVOKE_RE = re.compile(r'<invoke\s+name="([^"]+)"\s*>(.*?)</invoke>', re.S)
+_PARAM_RE = re.compile(r'<parameter\s+name="([^"]+)"\s*>(.*?)</parameter>', re.S)
+
+
+def _invoke_calls(text: str) -> list:
+    """Claude's own native tool-call text, which it emits instead of the JSON protocol often
+    enough that we must accept it too:
+        <invoke name="TOOL"><parameter name="k">v</parameter>...</invoke>
+    Otherwise the raw markup leaks into the chat and the call never runs."""
     out = []
-    for i, c in enumerate(calls):
+    for name, body in _INVOKE_RE.findall(text or ""):
+        args = {}
+        for key, val in _PARAM_RE.findall(body):
+            val = val.strip()
+            try:                     # a value may itself be JSON (number, bool, list, object)
+                args[key] = json.loads(val)
+            except ValueError:
+                args[key] = val
+        out.append({"name": name.strip(), "arguments": args})
+    return out
+
+
+def parse_tool_reply(text: str, tools: list[dict] | None) -> list[dict]:
+    """Turn a model reply into OpenAI-style tool_calls, accepting either the JSON tool protocol
+    or Claude's native <invoke> text format."""
+    if not tools or not (text or "").strip():
+        return []
+    allowed = _tool_names(tools)
+    calls = _json_calls(text) or _invoke_calls(text)
+    out = []
+    for c in calls:
         if not isinstance(c, dict):
             continue
         fn = c.get("function") if isinstance(c.get("function"), dict) else c
