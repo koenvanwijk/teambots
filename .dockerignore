@@ -1,0 +1,21 @@
+# Keep the build context small and free of secrets/state.
+.git
+.github
+.venv
+.local-deps
+data/
+logs/
+*.db
+*.sqlite*
+__pycache__/
+*.pyc
+.pytest_cache/
+.env
+.env.*
+!.env.example
+deploy/
+docs/
+scripts/
+tests/
+*.md
+start.ps1
