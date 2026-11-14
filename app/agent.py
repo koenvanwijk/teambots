@@ -586,9 +586,11 @@ async def _run_locked(conv_id: int, bot_id: int, requester_id: int, run: Run | N
         messages = [{"role": "system", "content": system_prompt(bot, conv, user, ctx)}] + build_history(conv, bot, run=run)
         common = dict(author_bot_id=bot_id, requester_id=requester_id)
         from . import usage
+        from . import llm_router
         origin = (usage.current().origin if usage.current() else None) or ("overview" if bot.is_home else "chat")
         if "usage_first" not in locals():
             usage_first = True
+            llm_router.begin_turn()
             block = usage.should_block(bot.team_id)
             if block:
                 _post(conv_id, role="assistant", content=block, **common)
@@ -611,7 +613,9 @@ async def _run_locked(conv_id: int, bot_id: int, requester_id: int, run: Run | N
         if not calls and not text:
             text = "The model returned no text. Please try again."
         msg = _post(conv_id, role="assistant", content=text if not calls else (reply["content"] or ""),
-                    tool_calls=json.dumps(calls) if calls else "", **common)
+                    tool_calls=json.dumps(calls) if calls else "",
+                    route=reply.get("route_label") or reply.get("route") or "",
+                    route_reason=reply.get("route_reason") or "", **common)
         if not calls:
             await share_activity(conv, bot, user, ep)
             return
@@ -675,8 +679,12 @@ async def share_activity(conv: Conversation, bot: Bot, user: User, ep: Endpoint)
     transcript = (f"Request: {turn[0].content[:1500]}\nTools used: {', '.join(tools)}\n"
                   f"Final answer: {turn[-1].content[:2000]}")
     try:
-        reply = await llm.chat(ep, bot.model, [{"role": "system", "content": FEED_PROMPT},
-                                               {"role": "user", "content": transcript}])
+        from . import usage as _usage
+        from . import llm_router as _llm_router
+        _llm_router.begin_turn()
+        with _usage.bind(origin="feed", route_hint="simple"):
+            reply = await llm.chat(ep, bot.model, [{"role": "system", "content": FEED_PROMPT},
+                                                   {"role": "user", "content": transcript}])
     except llm.LLMError as e:
         log.warning("activity summary failed: %s", e)
         return
@@ -695,7 +703,9 @@ async def run_subagent(ctx: Ctx, message: str, asked_by: str) -> str:
     messages = [{"role": "system", "content": system_prompt(bot, conv, user, ctx)},
                 {"role": "user", "content": f"[handed over by bot {asked_by}, working for {user.display_name}]\n{message}"}]
     from . import usage
+    from . import llm_router
     first = True
+    llm_router.begin_turn()
     for _ in range(config.MAX_STEPS):
         try:
             with usage.bind(origin="ask_bot", user_id=ctx.requester_id, team_id=bot.team_id,
@@ -810,9 +820,13 @@ async def _classify(key: Key, content: str) -> str:
         return "steer"
     task = earlier[0].content[:1500] if earlier else "(unknown)"
     try:
-        reply = await asyncio.wait_for(llm.chat(ep, bot.model, [
-            {"role": "system", "content": ROUTE_PROMPT},
-            {"role": "user", "content": f"Work in progress: {task}\n\nNew message: {content[:1500]}"}]), 20)
+        from . import usage as _usage
+        from . import llm_router as _llm_router
+        _llm_router.begin_turn()
+        with _usage.bind(route_hint="simple"):
+            reply = await asyncio.wait_for(llm.chat(ep, bot.model, [
+                {"role": "system", "content": ROUTE_PROMPT},
+                {"role": "user", "content": f"Work in progress: {task}\n\nNew message: {content[:1500]}"}]), 20)
     except (llm.LLMError, asyncio.TimeoutError):
         return "steer"
     answer = reply["content"].upper()

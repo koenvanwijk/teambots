@@ -23,6 +23,13 @@ LLM_TIMEOUT = float(os.environ.get("TB_LLM_TIMEOUT", "180"))
 # too low a cap yields an empty visible answer.
 LLM_MAX_TOKENS = int(os.environ.get("TB_MAX_TOKENS", "8192"))
 
+# --- Claude CLI provider. Shells out to the local `claude` binary in
+# headless mode; it authenticates with its own stored Claude Code credentials, so
+# the endpoint carries no API key. CLAUDE_CLI_CWD is a neutral directory kept apart
+# from any repo so the CLI does not pick up a project's CLAUDE.md, settings or hooks.
+CLAUDE_CLI_BIN = os.environ.get("TB_CLAUDE_CLI", "claude")
+CLAUDE_CLI_CWD = os.environ.get("TB_CLAUDE_CLI_CWD", os.path.join(DATA_DIR, "claude-cli-cwd"))
+
 # --- Sign in with GitHub or Google (OAuth2 / OIDC).
 # A provider is enabled when both its client id and secret are set.
 # TB_PUBLIC_URL is the browser-facing base URL; it builds the OAuth redirect URI and must match

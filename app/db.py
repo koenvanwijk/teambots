@@ -89,13 +89,14 @@ class Endpoint(SQLModel, table=True):
     owner_id: int
     shared: bool = False  # usable by every team member when creating bots
     name: str
-    base_url: str  # display / OpenAI base; for Copilot, the fallback API host
-    api_key_enc: str = ""  # OpenAI key, or GitHub OAuth token for github_copilot
+    base_url: str  # display / OpenAI base; for Copilot, the fallback API host; empty for claude_cli
+    api_key_enc: str = ""  # OpenAI key, or GitHub OAuth token for github_copilot; empty for claude_cli
     default_model: str
-    provider: str = "openai"  # openai | github_copilot
+    provider: str = "openai"  # openai | github_copilot | claude_cli | router
     github_domain: str = ""  # github.com or org.ghe.com; unused for openai
     models_json: str = ""  # last successful /models list, cached for the UI
     models_fetched_at: Optional[datetime] = None
+    rules_json: str = ""  # router rules (JSON); unused for other providers
 
 
 class Bot(SQLModel, table=True):
@@ -113,6 +114,7 @@ class Bot(SQLModel, table=True):
     approval_mode: str = "ask"  # ask | auto
     computer_use: bool = False  # own screen + mouse/keyboard tools; needs a model with image input
     is_home: bool = False  # per-user overview bot; not tied to a project (team_id is 0)
+    local_only: bool = False  # router must keep this bot on a local (Spark) route
 
 
 class BotAccess(SQLModel, table=True):
@@ -167,11 +169,13 @@ class LlmUsage(SQLModel, table=True):
     error: str = ""
     retry: bool = False
     origin: str = "chat"  # chat, routine, ask_bot, voice, overview, test, feed, route
-    billing_mode: str = "token"  # token | premium_request | zero | electricity
+    billing_mode: str = "token"  # token | premium_request | zero | electricity | subscription
     premium_requests: float = 0
     cost_usd: Optional[float] = None
     cost_unknown: bool = False
     notes: str = ""
+    route: str = ""  # router destination name, when a Router chose this call
+    route_reason: str = ""
 
 
 class ModelPrice(SQLModel, table=True):
@@ -207,6 +211,8 @@ class Message(SQLModel, table=True):
     tool_call_id: str = ""
     image_path: str = ""  # screenshot that belongs to a tool result
     created_at: datetime = Field(default_factory=now)
+    route: str = ""  # short router label shown on the step line, when present
+    route_reason: str = ""
 
 
 class Memory(SQLModel, table=True):
@@ -292,6 +298,7 @@ def init_db() -> None:
     _ensure_endpoint_provider_columns()
     _ensure_oauth_columns()
     _ensure_costs_columns()
+    _ensure_router_columns()
     from .usage import seed_prices
     seed_prices()
     migrate_channel_bots()
@@ -361,6 +368,31 @@ def _ensure_endpoint_provider_columns() -> None:
             conn.exec_driver_sql("ALTER TABLE endpoint ADD COLUMN models_json VARCHAR DEFAULT ''")
         if "models_fetched_at" not in cols:
             conn.exec_driver_sql("ALTER TABLE endpoint ADD COLUMN models_fetched_at DATETIME")
+        conn.commit()
+
+
+
+def _ensure_router_columns() -> None:
+    """Router rules, local-only bots, and route labels on older databases."""
+    if not config.DB_URL.startswith("sqlite"):
+        return
+    with engine.connect() as conn:
+        ep_cols = [r[1] for r in conn.exec_driver_sql("PRAGMA table_info(endpoint)").fetchall()]
+        if "rules_json" not in ep_cols:
+            conn.exec_driver_sql("ALTER TABLE endpoint ADD COLUMN rules_json VARCHAR DEFAULT ''")
+        bot_cols = [r[1] for r in conn.exec_driver_sql("PRAGMA table_info(bot)").fetchall()]
+        if "local_only" not in bot_cols:
+            conn.exec_driver_sql("ALTER TABLE bot ADD COLUMN local_only BOOLEAN NOT NULL DEFAULT 0")
+        usage_cols = [r[1] for r in conn.exec_driver_sql("PRAGMA table_info(llmusage)").fetchall()]
+        if "route" not in usage_cols:
+            conn.exec_driver_sql("ALTER TABLE llmusage ADD COLUMN route VARCHAR DEFAULT ''")
+        if "route_reason" not in usage_cols:
+            conn.exec_driver_sql("ALTER TABLE llmusage ADD COLUMN route_reason VARCHAR DEFAULT ''")
+        msg_cols = [r[1] for r in conn.exec_driver_sql("PRAGMA table_info(message)").fetchall()]
+        if "route" not in msg_cols:
+            conn.exec_driver_sql("ALTER TABLE message ADD COLUMN route VARCHAR DEFAULT ''")
+        if "route_reason" not in msg_cols:
+            conn.exec_driver_sql("ALTER TABLE message ADD COLUMN route_reason VARCHAR DEFAULT ''")
         conn.commit()
 
 

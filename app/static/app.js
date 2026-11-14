@@ -92,6 +92,7 @@ function form({ title, intro, fields, ok = 'Save', onSubmit }) {
     const needed = (f, v) => typeof f.required === 'function' ? !!f.required(v) : !!f.required;
     const rows = fields.map(f => {
       let input;
+      if (f.type === 'note') { inputs[f.name] = { value: '', focus() {} }; return $('p', { className: 'intro', textContent: f.hint }); }
       if (f.type === 'textarea') input = $('textarea', { rows: f.rows || 4, value: f.value || '', placeholder: f.placeholder || '' });
       else if (f.type === 'select') input = $('select', {}, f.options.map(o => $('option', { value: o.value, textContent: o.label, selected: o.value === f.value })));
       else if (f.type === 'checkbox') input = $('input', { type: 'checkbox', checked: !!f.value });
@@ -372,22 +373,33 @@ async function renameProject() {
   Object.assign(t, v); renderSide(); if (!S.conv) showHome();
 }
 function isCopilot(v) { return (v.provider || 'openai') === 'github_copilot'; }
+function isClaudeCli(v) { return (v.provider || 'openai') === 'claude_cli'; }
+function isRouter(v) { return (v.provider || 'openai') === 'router'; }
 function endpointFields(e) {
   return [
     { name: 'name', label: 'Name', required: true, value: e ? e.name : '', placeholder: 'dgx-spark' },
     { name: 'provider', label: 'Provider', type: 'select', value: (e && e.provider) || 'openai', options: [
       { value: 'openai', label: 'OpenAI-compatible' },
-      { value: 'github_copilot', label: 'GitHub Copilot' }] },
-    { name: 'base_url', label: 'Base URL', required: true, value: (e && e.base_url) || 'http://localhost:8000/v1', mono: true, when: v => !isCopilot(v) },
+      { value: 'github_copilot', label: 'GitHub Copilot' },
+      { value: 'claude_cli', label: 'Claude CLI (local)' },
+      { value: 'router', label: 'Router (rules pick the model)' }] },
+    { name: 'base_url', label: 'Base URL', required: true, value: (e && e.base_url) || 'http://localhost:8000/v1', mono: true, when: v => !isCopilot(v) && !isClaudeCli(v) && !isRouter(v) },
     { name: 'github_domain', label: 'GitHub domain', required: true, value: (e && e.github_domain) || 'github.com', mono: true,
       hint: 'github.com, or a data-residency tenant such as org.ghe.com.', when: isCopilot },
-    { name: 'default_model', label: 'Default model', required: true, value: e ? e.default_model : '', mono: true, placeholder: 'claude-sonnet-5' },
-    { name: 'api_key', label: e ? 'New token / API key' : 'Token / API key', type: 'password', required: v => !e && isCopilot(v),
+    { name: 'default_model', label: 'Default model', required: v => !isRouter(v), value: e ? (e.default_model || (isRouter(e) ? 'auto' : '')) : '', mono: true, placeholder: 'claude-sonnet-5',
+      hint: 'For Claude CLI, an alias like fable, haiku, sonnet or opus. For a Router, auto (rules decide) or a route name.' },
+    { name: 'api_key', label: e ? 'New token / API key' : 'Token / API key', type: 'password', required: v => !e && isCopilot(v), when: v => !isClaudeCli(v) && !isRouter(v),
       hint: e && e.has_key ? 'Leave empty to keep the stored key.' : 'For Copilot, a GitHub OAuth token (ghu_…). Otherwise optional. Stored encrypted, never shown again.' },
+    { name: 'cli_note', label: 'Claude CLI', type: 'note', when: isClaudeCli,
+      hint: 'Runs the local claude binary with its own Claude Code login. TeamBots tools are sent through a JSON protocol (the CLI itself is not given host tools). Every bot shares that one account and its limits.' },
+    { name: 'router_note', label: 'Router', type: 'note', when: isRouter,
+      hint: 'Each request is sent to Spark or a Copilot / Claude CLI model based on editable rules (privacy, length, tools, budget, fallbacks). Existing bots are not switched automatically. Edit the rules after you add the endpoint.' },
     { name: 'shared', label: 'Share with the project', type: 'checkbox', value: e && e.shared, hint: 'Other members can use this endpoint for their bots.' },
   ];
 }
 function endpointPayload(v) {
+  delete v.cli_note; delete v.router_note;
+  if (isClaudeCli(v) || isRouter(v)) { delete v.base_url; delete v.github_domain; delete v.api_key; if (isRouter(v) && !v.default_model) v.default_model = 'auto'; return v; }
   if (!v.api_key) delete v.api_key;
   if (isCopilot(v)) delete v.base_url; else delete v.github_domain;
   return v;
@@ -396,6 +408,31 @@ async function editEndpoint(e) {
   const r = await form({ title: 'Edit endpoint', fields: endpointFields(e),
     onSubmit: v => api('PATCH', `/endpoints/${e.id}`, endpointPayload(v)) });
   if (r) { await loadTeam(); toast('Saved'); }
+}
+async function editRouterRules(e) {
+  let rules = e.rules;
+  if (!rules) {
+    try { rules = await api('GET', `/teams/${S.team.id}/router-defaults`); } catch (err) { toast(err.message, 'bad'); return; }
+  }
+  const area = $('textarea', { className: 'mono', rows: 22, value: JSON.stringify(rules, null, 2), style: 'width:100%;min-height:320px' });
+  const err = $('div', { className: 'err' });
+  const d = openDialog('wide', $('div', { className: 'pad' },
+    $('h2', { textContent: 'Router rules' }),
+    $('p', { className: 'intro', textContent: 'Each request is sent to the first working route in the matching policy list. privacy is for local-only bots and secrets; simple for short or test work; heavy for tools, long context or hard keywords; budget_80 steers cheaper; budget_100_block is only local if blocking is on.' }),
+    area, err,
+    $('div', { className: 'dfoot' },
+      $('button', { className: 'btn', textContent: 'Load project defaults', onclick: guard(async () => {
+        try { const r = await api('GET', `/teams/${S.team.id}/router-defaults`); area.value = JSON.stringify(r, null, 2); err.textContent = ''; }
+        catch (x) { err.textContent = x.message; }
+      }) }),
+      $('button', { className: 'btn primary', textContent: 'Save rules', onclick: guard(async () => {
+        try { JSON.parse(area.value); } catch (x) { err.textContent = 'That is not valid JSON.'; return; }
+        try {
+          await api('PATCH', `/endpoints/${e.id}`, { rules_json: area.value });
+          d.close(); await loadTeam(); toast('Rules saved');
+        } catch (x) { err.textContent = x.message; }
+      }) }),
+      $('button', { className: 'btn', textContent: 'Close', onclick: () => d.close() }))));
 }
 async function newProject() {
   await form({ title: 'New project', intro: 'A project is a workspace with its own people, bots and one shared computer.', ok: 'Create project',
@@ -602,6 +639,7 @@ async function showCosts() {
       $('h2', { textContent: 'Per model' }), table(['Model', 'Provider', 'Calls', 'Cost'], (data.by_model || []).map(r => [r.model, r.provider, r.calls, moneyCell(r)])),
       $('h2', { textContent: 'Per endpoint' }), table(['Endpoint', 'Calls', 'Cost'], (data.by_endpoint || []).map(r => [r.name, r.calls, moneyCell(r)])),
       $('h2', { textContent: 'Per origin' }), table(['Origin', 'Calls', 'Cost'], (data.by_origin || []).map(r => [r.origin, r.calls, moneyCell(r)])),
+      (data.by_route && data.by_route.length ? [$('h2', { textContent: 'Per route' }), table(['Route', 'Calls', 'Cost'], data.by_route.map(r => [r.route, r.calls, moneyCell(r)]))] : []),
       $('h2', { textContent: 'Most expensive conversations' }), table(['Conversation', 'Calls', 'Cost'], (data.expensive_conversations || []).map(r => [r.name, r.calls, moneyCell(r)])),
       settingsBox);
   };
@@ -636,15 +674,19 @@ async function showCosts() {
 
 // ---------------------------------------------------------------- create things
 async function newEndpoint() {
-  const e = await form({ title: 'New endpoint', intro: 'An OpenAI-compatible chat completions API, or GitHub Copilot. The model needs tool calling.', ok: 'Add endpoint',
+  const e = await form({ title: 'New endpoint', intro: 'An OpenAI-compatible chat completions API, GitHub Copilot, the local Claude CLI, or a Router that picks a model per request. The model needs tool calling (the Claude CLI uses a JSON fallback).', ok: 'Add endpoint',
     fields: endpointFields(null), onSubmit: v => api('POST', `/teams/${S.team.id}/endpoints`, endpointPayload(v)) });
   if (!e) return;
   await loadTeam(); if (!S.conv) showHome();
+  if (isRouter(e)) {
+    toast('Router added. Existing bots were not switched.');
+    return editRouterRules(e);
+  }
   const t = await api('POST', `/endpoints/${e.id}/test`);
   toast(t.reachable && t.tool_calling ? `${e.name} works, tool calling included` : `${e.name}: ${t.detail}`, t.reachable && t.tool_calling ? '' : 'bad');
 }
 function endpointDialog(e) {
-  const out = $('div', { className: 'err' }), mine = e.owner_id === S.me.id, copilot = isCopilot(e);
+  const out = $('div', { className: 'err' }), mine = e.owner_id === S.me.id, copilot = isCopilot(e), cli = isClaudeCli(e), router = isRouter(e);
   const test = $('button', { className: 'btn', textContent: 'Test connection', onclick: async () => { test.disabled = true; out.style.color = 'var(--muted)'; out.textContent = 'Testing…';
     try { const t = await api('POST', `/endpoints/${e.id}/test`); const good = t.reachable && t.tool_calling; out.style.color = good ? 'var(--ok)' : 'var(--bad)'; out.textContent = good ? 'Reachable, and the model calls tools.' : !t.reachable ? 'Not reachable: ' + t.detail : 'Reachable, but no tool calling: ' + t.detail; }
     catch (x) { out.style.color = 'var(--bad)'; out.textContent = x.message; } test.disabled = false; } });
@@ -660,15 +702,18 @@ function endpointDialog(e) {
   }});
   const d = openDialog('', $('div', { className: 'pad' }, $('h2', { textContent: e.name }),
     $('dl', { className: 'kv', style: 'margin-top:14px' },
-      $('dt', { textContent: 'Provider' }), $('dd', { textContent: copilot ? 'GitHub Copilot' : 'OpenAI-compatible' }),
-      copilot ? [$('dt', { textContent: 'GitHub domain' }), $('dd', { className: 'mono', textContent: e.github_domain || 'github.com' })]
+      $('dt', { textContent: 'Provider' }), $('dd', { textContent: router ? 'Router' : cli ? 'Claude CLI (local)' : copilot ? 'GitHub Copilot' : 'OpenAI-compatible' }),
+      cli || router ? [] : copilot ? [$('dt', { textContent: 'GitHub domain' }), $('dd', { className: 'mono', textContent: e.github_domain || 'github.com' })]
               : [$('dt', { textContent: 'Base URL' }), $('dd', { className: 'mono', textContent: e.base_url })],
-      $('dt', { textContent: 'Default model' }), $('dd', { className: 'mono', textContent: e.default_model }),
-      $('dt', { textContent: copilot ? 'GitHub token' : 'API key' }), $('dd', { textContent: e.has_key ? 'Stored (hidden)' : 'None' }),
+      $('dt', { textContent: 'Default model' }), $('dd', { className: 'mono', textContent: e.default_model || (router ? 'auto' : '') }),
+      cli || router ? [] : [$('dt', { textContent: copilot ? 'GitHub token' : 'API key' }), $('dd', { textContent: e.has_key ? 'Stored (hidden)' : 'None' })],
+      router && e.rules ? [$('dt', { textContent: 'Routes' }), $('dd', { textContent: (e.rules.routes || []).map(r => r.name + (r.model ? ' · ' + r.model : '')).join(', ') })] : [],
       $('dt', { textContent: 'Sharing' }), $('dd', { textContent: e.shared ? 'Everyone in the project' : 'Only you' })),
     mine ? out : $('div', { className: 'err muted', textContent: 'Only the person who added this endpoint can test or remove it.' }),
     $('div', { className: 'dfoot' }, mine && $('button', { className: 'btn danger', textContent: 'Remove', onclick: guard(async () => { if (!await confirmBox({ title: 'Remove endpoint?', text: `"${e.name}" is removed for everyone. Bots must be moved to another endpoint first.`, ok: 'Remove', danger: true })) return; await api('DELETE', `/endpoints/${e.id}`); d.close(); await loadTeam(); }) }),
-      mine && $('button', { className: 'btn', textContent: 'Edit', onclick: () => { d.close(); guard(editEndpoint)(e); } }), mine && test, mine && modelsBtn, $('button', { className: 'btn primary', textContent: 'Done', onclick: () => d.close() }))));
+      mine && $('button', { className: 'btn', textContent: 'Edit', onclick: () => { d.close(); guard(editEndpoint)(e); } }),
+      mine && router && $('button', { className: 'btn', textContent: 'Edit rules', onclick: () => { d.close(); guard(editRouterRules)(e); } }),
+      mine && test, mine && modelsBtn, $('button', { className: 'btn primary', textContent: 'Done', onclick: () => d.close() }))));
 }
 async function newBot() {
   if (!S.endpoints.length) { toast('Add a model endpoint first'); return newEndpoint(); }
@@ -824,7 +869,8 @@ function blocks() {
     if (dn !== day) { flush(); if (day || dn !== new Date().toDateString()) out.push({ key: 'd' + dn, sig: '', make: () => $('div', { className: 'daysep', textContent: dayName(d) }) }); day = dn; }
     if (m.content) { flush(); working = false; const note = m.role === 'user' ? deliveryNote(m) : null; out.push({ key: 'm' + m.id, sig: note ? note[0] : '', make: () => msgNode(m, note) }); }
     if (m.tool_calls.length) {
-      if (!group || group.bot !== m.author_bot_id) { flush(); group = { id: m.id, bot: m.author_bot_id, author: m.author, calls: [] }; }
+      if (!group || group.bot !== m.author_bot_id) { flush(); group = { id: m.id, bot: m.author_bot_id, author: m.author, route: m.route, route_reason: m.route_reason, calls: [] }; }
+      else if (m.route && !group.route) { group.route = m.route; group.route_reason = m.route_reason; }
       for (const tc of m.tool_calls) { seen.add(tc.id); group.calls.push({ tc, r: res.get(tc.id), a: appr.get(tc.id) }); }
     }
   }
@@ -867,7 +913,7 @@ function msgNode(m, note) {
   }
   const direct = c.kind === 'dm' || c.kind === 'home';
   const body = $('div', { className: 'body' }, md(m.content)), done = ib('copy', 'Copy', async e => { const btn = e.currentTarget; await copyText(m.content); btn.replaceChildren(icon('check')); setTimeout(() => btn.replaceChildren(icon('copy')), 1500); }, 15);
-  return $('div', { className: 'msg bot' + (/^Endpoint error: /.test(m.content) ? ' error' : '') }, !direct && $('div', { className: 'who' }, avatar(m.author, 'bot'), m.author, time), body, $('div', { className: 'acts' }, done, direct && $('span', { className: 'muted', style: 'font-size:12px;align-self:center;margin-left:4px', textContent: clock(when) })));
+  return $('div', { className: 'msg bot' + (/^Endpoint error: /.test(m.content) ? ' error' : '') }, !direct && $('div', { className: 'who' }, avatar(m.author, 'bot'), m.author, time), body, $('div', { className: 'acts' }, m.route && $('span', { className: 'route-tag', textContent: m.route, title: m.route_reason || '' }), done, direct && $('span', { className: 'muted', style: 'font-size:12px;align-self:center;margin-left:4px', textContent: clock(when) })));
 }
 const failed = r => !!r && /^(denied|cancelled|stopped|error)|^exit code [1-9]/.test(r.content);
 /** One quiet line for everything a bot did in a row. Commands and file contents stay folded away. */
@@ -878,7 +924,7 @@ function workNode(g, busy) {
   const text = asks ? 'Needs your approval' : running ? toolInfo(open[open.length - 1].tc.function.name)[1] : `${n} ${n === 1 ? 'step' : 'steps'}` + (bad ? ` · ${bad} did not succeed` : '') + (open.length ? ' · stopped' : '');
   const lead = asks ? icon('pause', 15) : running ? $('span', { className: 'spin' }) : icon(bad || open.length ? 'dots' : 'check', 15);
   return $('details', { className: 'work' + (asks ? ' ask' : ''), data: { call: 'g' + g.id }, open: S.details || asks > 0 },
-    $('summary', {}, lead, $('span', { className: 'tn', textContent: who + text }), !asks && !running && $('span', { className: 'targ', textContent: kinds.slice(0, 3).join(', ') + (kinds.length > 3 ? '…' : '') }), $('span', { className: 'chev' }, icon('chev', 15))),
+    $('summary', {}, lead, $('span', { className: 'tn', textContent: who + text }), g.route && $('span', { className: 'route-tag', textContent: g.route, title: g.route_reason || '' }), !asks && !running && $('span', { className: 'targ', textContent: kinds.slice(0, 3).join(', ') + (kinds.length > 3 ? '…' : '') }), $('span', { className: 'chev' }, icon('chev', 15))),
     $('div', { className: 'steps' }, g.calls.map(x => stepNode(x, busy))));
 }
 function stepNode({ tc, r, a }, busy) {
@@ -1139,8 +1185,9 @@ async function openDrawer(bot, tab = 'setup') {
     ep.addEventListener('change', () => combo.reload());
     combo.reload();
     const mode = $('select', {}, $('option', { value: 'ask', textContent: 'Ask before risky actions', selected: bot.approval_mode === 'ask' }), $('option', { value: 'auto', textContent: 'Run everything without asking', selected: bot.approval_mode === 'auto' }));
-    const cu = $('input', { type: 'checkbox', checked: bot.computer_use }), fld = (label, input, small) => $('label', { className: 'field' }, $('span', { textContent: label }), input, small && $('small', { textContent: small }));
+    const cu = $('input', { type: 'checkbox', checked: bot.computer_use }), loc = $('input', { type: 'checkbox', checked: bot.local_only }), fld = (label, input, small) => $('label', { className: 'field' }, $('span', { textContent: label }), input, small && $('small', { textContent: small }));
     put(body, fld('Name', name), fld('Instructions', ins), fld('Model endpoint', ep), $('label', { className: 'field' }, $('span', { textContent: 'Model override' }), combo.box, combo.status), fld('Approvals', mode, 'Risky: shell commands, writing files, HTTP requests, routines, untrusted MCP tools and acting on the screen.'),
+      $('label', { className: 'check' }, loc, $('span', {}, 'Local-only', $('small', { textContent: 'If this bot uses a Router, private work stays on Spark. Existing bots stay as they are until you turn this on.' }))),
       $('label', { className: 'check' }, cu, $('span', {}, 'Own screen and computer use', $('small', { textContent: 'A virtual screen with a browser. Needs a model with image input and the Docker sandbox.' }))),
       $('div', { className: 'rowbtns' }, $('button', { className: 'btn primary', textContent: 'Save', onclick: guard(async () => {
         if (bot.is_home) {
@@ -1148,7 +1195,7 @@ async function openDrawer(bot, tab = 'setup') {
           const h = await api('PATCH', '/home', body); Object.assign(bot, h.bot); S.home = h;
           Object.assign(bot, await api('PATCH', `/bots/${bot.id}`, { name: name.value.trim() || bot.name, instructions: ins.value, approval_mode: mode.value }));
         } else {
-          const data = { name: name.value.trim() || bot.name, instructions: ins.value, model: model.value.trim(), approval_mode: mode.value, computer_use: cu.checked }; if (+ep.value !== bot.endpoint_id) data.endpoint_id = +ep.value;
+          const data = { name: name.value.trim() || bot.name, instructions: ins.value, model: model.value.trim(), approval_mode: mode.value, computer_use: cu.checked, local_only: loc.checked }; if (+ep.value !== bot.endpoint_id) data.endpoint_id = +ep.value;
           Object.assign(bot, await api('PATCH', `/bots/${bot.id}`, data));
         }
         if (S.conv && (S.conv.kind === 'dm' || S.conv.kind === 'home') && S.conv.bot_id === bot.id) S.conv.name = bot.name; renderSide(); renderTop(); toast('Saved'); again(); }) }),

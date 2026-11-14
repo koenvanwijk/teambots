@@ -1,6 +1,6 @@
 # LLM request router (design)
 
-Status: proposal only. Cost tracking is in place; this router is not implemented yet.
+Status: **v1 (Option A) is implemented.** A `router` endpoint type applies the rules below; cost tracking logs the chosen route and reason. Options B and C stay as later ideas.
 Logged usage (`llm_usage`: model, tokens, cost, origin, success, latency) is the input for later
 tuning.
 
@@ -19,9 +19,9 @@ person allows it.
 - **Resilience.** On 4xx/5xx, timeout or empty reply, fall back along a list rather than fail the
   turn immediately.
 
-## Option A — Rules only
+## Option A — Rules only (shipped)
 
-A short, ordered policy, evaluated before each `llm.chat`:
+A short, ordered policy, evaluated before each routed `llm.chat`:
 
 1. If the bot, conversation or project is marked **local-only**, or the prompt/context is tagged
    private: Spark. No cloud fallback unless the error is “Spark is down” *and* the bot allows it.
@@ -77,3 +77,12 @@ set, never around the privacy gate.
 
 Do not auto-switch existing bots (Overview stays on Spark) when the router lands; each bot gets
 an explicit routing policy (`local`, `rules`, later `rules+classifier`).
+
+
+## Implementation notes (v1)
+
+- Provider type `router`. Rules live in `endpoint.rules_json` and can be edited in the UI (JSON, validated).
+- Default routes in a project like Zandoerle: `local` = dgx-spark; `cheap` = ICT Copilot `claude-haiku-4.5` (then `gpt-5.4-nano`); `normal` = `claude-sonnet-5`; `heavy` = `claude-opus-5.5`; `claude_cli` is added when that endpoint exists.
+- A bot can be marked **local-only**. Overview / home bots also stay on the local route if they ever use a Router (Overview itself is not auto-switched).
+- `llm_usage.route` / `route_reason` record the decision; the Costs view has a per-route table; the step line shows a small route label.
+- Existing bots are not pointed at the Router automatically. A shared Router endpoint is created in the project for you to assign yourself.

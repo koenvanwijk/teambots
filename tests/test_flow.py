@@ -691,3 +691,62 @@ def test_cost_tracking_summary(c):
     later = c.get("/api/costs?period=today", headers=h).json()
     assert later["totals"]["calls"] >= before
     assert any(r["origin"] == "test" for r in later["by_origin"])
+
+
+def test_router_picks_local_and_heavy_and_labels_the_turn(c):
+    """A Router endpoint on the mock LLM chooses models by rule and stores the route on the message."""
+    h = H("alice")
+    # An earlier test set a $1 budget and already spent more; raise it so routing is not forced cheap.
+    assert c.patch(f"/api/teams/{S['team']}", headers=h, json={"monthly_budget": 100000, "budget_currency": "USD"}).status_code == 200
+    rules = {
+        "routes": [
+            {"name": "local", "endpoint_id": S["ep"], "model": "spark-model"},
+            {"name": "cheap", "endpoint_id": S["ep"], "model": "haiku-model"},
+            {"name": "normal", "endpoint_id": S["ep"], "model": "sonnet-model"},
+            {"name": "heavy", "endpoint_id": S["ep"], "model": "opus-model"},
+        ],
+        "policy": {
+            "privacy": ["local"],
+            "simple": ["local", "cheap"],
+            "normal": ["normal", "cheap", "local"],
+            "heavy": ["heavy", "normal", "cheap"],
+            "budget_80": ["local", "cheap"],
+            "budget_100_block": ["local"],
+        },
+        "signals": {"long_context_tokens": 32000, "short_chars": 80, "hard_keywords": ["think hard"]},
+    }
+    defaults = c.get(f"/api/teams/{S['team']}/router-defaults", headers=h)
+    assert defaults.status_code == 200, defaults.text
+    assert any(r["name"] == "local" for r in defaults.json()["routes"])
+    ep = c.post(f"/api/teams/{S['team']}/endpoints", headers=h, json={
+        "name": "Router", "provider": "router", "default_model": "auto", "shared": True,
+        "rules_json": json.dumps(rules)}).json()
+    S["router_ep"] = ep["id"]
+    assert ep["provider"] == "router" and ep["rules"]["routes"][0]["name"] == "local"
+    # Bad rules are rejected.
+    bad = c.patch(f"/api/endpoints/{ep['id']}", headers=h, json={"rules_json": json.dumps({
+        "routes": [{"name": "local", "endpoint_id": S["ep"], "model": "x"}],
+        "policy": {"privacy": ["missing"], "simple": ["local"], "normal": ["local"],
+                   "heavy": ["local"], "budget_80": ["local"], "budget_100_block": ["local"]}})})
+    assert bad.status_code == 400
+    bot = c.post(f"/api/teams/{S['team']}/bots", headers=h, json={
+        "name": "Router Bot", "handle": "routerbot", "endpoint_id": ep["id"],
+        "approval_mode": "auto", "instructions": "You are brief."}).json()
+    dm = c.post(f"/api/bots/{bot['id']}/dm", headers=h).json()["id"]
+    msgs = say(c, "alice", dm, "Hi")
+    ans = [m for m in msgs if m["role"] == "assistant"][-1]
+    assert "ECHO[spark-model]" in (ans["content"] or "")
+    assert ans["route"].startswith("local")
+    msgs = say(c, "alice", dm, "Please think hard about this design of a system.")
+    ans = [m for m in msgs if m["role"] == "assistant"][-1]
+    assert "ECHO[opus-model]" in (ans["content"] or "")
+    assert ans["route"].startswith("heavy")
+    # local-only wins over a heavy keyword
+    assert c.patch(f"/api/bots/{bot['id']}", headers=h, json={"local_only": True}).status_code == 200
+    msgs = say(c, "alice", dm, "Please think hard about this design of a system again.")
+    ans = [m for m in msgs if m["role"] == "assistant"][-1]
+    assert "ECHO[spark-model]" in (ans["content"] or "")
+    assert ans["route"].startswith("local")
+    costs = c.get("/api/costs?period=today", headers=h).json()
+    routes = {r["route"] for r in costs.get("by_route") or []}
+    assert "local" in routes and "heavy" in routes

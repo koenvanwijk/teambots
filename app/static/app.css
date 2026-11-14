@@ -350,3 +350,7 @@ dialog.wide { width: min(960px, calc(100vw - 24px)); }
   .costs .cval { font-size: 22px; }
   .costs .cchart { height: 110px; }
 }
+
+.route-tag { font-size: 11px; color: var(--muted); border: 1px solid var(--line); border-radius: 99px; padding: 1px 7px; white-space: nowrap; align-self: center; }
+.work > summary .route-tag { flex: 0 0 auto; }
+.msg .acts .route-tag { margin-right: 4px; }

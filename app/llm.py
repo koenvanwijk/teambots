@@ -97,6 +97,12 @@ async def list_models(ep: Endpoint, *, refresh: bool = False) -> list[dict]:
         if getattr(ep, "provider", "openai") == "github_copilot":
             from . import copilot
             out = await copilot.list_models(ep)
+        elif getattr(ep, "provider", "openai") == "claude_cli":
+            from . import claude_cli
+            out = await claude_cli.list_models(ep)
+        elif getattr(ep, "provider", "openai") == "router":
+            from . import llm_router
+            out = await llm_router.list_models(ep)
         else:
             headers = {"Accept": "application/json"}
             key = config.decrypt(ep.api_key_enc)
@@ -124,12 +130,18 @@ async def list_models(ep: Endpoint, *, refresh: bool = False) -> list[dict]:
 
 
 async def chat(ep: Endpoint, model: str, messages: list[dict], tools: list[dict] | None = None,
-               max_tokens: int | None = None) -> dict:
+               max_tokens: int | None = None, _routed: bool = False) -> dict:
     """Return the assistant message dict ({'content': ..., 'tool_calls': [...]})."""
     from . import usage
+    if (getattr(ep, "provider", "openai") == "router") and not _routed:
+        from . import llm_router
+        return await llm_router.chat(ep, model, messages, tools, max_tokens=max_tokens)
     if getattr(ep, "provider", "openai") == "github_copilot":
         from . import copilot
         return await copilot.chat(ep, model, messages, tools, max_tokens=max_tokens)
+    if getattr(ep, "provider", "openai") == "claude_cli":
+        from . import claude_cli
+        return await claude_cli.chat(ep, model, messages, tools, max_tokens=max_tokens)
     budget = max_tokens or config.LLM_MAX_TOKENS
     body: dict = {"model": model or ep.default_model, "messages": messages, "max_tokens": budget}
     if tools:

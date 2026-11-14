@@ -53,6 +53,9 @@ class UsageCtx:
     conversation_id: Optional[int] = None
     endpoint_id: Optional[int] = None
     billable_request: bool = True  # False for tool-follow-up rounds and retries
+    route: str = ""  # router destination name, when a Router endpoint chose the model
+    route_reason: str = ""
+    route_hint: str = ""  # optional policy hint: simple | normal | heavy
 
 
 def current() -> Optional[UsageCtx]:
@@ -193,7 +196,8 @@ def compute_cost(*, provider: str, model: str, endpoint: Endpoint | None,
                  cached_tokens: int = 0, cache_write_tokens: int = 0,
                  reasoning_tokens: int = 0, latency_ms: int = 0,
                  success: bool = True, billable_request: bool = True,
-                 price_row: ModelPrice | None = None, settings: dict | None = None) -> dict:
+                 price_row: ModelPrice | None = None, settings: dict | None = None,
+                 reported_cost_usd: float | None = None) -> dict:
     """Return a snapshot {cost_usd, cost_unknown, billing_mode, premium_requests, notes}."""
     def setting(key: str) -> str:
         if settings is not None:
@@ -235,6 +239,13 @@ def compute_cost(*, provider: str, model: str, endpoint: Endpoint | None,
                     premium_requests=0.0, notes=notes)
 
     provider = provider or (getattr(endpoint, "provider", None) if endpoint else "") or "openai"
+    if reported_cost_usd is not None:
+        return dict(cost_usd=float(reported_cost_usd), cost_unknown=False, billing_mode="subscription",
+                    premium_requests=0.0, notes="cost reported by the Claude CLI")
+    if provider == "claude_cli":
+        return dict(cost_usd=None, cost_unknown=True, billing_mode="subscription",
+                    premium_requests=0.0,
+                    notes="Claude CLI subscription (no cost in CLI output)")
     mode = "token"
     if provider == "github_copilot":
         mode = setting("copilot_billing") or "token"
@@ -296,13 +307,16 @@ def compute_cost(*, provider: str, model: str, endpoint: Endpoint | None,
 
 def log_call(*, endpoint: Endpoint | None, model: str, tokens: dict | None = None,
              latency_ms: int = 0, success: bool = True, error: str = "",
-             retry: bool = False, raw: dict | None = None) -> Optional[LlmUsage]:
+             retry: bool = False, raw: dict | None = None,
+             reported_cost_usd: float | None = None, notes: str = "") -> Optional[LlmUsage]:
     """Persist one LLM attempt. Never raises into the caller."""
     try:
         ctx = current() or UsageCtx()
         tok = dict(tokens or {})
         if raw is not None and not tok:
             tok = parse_usage(raw)
+        if reported_cost_usd is None and tok.get("cost_usd") is not None:
+            reported_cost_usd = tok.get("cost_usd")
         provider = (getattr(endpoint, "provider", None) if endpoint else None) or "openai"
         model_id = (model or (endpoint.default_model if endpoint else "") or "").strip()
         snap = compute_cost(
@@ -314,7 +328,11 @@ def log_call(*, endpoint: Endpoint | None, model: str, tokens: dict | None = Non
             reasoning_tokens=int(tok.get("reasoning_tokens") or 0),
             latency_ms=int(latency_ms or 0), success=success,
             billable_request=bool(ctx.billable_request) and not retry and success,
+            reported_cost_usd=reported_cost_usd,
         )
+        extra_notes = " · ".join(x for x in (snap.get("notes") or "", notes) if x)
+        if ctx.route and ctx.route_reason and ctx.route_reason not in extra_notes:
+            extra_notes = " · ".join(x for x in (extra_notes, f"route {ctx.route}: {ctx.route_reason}") if x)
         row = LlmUsage(
             created_at=now(),
             user_id=ctx.user_id,
@@ -338,7 +356,9 @@ def log_call(*, endpoint: Endpoint | None, model: str, tokens: dict | None = Non
             premium_requests=float(snap["premium_requests"] or 0),
             cost_usd=snap["cost_usd"],
             cost_unknown=bool(snap["cost_unknown"]),
-            notes=(snap.get("notes") or "")[:500],
+            notes=extra_notes[:500],
+            route=(ctx.route or "")[:64],
+            route_reason=(ctx.route_reason or "")[:300],
         )
         with session() as s:
             s.add(row)
@@ -477,6 +497,8 @@ def summarize(period: str, *, team_ids: list[int] | None, include_unassigned: bo
         "by_model": _group(rows, lambda r: (r.provider, r.model), model_label),
         "by_endpoint": _group(rows, lambda r: r.endpoint_id, ep_label),
         "by_origin": _group(rows, lambda r: r.origin or "chat", origin_label),
+        "by_route": _group([r for r in rows if getattr(r, "route", "")],
+                           lambda r: r.route, lambda k, grp: {"route": k or "(no route)"}),
         "by_day": daily,
         "expensive_conversations": expensive,
     }

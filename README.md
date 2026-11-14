@@ -8,8 +8,9 @@ capabilities that every teammate or client talks to in private.
 
 | Area | What works |
 | --- | --- |
-| Endpoints | Register any `/v1/chat/completions` endpoint (vLLM, Ollama, LiteLLM, ...) or GitHub Copilot (github.com or a data-residency tenant such as `org.ghe.com`). The key or GitHub token is stored encrypted and write-only; a connection test checks tool calling; the bot's model is a combobox of the endpoint catalog with free text still allowed |
-| Costs | Every LLM call is logged (tokens, model, origin, latency). Official USD prices are seeded from OpenAI, Anthropic and GitHub Copilot docs; unknown models stay 'price unknown'. A Costs view shows totals, charts and the dearest conversations. Optional monthly project budget (warn at 80%/100%, block only if you turn that on). Local endpoints are 0 |
+| Endpoints | Register any `/v1/chat/completions` endpoint (vLLM, Ollama, LiteLLM, ...), GitHub Copilot (github.com or a data-residency tenant such as `org.ghe.com`), the local Claude CLI, or a Router that picks a model per request. The key or GitHub token is stored encrypted and write-only; a connection test checks tool calling; the bot's model is a combobox of the endpoint catalog with free text still allowed |
+| Costs | Every LLM call is logged (tokens, model, origin, latency, and the router route when one was used). Official USD prices are seeded from OpenAI, Anthropic and GitHub Copilot docs; unknown models stay 'price unknown'. A Costs view shows totals, charts and the dearest conversations. Optional monthly project budget (warn at 80%/100%, block only if you turn that on). Local endpoints are 0 |
+| Router | A Router endpoint applies Option A rules: private or local-only work stays on Spark; short/simple work uses Spark or a cheap Copilot model; tool-heavy, long-context or hard work can use a stronger model; errors and empty replies fall back along a list; at 80% of budget it steers cheaper, and at 100% with blocking only Spark is used. Rules are editable. Existing bots are not switched automatically |
 | Projects | A project is the workspace; an optional client name groups projects. The Overview page shows all your projects per client with their latest shared activity |
 | Bots | Several bots per project; every project member can make one. Personal bots and Team Bots |
 | Team Bots | Draft, publish, share with the whole project or selected people; roles owner / manager / collaborator |
@@ -30,7 +31,7 @@ capabilities that every teammate or client talks to in private.
 Not built: Slack / Discord / Microsoft Teams, meeting bots, voice, SSO, token streaming,
 event-triggered routines.
 
-What has and has not been tested: `pytest -q` runs 60 tests (59 plus the screen test, which is skipped without Xvfb), including cost tracking against mock usage and GitHub Copilot against a mock — no real token — against a scripted model,
+What has and has not been tested: `pytest -q` runs the suite (end-to-end flows, cost tracking, the rule-based router against the mock LLM, GitHub Copilot against a mock — no real token — and the Claude CLI provider against a fake `claude` binary; the screen test is skipped without Xvfb),
 including the screen tools with a real Xvfb and Chromium on the local backend (skipped when those are missing). The test MCP listens on port 18792 so it does not collide with other local services. Not tested: the
 Docker sandbox backend, a real model, and anything on Windows or Hetzner.
 
@@ -79,7 +80,7 @@ safe: it encrypts the stored API keys and secrets, and losing it makes them unre
 ## First steps in the UI
 
 1. Create an account, then a team. Share the invite code with teammates.
-2. Add an endpoint and click it to run the connection test. "tool calling: true" is required. For GitHub Copilot, pick that provider type and enter the GitHub domain (for example `ictgroup.ghe.com`) plus a GitHub OAuth token; TeamBots exchanges it for a short-lived Copilot session and does not store that session token.
+2. Add an endpoint and click it to run the connection test. "tool calling: true" is required (the Claude CLI uses a JSON tool-call fallback). For GitHub Copilot, pick that provider type and enter the GitHub domain (for example `ictgroup.ghe.com`) plus a GitHub OAuth token; TeamBots exchanges it for a short-lived Copilot session and does not store that session token. For **Claude CLI**, pick that provider and set the default model to an alias (`fable`, `haiku`, `sonnet`, `opus`) or an id such as `claude-fable-5-2`; no base URL or key is needed. It shells out to the local `claude` binary (`-p --output-format json`, one turn, no host MCP tools), reusing that host's Claude Code login. Tokens and `total_cost_usd` from the CLI JSON are logged; if the CLI reports no cost, the call is stored as a subscription with unknown price. Every bot shares that one account and its rate/spend limits; the binary plus a valid login must be present on the host that runs TeamBots. Override the binary with `TB_CLAUDE_CLI` and its working directory with `TB_CLAUDE_CLI_CWD`. Using a Claude Code / subscription login as a shared bot backend is a licensing question for your organization to clear. For a **Router**, pick that provider; default rules use Spark, cheap/normal/heavy Copilot models, and Claude CLI when one exists. Edit the rules from the endpoint dialog. Do not point existing bots at it unless you mean to; a Router endpoint is added for you to choose.
 3. Create a bot. For a Team Bot: write instructions, add secrets / MCP servers / skills, then
    tick Published under Sharing.
 4. Chat. Create a channel and all project bots join it automatically and reply to every message; remove a bot or set it to mention-only if you do not want that. On a bot with computer use, **Open scherm** opens the interactive screen (sign in to Chromium there; the profile is kept in the project's Docker volume). To use `gh` in the sandbox, run `gh auth login` there (config is stored on the project volume); TeamBots secrets never enter the sandbox, so a `GH_TOKEN` secret cannot be used as an environment variable inside it.
@@ -154,6 +155,8 @@ app/copilot.py     GitHub Copilot provider (token exchange, cache, completions)
 app/usage.py       LLM usage log, official prices, cost aggregation
 app/prices_seed.py official price table (source URL and date on every row)
 app/costs_api.py   Costs API
+app/claude_cli.py  Claude CLI provider (local `claude` binary)
+app/llm_router.py  rule-based model router (Option A)
 app/sandbox.py     the project computer (docker / local)
 app/screen.py      a virtual screen per bot: screenshot, mouse, keyboard
 app/secrets_http.py  secrets filled in outside the sandbox, masking
@@ -163,7 +166,7 @@ app/api.py         REST API + SSE
 app/static/        web UI without a build step: index.html, app.css, app.js
 tests/             end-to-end tests against a scripted model (pytest -q)
 scripts/           local helpers (e.g. import the OpenClaw ICT Copilot token)
-docs/router.md     design proposal for a later cost-aware model router
+docs/router.md     model router (Option A implemented; B/C still described)
 ```
 
 ## Security

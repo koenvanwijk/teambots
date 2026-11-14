@@ -456,12 +456,24 @@ def patch_team(team_id: int, body: TeamPatch, user: User = Depends(current_user)
 
 class EndpointIn(BaseModel):
     name: str
-    provider: str = "openai"  # openai | github_copilot
+    provider: str = "openai"  # openai | github_copilot | claude_cli | router
     base_url: str = ""
     github_domain: str = ""
     api_key: str = ""
     default_model: str
     shared: bool = False
+    rules_json: str = ""
+
+
+
+def _rules_out(e: Endpoint):
+    raw = getattr(e, "rules_json", "") or ""
+    if not raw:
+        return None
+    try:
+        return json.loads(raw)
+    except ValueError:
+        return None
 
 
 def _ep_out(e: Endpoint) -> dict:  # the key never leaves the server
@@ -470,12 +482,14 @@ def _ep_out(e: Endpoint) -> dict:  # the key never leaves the server
             "provider": getattr(e, "provider", None) or "openai",
             "github_domain": getattr(e, "github_domain", None) or "",
             "models": __import__("app.usage", fromlist=["cached_models"]).cached_models(e),
-            "models_fetched_at": e.models_fetched_at.isoformat() if getattr(e, "models_fetched_at", None) else None}
+            "models_fetched_at": e.models_fetched_at.isoformat() if getattr(e, "models_fetched_at", None) else None,
+            "rules": _rules_out(e)}
 
 
 def _normalize_provider(value: str) -> str:
     provider = (value or "openai").strip()
-    _need(provider in ("openai", "github_copilot"), 400, "provider: openai | github_copilot")
+    _need(provider in ("openai", "github_copilot", "claude_cli", "router"), 400,
+          "provider: openai | github_copilot | claude_cli | router")
     return provider
 
 
@@ -496,9 +510,33 @@ def list_endpoints(team_id: int, user: User = Depends(current_user)):
 
 @router.post("/teams/{team_id}/endpoints")
 def create_endpoint(team_id: int, body: EndpointIn, user: User = Depends(current_user)):
-    _need(body.name.strip() and body.default_model.strip(), 400, "name and default model cannot be empty")
+    _need(body.name.strip(), 400, "name cannot be empty")
+    if (body.provider or "openai") != "router":
+        _need(body.default_model.strip(), 400, "name and default model cannot be empty")
+    elif not body.default_model.strip():
+        body = body.model_copy(update={"default_model": "auto"})
     provider = _normalize_provider(body.provider)
-    if provider == "github_copilot":
+    if provider == "claude_cli":
+        # No HTTP base URL and no API key (the CLI uses its own stored credentials).
+        fields = dict(provider=provider, github_domain="", base_url="", api_key_enc="", rules_json="")
+    elif provider == "router":
+        from . import llm_router
+        raw_rules = (body.rules_json or "").strip()
+        if raw_rules:
+            try:
+                rules = llm_router.validate_rules(raw_rules, team_id=team_id)
+            except ValueError as e:
+                raise HTTPException(400, str(e)) from e
+        else:
+            try:
+                rules = llm_router.default_rules_for_team(team_id)
+            except ValueError as e:
+                raise HTTPException(400, str(e)) from e
+        fields = dict(provider=provider, github_domain="", base_url="", api_key_enc="",
+                      rules_json=__import__("json").dumps(rules))
+        if not body.default_model.strip():
+            body = body.model_copy(update={"default_model": "auto"})
+    elif provider == "github_copilot":
         domain = _github_domain_or_400(body.github_domain or "github.com")
         _need(body.api_key.strip(), 400, "a GitHub token is required")
         base = body.base_url.strip().rstrip("/")
@@ -507,11 +545,11 @@ def create_endpoint(team_id: int, body: EndpointIn, user: User = Depends(current
         else:
             base = copilot.fallback_base(domain)
         fields = dict(provider=provider, github_domain=domain, base_url=base,
-                      api_key_enc=config.encrypt(body.api_key.strip()))
+                      api_key_enc=config.encrypt(body.api_key.strip()), rules_json="")
     else:
         _need(body.base_url.startswith(("http://", "https://")), 400, "base_url must start with http:// or https://")
         fields = dict(provider="openai", github_domain="", base_url=body.base_url.rstrip("/"),
-                      api_key_enc=config.encrypt(body.api_key))
+                      api_key_enc=config.encrypt(body.api_key), rules_json="")
     with session() as s:
         _need(team_role(s, user.id, team_id))
         e = Endpoint(team_id=team_id, owner_id=user.id, name=body.name.strip(),
@@ -529,6 +567,7 @@ class EndpointPatch(BaseModel):
     api_key: Optional[str] = None  # left out = keep the stored key
     default_model: Optional[str] = None
     shared: Optional[bool] = None
+    rules_json: Optional[str] = None
 
 
 @router.patch("/endpoints/{endpoint_id}")
@@ -540,7 +579,28 @@ def patch_endpoint(endpoint_id: int, body: EndpointPatch, user: User = Depends(c
         e = s.get(Endpoint, endpoint_id)
         _need(e and e.owner_id == user.id, 404, "endpoint not found")
         provider = _normalize_provider(data.get("provider", getattr(e, "provider", None) or "openai"))
-        if provider == "github_copilot":
+        if provider == "claude_cli":
+            data["github_domain"] = ""
+            data["base_url"] = ""
+            data["api_key"] = ""  # the CLI uses its own credentials, drop any stored key
+            data["rules_json"] = ""
+        elif provider == "router":
+            data["github_domain"] = ""
+            data["base_url"] = ""
+            data["api_key"] = ""
+            raw_rules = data.pop("rules_json") if "rules_json" in data else (e.rules_json or "")
+            from . import llm_router
+            try:
+                if raw_rules and str(raw_rules).strip():
+                    rules = llm_router.validate_rules(raw_rules, team_id=e.team_id)
+                else:
+                    rules = llm_router.default_rules_for_team(e.team_id)
+            except ValueError as exc:
+                raise HTTPException(400, str(exc)) from exc
+            data["rules_json"] = __import__("json").dumps(rules)
+            if not data.get("default_model") and not e.default_model:
+                data["default_model"] = "auto"
+        elif provider == "github_copilot":
             raw_domain = data["github_domain"] if "github_domain" in data else (e.github_domain or "github.com")
             domain = _github_domain_or_400(raw_domain)
             data["github_domain"] = domain
@@ -597,13 +657,28 @@ async def test_endpoint(endpoint_id: int, user: User = Depends(current_user)):
         "type": "object", "properties": {"ok": {"type": "boolean"}}, "required": ["ok"]}}}
     try:
         from . import usage
+        from . import llm_router
+        llm_router.begin_turn()
         with usage.bind(origin="test", user_id=user.id, team_id=e.team_id, endpoint_id=e.id,
-                        billable_request=True):
+                        billable_request=True, route_hint="simple"):
             reply = await llm.chat(e, "", [{"role": "user", "content": "Call the ping tool with ok=true."}], [tool])
     except llm.LLMError as err:
         return {"reachable": False, "tool_calling": False, "detail": str(err)}
     return {"reachable": True, "tool_calling": bool(reply["tool_calls"]),
             "detail": "ok" if reply["tool_calls"] else "the model answered in text instead of calling the tool"}
+
+
+
+@router.get("/teams/{team_id}/router-defaults")
+def router_defaults(team_id: int, user: User = Depends(current_user)):
+    """Suggested Option A rules built from this project's Spark, Copilot and Claude CLI endpoints."""
+    with session() as s:
+        _need(team_role(s, user.id, team_id))
+    from . import llm_router
+    try:
+        return llm_router.default_rules_for_team(team_id)
+    except ValueError as e:
+        raise HTTPException(400, str(e)) from e
 
 
 @router.get("/endpoints/{endpoint_id}/models")
@@ -631,10 +706,12 @@ class BotIn(BaseModel):
     is_team: bool = False
     approval_mode: str = "ask"
     computer_use: bool = False
+    local_only: bool = False
 
 
 class BotPatch(BaseModel):
     computer_use: Optional[bool] = None
+    local_only: Optional[bool] = None
     name: Optional[str] = None
     handle: Optional[str] = None
     instructions: Optional[str] = None
@@ -1365,7 +1442,8 @@ def list_messages(conv_id: int, after: int = 0, user: User = Depends(current_use
              "author": users.get(m.author_user_id) if m.role == "user" else bots.get(m.author_bot_id, "bot"),
              "author_user_id": m.author_user_id, "author_bot_id": m.author_bot_id,
              "is_bot": m.role != "user", "tool_calls": json.loads(m.tool_calls) if m.tool_calls else [],
-             "tool_call_id": m.tool_call_id, "has_image": bool(m.image_path)} for m in rows]
+             "tool_call_id": m.tool_call_id, "has_image": bool(m.image_path),
+             "route": getattr(m, "route", "") or "", "route_reason": getattr(m, "route_reason", "") or ""} for m in rows]
 
 
 class MessageIn(BaseModel):
