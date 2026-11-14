@@ -140,11 +140,11 @@ function confirmBox({ title, text, ok = 'Confirm', danger }) {
 }
 function closePop() { if (S.pop) { S.pop.remove(); S.pop = null; document.removeEventListener('mousedown', popOutside, true); } }
 function popOutside(e) { if (S.pop && !S.pop.contains(e.target)) closePop(); }
-function popmenu(anchor, items) {
+function popmenu(anchor, items, host) {
   closePop();
   const m = $('div', { className: 'pop', role: 'menu' }, items.map(it => !it ? null : it.sep ? $('div', { className: 'sep' }) : it.head ? $('div', { className: 'pophead', textContent: it.head })
     : $('button', { className: 'popitem' + (it.danger ? ' danger' : ''), role: 'menuitem', onclick: () => { closePop(); it.onclick(); } }, it.icon && icon(it.icon, 16), $('span', { textContent: it.label }), it.hint && $('small', { textContent: it.hint }), it.checked && icon('check', 15))));
-  document.body.append(m);
+  (host || document.body).append(m);  // host: a modal <dialog> in the top layer, so the menu is not hidden behind it
   const r = anchor.getBoundingClientRect(), w = m.offsetWidth, h = m.offsetHeight;
   m.style.left = Math.max(8, Math.min(r.left, innerWidth - w - 8)) + 'px';
   m.style.top = (r.bottom + 6 + h > innerHeight - 8 ? Math.max(8, r.top - h - 6) : r.bottom + 6) + 'px';
@@ -754,7 +754,7 @@ function endpointDialog(e) {
     const targets = (S.teams || []).filter(t => !S.team || t.id !== S.team.id);
     if (!targets.length) return toast('You have no other project to copy into');
     popmenu(ev.currentTarget, [{ head: 'Copy to' }, ...targets.map(t => ({ icon: 'grid', label: (t.client ? t.client + ' / ' : '') + t.name,
-      onclick: guard(async () => { await api('POST', `/endpoints/${e.id}/copy`, { team_id: t.id }); toast(`Copied "${e.name}" to ${t.name}`); }) }))]);
+      onclick: guard(async () => { await api('POST', `/endpoints/${e.id}/copy`, { team_id: t.id }); toast(`Copied "${e.name}" to ${t.name}`); }) }))], d);
   } });
   const d = openDialog('', $('div', { className: 'pad' }, $('h2', { textContent: e.name }),
     $('dl', { className: 'kv', style: 'margin-top:14px' },
