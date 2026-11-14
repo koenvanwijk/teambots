@@ -235,6 +235,9 @@ def _cli_argv(chosen: str, system_prompt: str) -> list[str]:
             "--max-turns", "1",
             "--strict-mcp-config",
             "--setting-sources", "",
+            "--tools", "",  # disable the CLI's built-in tools: no host Bash/Edit, and no
+                            # tool turn that --max-turns 1 would cut off (error_max_turns).
+                            # TeamBots tools are offered via the JSON protocol in the prompt.
             "--permission-mode", "dontAsk"]
     if chosen:
         argv += ["--model", chosen]
