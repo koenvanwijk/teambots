@@ -830,6 +830,7 @@ async function addToChannel(body) {
 async function channelMembers() {
   const c = S.conv, again = guard(async () => { d.close(); await loadCtx(c); renderTop(); renderDock(); await channelMembers(); });
   const m = S.ctx.mem, inU = new Set(m.users.map(u => u.id)), inB = new Set(m.bots.map(b => b.id)), admin = S.team.role === 'admin';
+  const inviteUrl = location.origin + '/?invite=' + encodeURIComponent(S.team.invite_code);
   const people = S.members.filter(x => !inU.has(x.user_id)), bots = S.bots.filter(b => !inB.has(b.id) && b.role !== 'collaborator'), picks = [];
   const pick = (kind, id, text) => { const cb = $('input', { type: 'checkbox' }); picks.push({ kind, id, cb }); return $('label', { className: 'check', style: 'margin:8px 0' }, cb, $('span', { textContent: text })); };
   const botRow = b => {
@@ -843,6 +844,9 @@ async function channelMembers() {
     $('div', { className: 'field' }, $('span', { textContent: 'Bots' }), m.bots.length ? m.bots.map(botRow) : $('div', { className: 'none', textContent: 'No bots in this team chat.' })),
     $('div', { className: 'field' }, $('span', { textContent: 'People' }), m.users.map(u => $('div', { className: 'li' }, avatar(u.display_name), $('div', { className: 'tx', textContent: u.display_name })))),
     (people.length || bots.length) ? $('div', { className: 'field' }, $('span', { textContent: 'Add' }), people.map(x => pick('u', x.user_id, x.display_name)), bots.map(b => pick('b', b.id, `${b.name} (@${b.handle})`))) : null,
+    admin && $('div', { className: 'field' }, $('span', { textContent: 'Invite someone new' }),
+      $('div', { className: 'copyrow' }, $('code', { textContent: inviteUrl }), $('button', { className: 'btn sm', textContent: 'Copy', onclick: () => copyText(inviteUrl, 'Invite link copied') })),
+      $('small', { className: 'muted', textContent: 'Share this link to add a new person to the project. Once they join, add them here.' })),
     $('div', { className: 'dfoot' }, (people.length || bots.length) ? $('button', { className: 'btn', textContent: 'Add selected', onclick: guard(async () => { const on = picks.filter(x => x.cb.checked); if (!on.length) return toast('Tick who you want to add'); await api('POST', `/channels/${c.id}/members`, { user_ids: on.filter(x => x.kind === 'u').map(x => x.id), bot_ids: on.filter(x => x.kind === 'b').map(x => x.id) }); again(); }) }) : null,
       $('button', { className: 'btn primary', textContent: 'Done', onclick: () => d.close() }))));
 }
