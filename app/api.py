@@ -6,6 +6,9 @@ import json
 import os
 import re
 import secrets
+import shutil
+import subprocess
+import sys
 import uuid
 from datetime import datetime, timezone
 from typing import Optional
@@ -19,9 +22,9 @@ import websockets
 
 from . import agent, config, copilot, events, home, llm, mcp_client, oauth, routines, sandbox, screen, secrets_http
 from .access import bot_role, can_manage, can_read_conversation, team_role
-from .db import (Approval, AuthToken, Bot, BotAccess, ChannelMember, Conversation, Endpoint, Identity, McpCredential,
-                 McpServer, Memory, Message, OAuthState, Routine, Secret, Skill, Team, TeamMember, User, now, select,
-                 session)
+from .db import (Approval, ApprovalRule, AuthToken, Bot, BotAccess, ChannelMember, Conversation, Endpoint, Identity,
+                 LlmUsage, McpCredential, McpServer, Memory, Message, OAuthState, Routine, Secret, Skill, Team,
+                 TeamMember, User, now, select, session)
 
 router = APIRouter(prefix="/api")
 
@@ -487,6 +490,72 @@ def patch_team(team_id: int, body: TeamPatch, user: User = Depends(current_user)
         s.add(t)
         s.commit()
     return {"ok": True}
+
+
+@router.delete("/teams/{team_id}")
+def delete_team(team_id: int, confirm: str = Query(default=""), user: User = Depends(current_user)):
+    """Delete a project and everything in it (bots, chats, messages, memory, secrets, MCP, usage)
+    plus its workspace. Admin only; `confirm` must equal the project name. A full export is written
+    first as a safety net; if that export fails, nothing is deleted."""
+    with session() as s:
+        _need(team_role(s, user.id, team_id) == "admin", 403, "only a project admin can delete the project")
+        team = s.get(Team, team_id)
+        _need(team, 404, "no such project")
+        _need(confirm == team.name, 400, "type the project name exactly to confirm")
+        name = team.name
+    # 1) Safety net: export first; abort the whole delete if it fails.
+    script = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "scripts", "export_project.py")
+    try:
+        subprocess.run([sys.executable, script, str(team_id), "--out", config.EXPORTS_DIR],
+                       check=True, capture_output=True, timeout=180)
+    except Exception as e:  # noqa: BLE001
+        detail = getattr(e, "stderr", b"") or b""
+        raise HTTPException(500, "backup before delete failed, nothing was deleted: "
+                            + (detail.decode(errors="replace")[-200:] if detail else str(e)))
+    # 2) Delete every row scoped to the project.
+    with session() as s:
+        bot_ids = [b.id for b in s.exec(select(Bot).where(Bot.team_id == team_id)).all()]
+        conv_ids = [c.id for c in s.exec(select(Conversation).where(Conversation.team_id == team_id)).all()]
+        mcp_ids = [m.id for m in s.exec(select(McpServer).where(McpServer.bot_id.in_(bot_ids))).all()] if bot_ids else []
+        for r in (s.exec(select(Routine).where(Routine.bot_id.in_(bot_ids))).all() if bot_ids else []):
+            routines.remove(r.id)
+
+        def wipe(model, cond):
+            for row in s.exec(select(model).where(cond)).all():
+                s.delete(row)
+        if mcp_ids:
+            wipe(McpCredential, McpCredential.mcp_server_id.in_(mcp_ids))
+        if conv_ids:
+            wipe(Message, Message.conversation_id.in_(conv_ids))
+            wipe(ChannelMember, ChannelMember.conversation_id.in_(conv_ids))
+            wipe(Approval, Approval.conversation_id.in_(conv_ids))
+        if bot_ids:
+            wipe(Approval, Approval.bot_id.in_(bot_ids))
+            wipe(ApprovalRule, ApprovalRule.bot_id.in_(bot_ids))
+            wipe(Memory, Memory.bot_id.in_(bot_ids))
+            wipe(Skill, Skill.bot_id.in_(bot_ids))
+            wipe(Routine, Routine.bot_id.in_(bot_ids))
+            wipe(BotAccess, BotAccess.bot_id.in_(bot_ids))
+            wipe(Secret, Secret.bot_id.in_(bot_ids))
+            wipe(McpServer, McpServer.bot_id.in_(bot_ids))
+        wipe(Conversation, Conversation.team_id == team_id)
+        wipe(Bot, Bot.team_id == team_id)
+        wipe(Endpoint, Endpoint.team_id == team_id)
+        wipe(TeamMember, TeamMember.team_id == team_id)
+        wipe(LlmUsage, LlmUsage.team_id == team_id)
+        s.delete(s.get(Team, team_id))
+        s.commit()
+    # 3) Remove the project's workspace: the Docker container and volume, and any local dir.
+    vol = f"tb-p{team_id}"
+    try:
+        subprocess.run(["docker", "rm", "-f", vol], capture_output=True, timeout=30)
+        subprocess.run(["docker", "volume", "rm", vol], capture_output=True, timeout=30)
+    except FileNotFoundError:
+        pass  # no docker here
+    local = os.path.join(config.DATA_DIR, "workspaces", f"p{team_id}")
+    if os.path.isdir(local):
+        shutil.rmtree(local, ignore_errors=True)
+    return {"deleted": name}
 
 
 # ---------------------------------------------------------------- endpoints

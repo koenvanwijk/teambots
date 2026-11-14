@@ -490,6 +490,16 @@ function backupsSection(t) {
   return $('div', { className: 'field' }, $('span', { textContent: 'Backups' }), list,
     $('small', { className: 'muted', textContent: 'Per-project exports (messages, bots, settings, workspace). Downloads contain secrets — keep them private.' }));
 }
+async function deleteProjectFlow(t) {
+  const done = await form({ title: 'Delete project', ok: 'Delete permanently',
+    intro: `This permanently deletes "${t.name}" and everything in it — bots, chats, messages, memory, secrets and the project computer. A backup export is saved first, but this cannot be undone.`,
+    fields: [{ name: 'name', label: 'Type the project name to confirm', required: true, placeholder: t.name, mono: true }],
+    onSubmit: async v => { if (v.name !== t.name) throw new Error('The name does not match.'); await api('DELETE', `/teams/${t.id}?confirm=${encodeURIComponent(t.name)}`); } });
+  if (!done) return;  // cancelled
+  toast('Project deleted');
+  store.set('tb_team', null); store.set('tb_last_' + t.id, null);
+  await boot();
+}
 function projectDialog() {
   const t = S.team, admin = t.role === 'admin';
   const inviteUrl = location.origin + '/?invite=' + encodeURIComponent(t.invite_code);
@@ -502,7 +512,7 @@ function projectDialog() {
     admin && $('label', { className: 'field' }, $('span', { textContent: 'Bot sharing' }), sharing),
     admin && backupsSection(t),
     $('div', { className: 'field' }, $('span', { textContent: 'People' }), S.members.map(m => $('div', { className: 'li' }, avatar(m.display_name), $('div', { className: 'tx' }, m.display_name, $('small', { textContent: '@' + m.username })), m.role === 'admin' && $('span', { className: 'tag', textContent: 'admin' })))),
-    $('div', { className: 'dfoot' }, admin && $('button', { className: 'btn', textContent: 'Rename', onclick: () => { d.close(); guard(renameProject)(); } }), $('button', { className: 'btn primary', textContent: 'Done', onclick: () => d.close() }))));
+    $('div', { className: 'dfoot' }, admin && $('button', { className: 'btn', textContent: 'Rename', onclick: () => { d.close(); guard(renameProject)(); } }), admin && $('button', { className: 'btn danger', textContent: 'Delete project', onclick: () => { d.close(); guard(() => deleteProjectFlow(t))(); } }), $('button', { className: 'btn primary', textContent: 'Done', onclick: () => d.close() }))));
 }
 
 // ---------------------------------------------------------------- home
