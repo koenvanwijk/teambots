@@ -1,10 +1,12 @@
 """REST API. Every route checks permissions through app.access."""
 import asyncio
+import base64
 import hashlib
 import json
 import os
 import re
 import secrets
+import uuid
 from datetime import datetime, timezone
 from typing import Optional
 from urllib.parse import quote
@@ -1361,7 +1363,9 @@ def message_image(message_id: int, user: User = Depends(current_user)):
         m = s.get(Message, message_id)
         _need(m and m.image_path, 404, "no image")
         _conv(s, m.conversation_id, user)
-    return FileResponse(m.image_path, media_type="image/jpeg")
+    ext = os.path.splitext(m.image_path)[1].lower()
+    mime = {".png": "image/png", ".gif": "image/gif", ".webp": "image/webp"}.get(ext, "image/jpeg")
+    return FileResponse(m.image_path, media_type=mime)
 
 
 class ChannelIn(BaseModel):
@@ -1504,15 +1508,37 @@ def list_messages(conv_id: int, after: int = 0, user: User = Depends(current_use
              "route": getattr(m, "route", "") or "", "route_reason": getattr(m, "route_reason", "") or ""} for m in rows]
 
 
+_IMG_EXT = {"image/png": ".png", "image/jpeg": ".jpg", "image/gif": ".gif", "image/webp": ".webp"}
+
+
+def _save_user_image(data_url: str) -> str:
+    """Decode a base64 image data URL from the composer (a pasted screenshot) and store it."""
+    m = re.match(r"data:(image/(?:png|jpe?g|gif|webp));base64,(.+)$", data_url, re.S)
+    _need(m, 400, "image must be a base64 data URL (png, jpg, gif or webp)")
+    mime = "image/jpeg" if m.group(1) in ("image/jpg", "image/jpeg") else m.group(1)
+    try:
+        raw = base64.b64decode(m.group(2), validate=True)
+    except Exception:
+        raise HTTPException(400, "image is not valid base64")
+    _need(len(raw) <= 10 * 1024 * 1024, 400, "image too large (max 10 MB)")
+    folder = os.path.join(config.DATA_DIR, "uploads")
+    os.makedirs(folder, exist_ok=True)
+    path = os.path.join(folder, f"{uuid.uuid4().hex}{_IMG_EXT[mime]}")
+    with open(path, "wb") as f:
+        f.write(raw)
+    return path
+
+
 class MessageIn(BaseModel):
     content: str
     mode: str = "auto"  # what to do when the bot is busy: auto | steer | queue | interrupt
     allow_secret: bool = False  # the person looked at the warning and sends it anyway
+    image: str = ""  # optional base64 image data URL: a pasted screenshot
 
 
 @router.post("/conversations/{conv_id}/messages")
 async def send_message(conv_id: int, body: MessageIn, user: User = Depends(current_user)):
-    _need(body.content.strip(), 400, "empty message")
+    _need(body.content.strip() or body.image, 400, "empty message")
     _need(body.mode in agent.MODES, 400, "mode: " + " | ".join(agent.MODES))
     with session() as s:
         conv = _conv(s, conv_id, user)
@@ -1526,7 +1552,8 @@ async def send_message(conv_id: int, body: MessageIn, user: User = Depends(curre
         if found:  # nothing is stored; the person decides what to do with it
             raise HTTPException(409, {"code": "secret", "found": found,
                                       "message": "this message seems to contain a secret"})
-    m = agent.handle_user_message(conv_id, user.id, body.content.strip(), body.mode)
+    image_path = _save_user_image(body.image) if body.image else None
+    m = agent.handle_user_message(conv_id, user.id, body.content.strip(), body.mode, image_path=image_path)
     return {"id": m.id}
 
 

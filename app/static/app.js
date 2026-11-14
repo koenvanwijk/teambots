@@ -970,6 +970,7 @@ function msgNode(m, note) {
   if (m.role === 'user') {
     const mine = m.author_user_id === S.me.id;
     return $('div', { className: 'msg user' + (mine ? ' mine' : '') }, !mine && $('div', { className: 'who' }, avatar(m.author), m.author || 'Someone', time), plain(m.content, $('div', { className: 'body', title: mine ? when.toLocaleString() : '' })),
+      m.has_image && $('img', { className: 'msgimg', src: withToken(`/messages/${m.id}/image`), alt: 'Pasted image', loading: 'lazy', onclick: () => window.open(withToken(`/messages/${m.id}/image`), '_blank', 'noopener') }),
       note && $('div', { className: 'note' }, icon(note[1], 13), note[2]));
   }
   const direct = c.kind === 'dm' || c.kind === 'home';
@@ -1115,7 +1116,14 @@ function renderDock() {
   const hint = $('span', { className: 'hint' }), modeLabel = $('span');
   const modeBtn = $('button', { className: 'cbtn', type: 'button', hidden: true, title: 'What a new message does while the bot is working', onclick: () => popmenu(modeBtn, [{ head: 'While the bot is working' }, ...Object.entries(MODES).map(([k, [label, sub]]) => ({ label, hint: sub, checked: mode === k, onclick: () => { mode = k; S.dockSync(); ta.focus(); } }))]) }, modeLabel, icon('chev', 14));
   const stopBtn = $('button', { className: 'cbtn stop', type: 'button', hidden: true, title: 'Stop the bot', ariaLabel: 'Stop the bot', onclick: guard(async () => { await api('POST', `/conversations/${c.id}/stop`); refresh(); }) }, icon('stop', 14), 'Stop');
-  const box = $('div', { className: 'composer' }, $('div', { className: 'ta' }, hl, ta),
+  let pendingImage = null;  // a pasted screenshot waiting to be sent with the next message
+  const attach = $('div', { className: 'attach', hidden: true });
+  const showAttach = () => {
+    attach.hidden = !pendingImage; attach.replaceChildren();
+    if (pendingImage) attach.append($('img', { className: 'thumb', src: pendingImage, alt: 'Image to send' }),
+      $('button', { className: 'ib', type: 'button', title: 'Remove image', onclick: () => { pendingImage = null; showAttach(); sync(); ta.focus(); } }, icon('x', 15)));
+  };
+  const box = $('div', { className: 'composer' }, attach, $('div', { className: 'ta' }, hl, ta),
     $('div', { className: 'crow' }, $('button', { className: 'cbtn', type: 'button', title: 'Add a bot, skill, file or person', onclick: () => atButton() }, icon('at', 16), 'Add'), hint, modeBtn, stopBtn, send));
   S.dockSync = () => {
     const run = S.state.running, names = run.map(r => r.bot).join(' and ');
@@ -1125,7 +1133,7 @@ function renderDock() {
   };
   let menu = null, shown = [], sel = 0, dismissed = -1;
 
-  const sync = () => { ta.style.height = 'auto'; ta.style.height = Math.min(ta.scrollHeight, 220) + 'px'; hl.replaceChildren(); plain(ta.value + (ta.value.endsWith('\n') ? ' ' : ''), hl); hl.scrollTop = ta.scrollTop; send.disabled = !ta.value.trim(); S.drafts[c.id] = ta.value; };
+  const sync = () => { ta.style.height = 'auto'; ta.style.height = Math.min(ta.scrollHeight, 220) + 'px'; hl.replaceChildren(); plain(ta.value + (ta.value.endsWith('\n') ? ' ' : ''), hl); hl.scrollTop = ta.scrollTop; send.disabled = !ta.value.trim() && !pendingImage; S.drafts[c.id] = ta.value; };
   const state = () => { if (ta.selectionStart !== ta.selectionEnd) return null; const pos = ta.selectionStart, m = /(^|[\s(])@([^\s@]*)$/.exec(ta.value.slice(0, pos)); return m ? { start: pos - m[2].length - 1, pos, q: m[2].toLowerCase() } : null; };
   const closeMenu = () => { if (menu) { menu.remove(); menu = null; } };
   const pick = guard(async it => {
@@ -1157,17 +1165,28 @@ function renderDock() {
   const mark = () => { if (!menu) return; for (const r of menu.querySelectorAll('.mrow')) { const on = +r.dataset.n === sel; r.classList.toggle('sel', on); r.ariaSelected = on; if (on) r.scrollIntoView({ block: 'nearest' }); } };
   const atButton = () => { ta.focus(); if (menu) return closeMenu(); const p = ta.selectionStart, before = ta.value.slice(0, p), ins = (before && !/\s$/.test(before) ? ' ' : '') + '@'; ta.setRangeText(ins, p, ta.selectionEnd, 'end'); dismissed = -1; sync(); drawMenu(); };
   const submit = guard(async allow => {
-    const text = ta.value.trim(); if (!text) return;
-    ta.value = ''; closeMenu(); sync(); S.first = true;
-    try { await api('POST', `/conversations/${c.id}/messages`, { content: text, mode, allow_secret: allow === true }); refresh(); }
+    const text = ta.value.trim(), image = pendingImage; if (!text && !image) return;
+    ta.value = ''; pendingImage = null; showAttach(); closeMenu(); sync(); S.first = true;
+    try { await api('POST', `/conversations/${c.id}/messages`, { content: text, mode, allow_secret: allow === true, image: image || undefined }); refresh(); }
     catch (e) {
-      if (!ta.value) { ta.value = text; sync(); }
+      if (!ta.value && !pendingImage) { ta.value = text; pendingImage = image; showAttach(); sync(); }
       if (!e.detail || e.detail.code !== 'secret') throw e;
       // The server held the message back. Nothing was stored; the person decides what happens with it.
       secretGuard(e.detail.found, { swap: (value, placeholder) => { ta.value = ta.value.split(value).join(placeholder); sync(); }, send: yes => submit(yes), focus: () => ta.focus() });
     }
   });
   ta.addEventListener('input', () => { sel = 0; sync(); drawMenu(); });
+  ta.addEventListener('paste', e => {  // a pasted screenshot becomes an attachment on the next message
+    const items = e.clipboardData && e.clipboardData.items;
+    const it = items && [...items].find(x => x.type && x.type.startsWith('image/'));
+    if (!it) return;
+    e.preventDefault();
+    const file = it.getAsFile(); if (!file) return;
+    if (file.size > 10 * 1024 * 1024) return toast('Image is too large (max 10 MB)', 'bad');
+    const reader = new FileReader();
+    reader.onload = () => { pendingImage = reader.result; showAttach(); sync(); };
+    reader.readAsDataURL(file);
+  });
   ta.addEventListener('scroll', () => { hl.scrollTop = ta.scrollTop; });
   ta.addEventListener('click', drawMenu);
   ta.addEventListener('keyup', e => { if (['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(e.key)) drawMenu(); });

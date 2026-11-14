@@ -488,6 +488,8 @@ def build_history(conv: Conversation, bot: Bot, limit: int = 80, run: Run | None
     answers = {m.tool_call_id: m for m in rows if m.role == "tool" and m.author_bot_id == bot.id}
     # Only the two most recent screenshots are sent as images; older ones would bloat every request.
     recent_images = {m.id for m in [m for m in rows if m.image_path and m.author_bot_id == bot.id][-2:]}
+    # Screenshots the person pasted: send the few most recent as images, older ones as a short note.
+    recent_user_images = {m.id for m in [m for m in rows if m.image_path and m.author_user_id][-4:]}
     out: list[dict] = []
     for m in rows:
         if m.author_bot_id == bot.id:
@@ -513,7 +515,18 @@ def build_history(conv: Conversation, bot: Bot, limit: int = 80, run: Run | None
                         {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}}]})
         elif m.role == "user":
             text = f"{names.get(m.author_user_id, 'someone')}: {m.content}" if conv.kind == "channel" else m.content
-            out.append({"role": "user", "content": text})
+            if m.image_path and m.id in recent_user_images and os.path.exists(m.image_path):
+                with open(m.image_path, "rb") as f:
+                    b64 = base64.b64encode(f.read()).decode()
+                mime = {".png": "image/png", ".gif": "image/gif", ".webp": "image/webp"}.get(
+                    os.path.splitext(m.image_path)[1].lower(), "image/jpeg")
+                out.append({"role": "user", "content": [
+                    {"type": "text", "text": text or "[screenshot]"},
+                    {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64}"}}]})
+            else:
+                if m.image_path and m.id not in recent_user_images:
+                    text = (text + "\n[earlier image omitted]").strip()
+                out.append({"role": "user", "content": text})
         elif m.role == "assistant" and m.content:
             out.append({"role": "user", "content": f"[bot {bots.get(m.author_bot_id, 'bot')}]: {m.content}"})
     return out
@@ -920,7 +933,8 @@ async def _route(key: Key, run: Run, msg_id: int, user_id: int, content: str, mo
     publish(conv_id, "run")
 
 
-def handle_user_message(conv_id: int, user_id: int, content: str, mode: str = "auto") -> Message:
+def handle_user_message(conv_id: int, user_id: int, content: str, mode: str = "auto",
+                        image_path: str | None = None) -> Message:
     """Store a person's message and wake up the bots it addresses.
 
     A bot that is busy is not woken twice: the message steers its turn, waits in the queue behind it,
@@ -931,7 +945,7 @@ def handle_user_message(conv_id: int, user_id: int, content: str, mode: str = "a
     to each other. ask_bot remains a deliberate one-level handoff (depth>=1 cannot
     call ask_bot again).
     """
-    msg = _post(conv_id, role="user", content=content, author_user_id=user_id)
+    msg = _post(conv_id, role="user", content=content, author_user_id=user_id, image_path=image_path)
     with session() as s:
         conv = s.get(Conversation, conv_id)
         if conv.kind == "feed":
