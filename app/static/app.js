@@ -486,7 +486,9 @@ async function showRoutines() {
           ib('trash', 'Remove', guard(async () => {
             if (!await confirmBox({ title: 'Remove this routine?', text: 'This cannot be undone.', ok: 'Remove', danger: true })) return;
             await api('DELETE', `/routines/${r.id}`); again();
-
+          }), 15))));
+    }
+  }
 }
 
 async function showCosts() {
