@@ -21,6 +21,10 @@ class User(SQLModel, table=True):
     email: str = Field(default="", index=True)  # verified address from an OAuth identity, if any
     home_endpoint_id: Optional[int] = None  # model endpoint for the overview bot
     home_model: str = ""  # empty = endpoint default
+    home_android_enabled: bool = False
+    home_android_software: bool = False
+    home_android_memory_mb: int = 6144
+    home_android_cpus: int = 4
 
 
 class Identity(SQLModel, table=True):
@@ -73,6 +77,11 @@ class Team(SQLModel, table=True):
     monthly_budget: Optional[float] = None  # amount in budget_currency; None = no budget
     budget_currency: str = "USD"  # USD | EUR
     budget_block: bool = False  # if True, new LLM calls are refused once the month is over budget
+    # Optional Android emulator in this project's sandbox (default off). See docs/android-emulator.md.
+    android_enabled: bool = False
+    android_software: bool = False  # explicit software accel; required when the host has no KVM
+    android_memory_mb: int = 6144
+    android_cpus: int = 4
 
 
 class TeamMember(SQLModel, table=True):
@@ -338,6 +347,7 @@ def init_db() -> None:
     _ensure_endpoint_provider_columns()
     _ensure_oauth_columns()
     _ensure_costs_columns()
+    _ensure_android_columns()
     _ensure_router_columns()
     _ensure_mcp_auth_columns()
     from .usage import seed_prices
@@ -523,6 +533,34 @@ def _ensure_costs_columns() -> None:
             conn.exec_driver_sql("ALTER TABLE team ADD COLUMN budget_currency VARCHAR DEFAULT 'USD'")
         if "budget_block" not in cols:
             conn.exec_driver_sql("ALTER TABLE team ADD COLUMN budget_block BOOLEAN NOT NULL DEFAULT 0")
+        conn.commit()
+
+
+def _ensure_android_columns() -> None:
+    """Add Android-emulator settings on databases created before that option existed."""
+    if not config.DB_URL.startswith("sqlite"):
+        return
+    with engine.connect() as conn:
+        team_cols = [r[1] for r in conn.exec_driver_sql("PRAGMA table_info(team)").fetchall()]
+        team_adds = {
+            "android_enabled": "BOOLEAN NOT NULL DEFAULT 0",
+            "android_software": "BOOLEAN NOT NULL DEFAULT 0",
+            "android_memory_mb": "INTEGER DEFAULT 6144",
+            "android_cpus": "INTEGER DEFAULT 4",
+        }
+        for name, decl in team_adds.items():
+            if name not in team_cols:
+                conn.exec_driver_sql(f"ALTER TABLE team ADD COLUMN {name} {decl}")
+        user_cols = [r[1] for r in conn.exec_driver_sql("PRAGMA table_info(user)").fetchall()]
+        user_adds = {
+            "home_android_enabled": "BOOLEAN NOT NULL DEFAULT 0",
+            "home_android_software": "BOOLEAN NOT NULL DEFAULT 0",
+            "home_android_memory_mb": "INTEGER DEFAULT 6144",
+            "home_android_cpus": "INTEGER DEFAULT 4",
+        }
+        for name, decl in user_adds.items():
+            if name not in user_cols:
+                conn.exec_driver_sql(f"ALTER TABLE user ADD COLUMN {name} {decl}")
         conn.commit()
 
 

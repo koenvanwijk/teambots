@@ -96,6 +96,11 @@ async def _env(key: str, bot_id: int, *, start_vnc: bool = True) -> dict:
             await _ensure_vnc(key, bot_id, env)
         except Exception:
             log.exception("interactive VNC did not start for bot %s (screenshot still works)", bot_id)
+    try:
+        from . import android
+        await android.ensure_emulator(key, bot_id, env)
+    except Exception:
+        log.exception("Android emulator did not start for bot %s (the regular screen still works)", bot_id)
     return env
 
 

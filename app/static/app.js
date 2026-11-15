@@ -510,6 +510,78 @@ async function deleteProjectFlow(t) {
   store.set('tb_team', null); store.set('tb_last_' + t.id, null);
   await boot();
 }
+function androidHomeMount() {
+  const box = $('div', { className: 'field' }, $('span', { textContent: 'Android-emulator' }), $('small', { className: 'muted', textContent: 'Laden…' }));
+  (async () => {
+    let st = {}, h = S.home || {};
+    try { st = (h.android_status) || await api('GET', '/android-status'); } catch { box.lastChild.textContent = 'Kon de Android-status niet laden.'; return; }
+    box.replaceWith(androidFields({
+      enabled: h.android_enabled, software: h.android_software, memory: h.android_memory_mb, cpus: h.android_cpus, status: st,
+      onSave: async body => {
+        const r = await api('PATCH', '/home', body);
+        S.home = r;
+        toast(r.sandbox_restarted ? 'Opgeslagen; sandbox herstart' : 'Opgeslagen');
+      }
+    }));
+  })();
+  return box;
+}
+function androidProjectSection(t) {
+
+  const box = $('div', { className: 'field' }, $('span', { textContent: 'Android-emulator' }), $('small', { className: 'muted', textContent: 'Laden…' }));
+  (async () => {
+    let st = {};
+    try { st = await api('GET', '/android-status'); } catch { box.lastChild.textContent = 'Kon de Android-status niet laden.'; return; }
+    box.replaceWith(androidFields({
+      enabled: t.android_enabled, software: t.android_software, memory: t.android_memory_mb, cpus: t.android_cpus, status: st,
+      onSave: async body => {
+        const r = await api('PATCH', `/teams/${t.id}`, body);
+        Object.assign(t, body);
+        toast(r.sandbox_restarted ? 'Opgeslagen; sandbox herstart' : 'Opgeslagen');
+      }
+    }));
+  })();
+  return box;
+}
+function androidFields({ enabled, software, memory, cpus, status, onSave }) {
+
+  const st = status || {};
+  const en = $('input', { type: 'checkbox', checked: !!enabled });
+  const soft = $('input', { type: 'checkbox', checked: !!software });
+  const mem = $('input', { type: 'number', min: '2048', max: '16384', step: '512', value: memory || 6144 });
+  const cpu = $('input', { type: 'number', min: '1', max: '8', step: '1', value: cpus || 4 });
+  const msg = $('small', { className: 'muted' });
+  const sync = () => {
+    if (!st.docker) { msg.textContent = 'De Android-emulator werkt alleen met de Docker-sandbox.'; return; }
+    if (!st.kvm_available && !soft.checked) {
+      msg.textContent = 'geen KVM, emulator niet beschikbaar';
+      if (!en.checked) en.title = msg.textContent;
+      return;
+    }
+    if (!st.android_image_present) {
+      msg.textContent = 'Het image teambots-sandbox-android ontbreekt nog. Bouw het met: docker build -t teambots-sandbox-android:latest -f sandbox/Dockerfile.android sandbox';
+      return;
+    }
+    msg.textContent = 'De emulator verschijnt op het bestaande scherm (noVNC). In- of uitschakelen herstart de sandbox; bestanden blijven bewaard. Op een Hetzner Cloud-VPS is er meestal geen KVM.';
+  };
+  soft.addEventListener('change', sync);
+  sync();
+  const save = async () => {
+    if (!st.kvm_available && en.checked && !soft.checked) throw new Error('geen KVM, emulator niet beschikbaar');
+    if (en.checked !== !!enabled || soft.checked !== !!software || +mem.value !== +(memory || 6144) || +cpu.value !== +(cpus || 4)) {
+      if (!await confirmBox({ title: 'Sandbox herstarten?', text: 'De sandbox wordt herstart. Open vensters en processen in de computer stoppen. De bestanden op het volume blijven bewaard.', ok: 'Opslaan en herstarten' })) return;
+    }
+    await onSave({ android_enabled: en.checked, android_software: soft.checked, android_memory_mb: +mem.value, android_cpus: +cpu.value });
+  };
+  return $('div', { className: 'field android-opt' },
+    $('span', { textContent: 'Android-emulator' }),
+    $('label', { className: 'check' }, en, $('span', {}, 'Emulator in deze sandbox', $('small', { textContent: 'API 34, x86_64, Google APIs. Eén emulator per project- of overzichtscomputer, zichtbaar op het virtuele scherm. De bot gebruikt adb via de shell.' }))),
+    $('label', { className: 'check' }, soft, $('span', {}, 'Softwaremodus (traag)', $('small', { textContent: 'Alleen gebruiken als er geen KVM is en je dat bewust wilt.' }))),
+    $('label', { className: 'field' }, $('span', { textContent: 'Geheugen (MB)' }), mem),
+    $('label', { className: 'field' }, $('span', { textContent: "CPU's" }), cpu),
+    msg,
+    $('div', { className: 'rowbtns' }, $('button', { className: 'btn sm', textContent: 'Opslaan', onclick: guard(save) })));
+}
 function projectDialog() {
   const t = S.team, admin = t.role === 'admin';
   const inviteUrl = location.origin + '/?invite=' + encodeURIComponent(t.invite_code);
@@ -520,6 +592,7 @@ function projectDialog() {
       $('div', { className: 'copyrow' }, $('code', { textContent: inviteUrl }), $('button', { className: 'btn sm', textContent: 'Copy', onclick: () => copyText(inviteUrl, 'Invite link copied') })),
       $('small', { className: 'muted' }, 'Share this link to invite someone. Or give just the code: ', $('code', { textContent: t.invite_code }))),
     admin && $('label', { className: 'field' }, $('span', { textContent: 'Bot sharing' }), sharing),
+    admin && androidProjectSection(t),
     admin && backupsSection(t),
     $('div', { className: 'field' }, $('span', { textContent: 'People' }), S.members.map(m => $('div', { className: 'li' }, avatar(m.display_name), $('div', { className: 'tx' }, m.display_name, $('small', { textContent: '@' + m.username })), m.role === 'admin' && $('span', { className: 'tag', textContent: 'admin' })))),
     $('div', { className: 'dfoot' }, admin && $('button', { className: 'btn', textContent: 'Rename', onclick: () => { d.close(); guard(renameProject)(); } }), admin && $('button', { className: 'btn danger', textContent: 'Delete project', onclick: () => { d.close(); guard(() => deleteProjectFlow(t))(); } }), $('button', { className: 'btn primary', textContent: 'Done', onclick: () => d.close() }))));
@@ -1325,6 +1398,7 @@ async function openDrawer(bot, tab = 'setup') {
     put(body, fld('Name', name), fld('Instructions', ins), fld('Model endpoint', ep), $('label', { className: 'field' }, $('span', { textContent: 'Model override' }), combo.box, combo.status), fld('Approvals', mode, 'Risky: shell commands, writing files, HTTP requests, routines, untrusted MCP tools and acting on the screen.'),
       $('label', { className: 'check' }, loc, $('span', {}, 'Local-only', $('small', { textContent: 'If this bot uses a Router, private work stays on Spark. Existing bots stay as they are until you turn this on.' }))),
       $('label', { className: 'check' }, cu, $('span', {}, 'Own screen and computer use', $('small', { textContent: 'A virtual screen with a browser. Needs a model with image input and the Docker sandbox.' }))),
+      bot.is_home && androidHomeMount(),
       $('div', { className: 'rowbtns' }, $('button', { className: 'btn primary', textContent: 'Save', onclick: guard(async () => {
         if (bot.is_home) {
           const body = { model: model.value.trim(), computer_use: cu.checked }; if (+ep.value !== bot.endpoint_id) body.endpoint_id = +ep.value;

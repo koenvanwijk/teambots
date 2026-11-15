@@ -19,6 +19,7 @@ capabilities that every teammate or client talks to in private.
 | Memory | Personal memory per user, shared team memory, learnings from collaborators wait for review |
 | Skills, routines | Saved by owner or manager; cron-scheduled prompts per user and conversation |
 | Computer | One sandbox per project, shared by its people and bots: shell and files. Each person also has an Overview bot with its own private chat and sandbox (`tb-home-u{user id}`), not tied to a project. The image includes git and the official GitHub CLI (`gh`); no credentials are baked in, so sign in per project with `gh auth login` |
+| Android | Optional, default off. A project admin (or the Overview-bot owner) can turn on an Android emulator in that sandbox. The container is recreated from `teambots-sandbox-android` with `/dev/kvm` when present; the emulator window appears on the existing noVNC screen, and `adb` is available inside the sandbox. See [docs/android-emulator.md](docs/android-emulator.md) |
 | Screen | With "computer use" on, a bot has its own virtual screen with a browser, screenshot / click / type / key / scroll tools, and a live view in the UI. "Open scherm" attaches noVNC to that same Xvfb so you can use mouse and keyboard (e.g. to sign in to Chromium). Needs a model with image input |
 | Secrets | Never in the sandbox or the model's context. The bot writes `{{secret:NAME}}` in an `http_request`; the app fills it in outside the sandbox, only for the hosts the secret is bound to, never follows redirects, and masks secret values in everything returned to the model. A message that seems to contain a credential (a known token format, `password is ...`, or the value of a stored secret) is held back before it is stored: the person saves it as a secret and sends the placeholder, edits the message, or sends it anyway |
 | Approvals | Risky tools pause for an approval card (Allow once / Always allow / Deny); only the requester can answer |
@@ -142,6 +143,8 @@ TeamBots is meant to sit behind a TLS reverse proxy. It honours `X-Forwarded-Pro
 | `TB_DB_URL` | SQLite in data dir | Any SQLAlchemy URL, e.g. Postgres |
 | `TB_SANDBOX` | `local` | `docker` or `local` |
 | `TB_SANDBOX_IMAGE` | `teambots-sandbox:latest` | Image for the bots' computers |
+| `TB_SANDBOX_ANDROID_IMAGE` | `teambots-sandbox-android:latest` | Optional Android-emulator variant; see [docs/android-emulator.md](docs/android-emulator.md) |
+| `TB_SANDBOX_PREFIX` | `tb` | Prefix of sandbox container and volume names (`tb-p3`, `tb-home-u1`) |
 | `TB_SANDBOX_NETWORK` | `bridge` | Docker network for sandboxes (`none` = offline) |
 | `TB_BROWSER` | `google-chrome` | Browser binary inside the sandbox (`google-chrome` by default; set `chromium` to use Debian Chromium). Runs as user `bot` with `--no-sandbox` because the container drops capabilities. The profile is stored on the project volume under `.screens/bot<id>` |
 | `TB_HTTP_ALLOW_PRIVATE` | `0` | `1` lets `http_request` reach private addresses and send secrets over http (development) |
@@ -164,6 +167,7 @@ app/costs_api.py   Costs API
 app/claude_cli.py  Claude CLI provider (local `claude` binary)
 app/llm_router.py  rule-based model router (Option A)
 app/sandbox.py     the project computer (docker / local)
+app/android.py     optional Android emulator on the bot's existing screen
 app/screen.py      a virtual screen per bot: screenshot, mouse, keyboard
 app/secrets_http.py  secrets filled in outside the sandbox, masking
 app/mcp_client.py  MCP tool discovery and calls

@@ -24,3 +24,11 @@ Moving data from the laptop: stop both sides, copy the `tb-data` volume (`teambo
 
 Before real client use: sign-in is username/password with tokens that do not expire. Put SSO or
 at least token expiry in front first (see README, Security).
+
+## Android-emulator and KVM
+
+A Hetzner Cloud VPS (CX/CPX, the planned TeamBots host) normally has **no KVM**. Nested
+virtualization is not available there, so the optional Android emulator in a project sandbox
+will not start (`geen KVM, emulator niet beschikbaar`). Keep the emulator on a machine that
+has `/dev/kvm` (for example the laptop), or use a Hetzner dedicated server (Robot) where KVM
+works. Software mode exists as an explicit opt-in but is too slow for regular use on a VPS.

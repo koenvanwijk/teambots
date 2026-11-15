@@ -15,7 +15,16 @@ SECRET_KEY = os.environ.get("TB_SECRET_KEY", "dev-insecure-change-me")
 # "docker" = one container per sandbox key; "local" = plain subprocess (development only).
 SANDBOX_BACKEND = os.environ.get("TB_SANDBOX", "local")
 SANDBOX_IMAGE = os.environ.get("TB_SANDBOX_IMAGE", "teambots-sandbox:latest")
+SANDBOX_ANDROID_IMAGE = os.environ.get("TB_SANDBOX_ANDROID_IMAGE", "teambots-sandbox-android:latest")
 SANDBOX_NETWORK = os.environ.get("TB_SANDBOX_NETWORK", "bridge")
+# Container/volume prefix. Default `tb` yields tb-p{id} and tb-home-u{id}.
+# Use a different prefix for a throwaway instance so it never touches production sandboxes.
+SANDBOX_PREFIX = os.environ.get("TB_SANDBOX_PREFIX", "tb")
+SANDBOX_ANDROID_SDK_VOLUME = os.environ.get("TB_SANDBOX_ANDROID_SDK_VOLUME", "tb-android-sdk")
+SANDBOX_MEMORY_MB = int(os.environ.get("TB_SANDBOX_MEMORY_MB", "2048"))
+SANDBOX_CPUS = float(os.environ.get("TB_SANDBOX_CPUS", "2"))
+SANDBOX_ANDROID_MEMORY_MB = int(os.environ.get("TB_SANDBOX_ANDROID_MEMORY_MB", "6144"))
+SANDBOX_ANDROID_CPUS = float(os.environ.get("TB_SANDBOX_ANDROID_CPUS", "4"))
 TIMEZONE = os.environ.get("TB_TIMEZONE", "Europe/Amsterdam")
 SANDBOX_BROWSER = os.environ.get("TB_BROWSER", "google-chrome")
 # http_request may only reach public addresses unless this is set (development, internal APIs).
