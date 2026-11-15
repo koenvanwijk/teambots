@@ -1194,6 +1194,7 @@ async def add_mcp(bot_id: int, body: McpIn, user: User = Depends(current_user)):
         s.add(r)
         s.commit()
         r_id = r.id
+    events.publish_bot(bot_id, "mcp", action="add", id=r_id)
     # A per-user or OAuth server has no credentials yet, so don't probe it as the adder.
     try:
         probe_user = user.id if scope != "user" else None
@@ -1285,7 +1286,10 @@ async def patch_mcp(server_id: int, body: McpPatch, user: User = Depends(current
                                                                     "oauth_token_url", "oauth_client_id") else v)
         s.add(r)
         s.commit()
-        return _mcp_out(r, user.id, s)
+        out = _mcp_out(r, user.id, s)
+        bot_id = r.bot_id
+    events.publish_bot(bot_id, "mcp", action="update", id=server_id)
+    return out
 
 
 class McpCredIn(BaseModel):
@@ -1312,7 +1316,9 @@ def set_mcp_credential(server_id: int, body: McpCredIn, user: User = Depends(cur
                                  value_enc=config.encrypt(body.value.strip()))
         s.add(cred)
         s.commit()
+        bot_id = r.bot_id
     mcp_client.invalidate(server_id)
+    events.publish_bot(bot_id, "mcp", action="update", id=server_id)
     return {"ok": True, "connected": True}
 
 
@@ -1324,10 +1330,12 @@ def clear_mcp_credential(server_id: int, user: User = Depends(current_user)):
         _bot(s, r.bot_id, user)
         cred = s.exec(select(McpCredential).where(
             McpCredential.mcp_server_id == server_id, McpCredential.user_id == user.id)).first()
+        bot_id = r.bot_id
         if cred:
             s.delete(cred)
             s.commit()
     mcp_client.invalidate(server_id)
+    events.publish_bot(bot_id, "mcp", action="update", id=server_id)
     return {"ok": True, "connected": False}
 
 
@@ -1392,11 +1400,13 @@ def delete_mcp(server_id: int, user: User = Depends(current_user)):
         r = s.get(McpServer, server_id)
         _need(r, 404, "server not found")
         _bot(s, r.bot_id, user, manage=True)
+        bot_id = r.bot_id
         for cred in s.exec(select(McpCredential).where(McpCredential.mcp_server_id == server_id)).all():
             s.delete(cred)
         s.delete(r)
         s.commit()
     mcp_client.invalidate(server_id)
+    events.publish_bot(bot_id, "mcp", action="delete", id=server_id)
     return {"ok": True}
 
 
@@ -1972,5 +1982,26 @@ async def stream_events(conv_id: int, user: User = Depends(current_user)):
                     yield ": keepalive\n\n"
         finally:
             events.unsubscribe(conv_id, q)
+
+    return StreamingResponse(gen(), media_type="text/event-stream", headers={"Cache-Control": "no-cache"})
+
+
+@router.get("/bots/{bot_id}/events")
+async def stream_bot_events(bot_id: int, user: User = Depends(current_user)):
+    # Live updates for the settings drawer (MCP servers added by a tool or another member).
+    with session() as s:
+        _bot(s, bot_id, user)
+
+    async def gen():
+        q = events.subscribe_bot(bot_id)
+        try:
+            while True:
+                try:
+                    ev = await asyncio.wait_for(q.get(), 20)
+                    yield f"data: {json.dumps(ev)}\n\n"
+                except asyncio.TimeoutError:
+                    yield ": keepalive\n\n"
+        finally:
+            events.unsubscribe_bot(bot_id, q)
 
     return StreamingResponse(gen(), media_type="text/event-stream", headers={"Cache-Control": "no-cache"})

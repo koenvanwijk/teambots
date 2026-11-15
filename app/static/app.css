@@ -260,8 +260,10 @@ button.card:hover { background:var(--s1); }
 .dbody { flex:1; overflow-y:auto; padding:16px; min-height:0; }
 .dbody h4 { display:flex; align-items:center; justify-content:space-between; font-size:13.5px; margin:22px 0 4px; } .dbody h4:first-child { margin-top:0; }
 .dbody .hint { font-size:12.5px; color:var(--muted); margin:0 0 10px; line-height:1.45; }
-.li { display:flex; align-items:center; gap:8px; padding:9px 0; border-bottom:1px solid var(--line); min-width:0; }
-.li .tx { flex:1; min-width:0; overflow-wrap:anywhere; font-size:14px; } .li .tx small { display:block; color:var(--muted); font-size:12.5px; }
+.li { display:flex; align-items:center; gap:8px; padding:9px 0; border-bottom:1px solid var(--line); min-width:0; flex-wrap:wrap; }
+.li .tx { flex:1 1 12em; min-width:min(12em, 100%); overflow-wrap:break-word; font-size:14px; }
+.li .tx small { display:block; color:var(--muted); font-size:12.5px; overflow-wrap:break-word; }
+.li-act { display:flex; align-items:center; gap:8px; flex-wrap:wrap; flex:0 1 auto; }
 .li .ib { width:28px; height:28px; }
 .none { color:var(--muted); font-size:13px; padding:6px 0; }
 .rowbtns { display:flex; gap:8px; flex-wrap:wrap; margin-top:6px; }
