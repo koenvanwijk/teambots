@@ -1,0 +1,12 @@
+[Unit]
+Description=Nightly SQLite backup of the TeamBots database
+After=docker.service
+# The app may be running; the backup uses SQLite's online backup API.
+
+[Service]
+Type=oneshot
+User=root
+Environment=TB_DATA_DIR=/opt/teambots/data
+Environment=TB_BACKUP_DIR=/opt/teambots/backups
+Environment=TB_BACKUP_KEEP=14
+ExecStart=/opt/teambots/scripts/backup-db.sh
