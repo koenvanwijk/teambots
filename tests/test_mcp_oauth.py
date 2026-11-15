@@ -26,6 +26,18 @@ from app.main import app  # noqa: E402
 SECRET = "super-secret-mcp-client"
 
 
+@pytest.fixture(autouse=True)
+def _oauth_isolation():
+    """Do not call real .well-known endpoints; tests that need metadata call prime_metadata()."""
+    mcp_oauth.clear_metadata_cache()
+    prev = mcp_oauth._discovery_enabled
+    mcp_oauth._discovery_enabled = False
+    yield
+    mcp_oauth._discovery_enabled = prev
+    mcp_oauth.clear_metadata_cache()
+
+
+
 @pytest.fixture(scope="module")
 def c():
     import app.db as db
@@ -211,3 +223,162 @@ def test_tool_requires_authorize_and_token_urls_with_client_id(c, auth):
     assert SECRET not in out
     with session() as s:
         assert s.exec(select(McpServer).where(McpServer.name == "incomplete")).first() is None
+
+
+
+def _homey_oauth_payload(scopes=""):
+    return {
+        "name": "homeymeta", "url": "https://mcp.athom.com", "auth_mode": "oauth",
+        "oauth_authorize_url": "https://mcp.athom.com/oauth2/authorise",
+        "oauth_token_url": "https://mcp.athom.com/oauth2/token",
+        "oauth_client_id": "68ff6e-test",
+        "oauth_client_secret": SECRET,
+        "oauth_scopes": scopes,
+    }
+
+
+def test_build_authorize_url_omits_scope_when_empty(c, auth):
+    headers, bot_id = auth["headers"], auth["bot_id"]
+    r = c.post(f"/api/bots/{bot_id}/mcp", headers=headers, json=_homey_oauth_payload(""))
+    assert r.status_code == 200, r.text
+    start = c.get(f"/api/mcp/{r.json()['id']}/oauth/start", headers=headers)
+    assert start.status_code == 200, start.text
+    qs = parse_qs(urlparse(start.json()["url"]).query)
+    assert "scope" not in qs
+    assert "response_mode" not in qs
+    assert qs["response_type"] == ["code"]
+    assert qs["redirect_uri"] == ["https://bots.example.com/api/mcp/oauth/callback"]
+    assert SECRET not in start.json()["url"]
+
+
+def test_build_authorize_url_adds_form_post_when_metadata_requires_it(c, auth):
+    mcp_oauth.prime_metadata("https://mcp.athom.com", {
+        "response_modes_supported": ["form_post"],
+        "token_endpoint_auth_methods_supported": ["client_secret_basic"],
+    })
+    headers, bot_id = auth["headers"], auth["bot_id"]
+    payload = _homey_oauth_payload("homey.device.readonly")
+    payload["name"] = "homeyform"
+    r = c.post(f"/api/bots/{bot_id}/mcp", headers=headers, json=payload)
+    assert r.status_code == 200, r.text
+    start = c.get(f"/api/mcp/{r.json()['id']}/oauth/start", headers=headers)
+    qs = parse_qs(urlparse(start.json()["url"]).query)
+    assert qs["response_mode"] == ["form_post"]
+    assert qs["scope"] == ["homey.device.readonly"]
+
+
+def test_oauth_callback_rejects_unknown_state_on_get_and_post(c):
+    get = c.get("/api/mcp/oauth/callback", params={"code": "x", "state": "nope"}, follow_redirects=False)
+    assert get.status_code == 302
+    assert get.headers["location"] == "/#mcp=error"
+    post = c.post("/api/mcp/oauth/callback", data={"code": "x", "state": "nope"}, follow_redirects=False)
+    assert post.status_code == 302, post.text
+    assert post.headers["location"] == "/#mcp=error"
+
+
+def test_oauth_callback_post_form_exchanges_code(c, auth, monkeypatch):
+    headers, bot_id = auth["headers"], auth["bot_id"]
+    payload = _homey_oauth_payload("")
+    payload["name"] = "homeypost"
+    created = c.post(f"/api/bots/{bot_id}/mcp", headers=headers, json=payload)
+    assert created.status_code == 200, created.text
+    sid = created.json()["id"]
+    start = c.get(f"/api/mcp/{sid}/oauth/start", headers=headers)
+    state = parse_qs(urlparse(start.json()["url"]).query)["state"][0]
+
+    async def fake_exchange(server, code, code_verifier):
+        assert code == "the-code"
+        assert code_verifier
+        return "access-token", "refresh-token", None
+
+    monkeypatch.setattr(mcp_oauth, "exchange_code", fake_exchange)
+    r = c.post("/api/mcp/oauth/callback",
+               data={"code": "the-code", "state": state},
+               follow_redirects=False)
+    assert r.status_code == 302, r.text
+    assert r.headers["location"] == "/#mcp=connected"
+    listing = c.get(f"/api/bots/{bot_id}/mcp", headers=headers).json()
+    row = next(x for x in listing if x["id"] == sid)
+    assert row["connected"] is True
+    dump = json.dumps(listing)
+    assert "access-token" not in dump and "refresh-token" not in dump
+    assert SECRET not in dump
+
+
+def test_token_request_uses_basic_when_metadata_requires_it(c, auth):
+    captured = []
+
+    class FakeResp:
+        status_code = 200
+        text = "{}"
+
+        def json(self):
+            return {"access_token": "atok", "refresh_token": "rtok", "expires_in": 3600}
+
+    async def fake_post(url, body, headers):
+        captured.append({"url": url, "body": dict(body), "headers": dict(headers)})
+        return FakeResp()
+
+    mcp_oauth.prime_metadata("https://mcp.athom.com", {
+        "token_endpoint_auth_methods_supported": ["client_secret_basic"],
+        "response_modes_supported": ["form_post"],
+    })
+    headers, bot_id = auth["headers"], auth["bot_id"]
+    payload = _homey_oauth_payload("")
+    payload["name"] = "homeybasic"
+    created = c.post(f"/api/bots/{bot_id}/mcp", headers=headers, json=payload)
+    assert created.status_code == 200, created.text
+    with session() as s:
+        server = s.get(McpServer, created.json()["id"])
+        assert server is not None
+    saved = mcp_oauth._post_token
+    mcp_oauth._post_token = fake_post
+    try:
+        data = asyncio.run(mcp_oauth._token_request(server, {"grant_type": "authorization_code", "code": "c",
+                                                              "code_verifier": "v"}))
+    finally:
+        mcp_oauth._post_token = saved
+    assert data["access_token"] == "atok"
+    assert len(captured) == 1
+    assert "client_secret" not in captured[0]["body"]
+    assert captured[0]["headers"]["Authorization"].startswith("Basic ")
+    assert SECRET not in json.dumps(captured[0]["body"])
+    assert SECRET not in captured[0]["headers"]["Authorization"]
+    assert SECRET not in json.dumps(captured)
+
+
+def test_token_request_falls_back_to_basic_after_post_401(c):
+    captured = []
+
+    class FakeResp:
+        def __init__(self, status, payload=None, text="err"):
+            self.status_code = status
+            self._payload = payload
+            self.text = text
+
+        def json(self):
+            return self._payload
+
+    async def fake_post(url, body, headers):
+        captured.append({"body": dict(body), "headers": dict(headers)})
+        if "Authorization" not in headers:
+            return FakeResp(401, text="need basic")
+        return FakeResp(200, {"access_token": "atok2", "refresh_token": "rtok2", "expires_in": 60})
+
+    # no metadata (discovery off) -> try post first, then basic
+    mcp_oauth.clear_metadata_cache()
+    with session() as s:
+        server = s.exec(select(McpServer).where(McpServer.name == "homeyauth")).first()
+    saved = mcp_oauth._post_token
+    mcp_oauth._post_token = fake_post
+    try:
+        data = asyncio.run(mcp_oauth._token_request(server, {"grant_type": "refresh_token",
+                                                              "refresh_token": "old"}))
+    finally:
+        mcp_oauth._post_token = saved
+    assert data["access_token"] == "atok2"
+    assert len(captured) == 2
+    assert "client_secret" in captured[0]["body"]
+    assert "Authorization" not in captured[0]["headers"]
+    assert "client_secret" not in captured[1]["body"]
+    assert captured[1]["headers"]["Authorization"].startswith("Basic ")

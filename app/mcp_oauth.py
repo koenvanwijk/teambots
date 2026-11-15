@@ -3,16 +3,18 @@
 The admin configures a server's OAuth client once (authorize/token URLs, client id,
 optional secret, scopes). Each member authorizes and receives their own access and
 refresh tokens, stored encrypted in McpCredential. Works for Athom/Homey, Google and
-any standard OAuth2 server. Discovery / dynamic client registration is not used; the
-endpoints are configured explicitly.
+any standard OAuth2 server. Authorization-server metadata (.well-known) is fetched
+when available, so we can honour form_post and client_secret_basic. Dynamic client
+registration is not used; the endpoints are configured explicitly.
 """
 from __future__ import annotations
 
 import base64
 import hashlib
 import secrets as pysecrets
+import time
 from datetime import timedelta
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlparse
 
 import httpx
 
@@ -20,6 +22,10 @@ from . import config
 from .db import McpOAuthState, McpServer, now, session
 
 STATE_TTL_S = 600
+_META_TTL_S = 3600
+_META_FAIL_TTL_S = 60
+_metadata_cache: dict[str, tuple[float, dict]] = {}
+_discovery_enabled = True
 
 
 def normalize_scopes(value) -> str:
@@ -51,6 +57,80 @@ def _pkce() -> tuple[str, str]:
     return verifier, challenge
 
 
+def _origins(server: McpServer) -> list[str]:
+    origins: list[str] = []
+    for raw in (getattr(server, "oauth_authorize_url", ""), getattr(server, "oauth_token_url", ""),
+                getattr(server, "url", "")):
+        if not raw:
+            continue
+        p = urlparse(raw)
+        if p.scheme and p.netloc:
+            origin = f"{p.scheme}://{p.netloc}"
+            if origin not in origins:
+                origins.append(origin)
+    return origins
+
+
+def clear_metadata_cache() -> None:
+    _metadata_cache.clear()
+
+
+def prime_metadata(origin: str, data: dict, ttl: float = _META_TTL_S) -> None:
+    """Test helper: pre-load authorization-server metadata for an origin."""
+    _metadata_cache[origin.rstrip("/")] = (time.time() + ttl, dict(data or {}))
+
+
+def authorization_server_metadata(server: McpServer) -> dict:
+    """RFC 8414 metadata for this server's issuer, cached. Empty dict if discovery fails."""
+    now_ts = time.time()
+    skip = set()
+    for origin in _origins(server):
+        hit = _metadata_cache.get(origin)
+        if hit and hit[0] > now_ts:
+            if hit[1]:
+                return hit[1]
+            skip.add(origin)
+    for origin in _origins(server):
+        if origin in skip or not _discovery_enabled:
+            continue
+        url = origin + "/.well-known/oauth-authorization-server"
+        try:
+            with httpx.Client(timeout=5.0) as client:
+                r = client.get(url, headers={"Accept": "application/json"})
+            if r.status_code >= 400:
+                _metadata_cache[origin] = (now_ts + _META_FAIL_TTL_S, {})
+                continue
+            data = r.json()
+            if not isinstance(data, dict):
+                data = {}
+            _metadata_cache[origin] = (now_ts + _META_TTL_S, data)
+            if data:
+                return data
+        except (httpx.HTTPError, ValueError):
+            _metadata_cache[origin] = (now_ts + _META_FAIL_TTL_S, {})
+    return {}
+
+
+def _wants_form_post(meta: dict) -> bool:
+    modes = [str(m).lower() for m in (meta.get("response_modes_supported") or [])]
+    if not modes:
+        return False
+    return "form_post" in modes and "query" not in modes
+
+
+def _token_auth_methods(meta: dict) -> list[str]:
+    return [str(m).lower() for m in (meta.get("token_endpoint_auth_methods_supported") or [])]
+
+
+def _prefer_basic(meta: dict, has_secret: bool) -> bool:
+    if not has_secret:
+        return False
+    methods = _token_auth_methods(meta)
+    if not methods:
+        return False
+    return "client_secret_basic" in methods and "client_secret_post" not in methods
+
+
 def build_authorize_url(server: McpServer, user_id: int) -> str:
     """Create a one-time state + PKCE verifier and return the provider authorize URL."""
     if not config.PUBLIC_URL:
@@ -73,6 +153,8 @@ def build_authorize_url(server: McpServer, user_id: int) -> str:
     scopes = normalize_scopes(server.oauth_scopes)
     if scopes:
         params["scope"] = scopes
+    if _wants_form_post(authorization_server_metadata(server)):
+        params["response_mode"] = "form_post"
     sep = "&" if "?" in server.oauth_authorize_url else "?"
     return server.oauth_authorize_url + sep + urlencode(params)
 
@@ -117,17 +199,46 @@ def parse_token_response(data: dict) -> tuple[str, str, object]:
     return access, refresh, expires_at
 
 
-async def _token_request(server: McpServer, data: dict) -> dict:
-    body = {**data, "client_id": server.oauth_client_id, "redirect_uri": redirect_uri()}
-    secret = config.decrypt(server.oauth_client_secret_enc) if server.oauth_client_secret_enc else ""
-    if secret:
+def _basic_header(client_id: str, secret: str) -> str:
+    raw = f"{client_id}:{secret}".encode()
+    return "Basic " + base64.b64encode(raw).decode()
+
+
+def _token_headers(basic: bool, client_id: str, secret: str) -> dict:
+    headers = {"Accept": "application/json"}
+    if basic and secret:
+        headers["Authorization"] = _basic_header(client_id, secret)
+    return headers
+
+
+def _token_body(data: dict, client_id: str, secret: str, basic: bool) -> dict:
+    body = {**data, "client_id": client_id, "redirect_uri": redirect_uri()}
+    if secret and not basic:
         body["client_secret"] = secret
+    return body
+
+
+async def _post_token(url: str, body: dict, headers: dict) -> httpx.Response:
     try:
         async with httpx.AsyncClient(timeout=30) as client:
-            r = await client.post(server.oauth_token_url, data=body,
-                                  headers={"Accept": "application/json"})
+            return await client.post(url, data=body, headers=headers)
     except httpx.HTTPError as e:
         raise OAuthError(f"cannot reach the token endpoint: {e.__class__.__name__}") from e
+
+
+async def _token_request(server: McpServer, data: dict) -> dict:
+    secret = config.decrypt(server.oauth_client_secret_enc) if server.oauth_client_secret_enc else ""
+    client_id = server.oauth_client_id
+    meta = authorization_server_metadata(server)
+    use_basic = _prefer_basic(meta, bool(secret))
+    body = _token_body(data, client_id, secret, use_basic)
+    headers = _token_headers(use_basic, client_id, secret)
+    r = await _post_token(server.oauth_token_url, body, headers)
+    if r.status_code in (400, 401) and secret and not use_basic:
+        # Some servers (Homey MCP) only accept HTTP Basic; retry once.
+        body = _token_body(data, client_id, secret, basic=True)
+        headers = _token_headers(True, client_id, secret)
+        r = await _post_token(server.oauth_token_url, body, headers)
     if r.status_code >= 400:
         raise OAuthError(f"token endpoint returned HTTP {r.status_code}: {r.text[:200]}")
     try:
