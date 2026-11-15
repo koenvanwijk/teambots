@@ -153,7 +153,10 @@ def _create_home(s: Session, user: User) -> Bot:
 
 
 def apply_settings(s: Session, user: User, endpoint_id: Optional[int] = None, model: Optional[str] = None,
-                   computer_use: Optional[bool] = None) -> Bot:
+                   computer_use: Optional[bool] = None, android_enabled: Optional[bool] = None,
+                   android_software: Optional[bool] = None, android_memory_mb: Optional[int] = None,
+                   android_cpus: Optional[int] = None) -> Bot:
+    from . import sandbox
     bot, _ = ensure_home(s, user)
     available = {e.id: e for e in _usable_endpoints(s, user)}
     if endpoint_id is not None:
@@ -166,11 +169,29 @@ def apply_settings(s: Session, user: User, endpoint_id: Optional[int] = None, mo
         bot.model = model
     if computer_use is not None:
         bot.computer_use = computer_use
+    android_changed = any(v is not None for v in (
+        android_enabled, android_software, android_memory_mb, android_cpus))
+    if android_changed:
+        enabled = user.home_android_enabled if android_enabled is None else bool(android_enabled)
+        software = user.home_android_software if android_software is None else bool(android_software)
+        mem = user.home_android_memory_mb if android_memory_mb is None else android_memory_mb
+        cpus = user.home_android_cpus if android_cpus is None else android_cpus
+        mem, cpus = sandbox.validate_android_limits(mem, cpus)
+        sandbox.validate_android_enable(enabled=enabled, software=software)
+        user.home_android_enabled = enabled
+        user.home_android_software = software
+        user.home_android_memory_mb = mem
+        user.home_android_cpus = cpus
     s.add(user)
     s.add(bot)
     s.commit()
     s.refresh(bot)
     return bot
+
+
+def _android_status() -> dict:
+    from . import sandbox
+    return sandbox.host_android_status()
 
 
 def home_out(s: Session, user: User, bot: Bot, conv: Conversation) -> dict:
@@ -182,6 +203,11 @@ def home_out(s: Session, user: User, bot: Bot, conv: Conversation) -> dict:
         "endpoint_id": bot.endpoint_id,
         "model": bot.model,
         "computer_use": bot.computer_use,
+        "android_enabled": bool(getattr(user, "home_android_enabled", False)),
+        "android_software": bool(getattr(user, "home_android_software", False)),
+        "android_memory_mb": int(getattr(user, "home_android_memory_mb", None) or 6144),
+        "android_cpus": int(getattr(user, "home_android_cpus", None) or 4),
+        "android_status": _android_status(),
         "endpoints": [
             {"id": e.id, "name": e.name, "default_model": e.default_model, "base_url": e.base_url,
              "project": teams[e.team_id].name if e.team_id in teams else "",

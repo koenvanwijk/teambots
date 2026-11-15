@@ -283,6 +283,12 @@ def auth_identities(user: User = Depends(current_user)):
                             "email": i.email} for i in rows]}
 
 
+@router.get("/android-status")
+def android_status(user: User = Depends(current_user)):
+    """Whether this host can run the optional Android emulator in a sandbox."""
+    return sandbox.host_android_status()
+
+
 # ---------------------------------------------------------------- overview bot (per user, not tied to a project)
 
 @router.get("/home")
@@ -300,21 +306,40 @@ class HomePatch(BaseModel):
     endpoint_id: Optional[int] = None
     model: Optional[str] = None
     computer_use: Optional[bool] = None
+    android_enabled: Optional[bool] = None
+    android_software: Optional[bool] = None
+    android_memory_mb: Optional[int] = None
+    android_cpus: Optional[int] = None
 
 
 @router.patch("/home")
-def patch_home(body: HomePatch, user: User = Depends(current_user)):
+async def patch_home(body: HomePatch, user: User = Depends(current_user)):
     """Choose the model endpoint (from any of your projects) and options for the overview bot."""
+    android_changed = any(v is not None for v in (
+        body.android_enabled, body.android_software, body.android_memory_mb, body.android_cpus))
     with session() as s:
         try:
-            bot = home.apply_settings(s, user, endpoint_id=body.endpoint_id, model=body.model,
-                                      computer_use=body.computer_use)
+            bot = home.apply_settings(
+                s, user, endpoint_id=body.endpoint_id, model=body.model,
+                computer_use=body.computer_use, android_enabled=body.android_enabled,
+                android_software=body.android_software, android_memory_mb=body.android_memory_mb,
+                android_cpus=body.android_cpus)
             conv = home._home_conv(s, bot)
             if not conv:
                 bot, conv = home.ensure_home(s, user)
-        except ValueError as e:
+            user = s.get(User, user.id)
+        except (ValueError, sandbox.AndroidUnavailable) as e:
             raise HTTPException(400, str(e)) from e
-        return home.home_out(s, user, bot, conv)
+        out = home.home_out(s, user, bot, conv)
+    if android_changed:
+        try:
+            applied = await sandbox.apply_spec(home.sandbox_key(bot))
+        except sandbox.AndroidUnavailable as e:
+            raise HTTPException(400, str(e)) from e
+        out["sandbox_restarted"] = applied.get("restarted", False)
+    else:
+        out["sandbox_restarted"] = False
+    return out
 
 
 @router.get("/home/files")
@@ -367,7 +392,11 @@ def my_teams(user: User = Depends(current_user)):
         out = []
         for m in s.exec(select(TeamMember).where(TeamMember.user_id == user.id)).all():
             t = s.get(Team, m.team_id)
-            d = {"id": t.id, "name": t.name, "client": t.client, "role": m.role, "bot_sharing": t.bot_sharing}
+            d = {"id": t.id, "name": t.name, "client": t.client, "role": m.role, "bot_sharing": t.bot_sharing,
+                 "android_enabled": bool(getattr(t, "android_enabled", False)),
+                 "android_software": bool(getattr(t, "android_software", False)),
+                 "android_memory_mb": int(getattr(t, "android_memory_mb", None) or 6144),
+                 "android_cpus": int(getattr(t, "android_cpus", None) or 4)}
             if m.role == "admin":
                 d["invite_code"] = t.invite_code
                 d["monthly_budget"] = getattr(t, "monthly_budget", None)
@@ -460,10 +489,14 @@ class TeamPatch(BaseModel):
     monthly_budget: Optional[float] = None
     budget_currency: Optional[str] = None
     budget_block: Optional[bool] = None
+    android_enabled: Optional[bool] = None
+    android_software: Optional[bool] = None
+    android_memory_mb: Optional[int] = None
+    android_cpus: Optional[int] = None
 
 
 @router.patch("/teams/{team_id}")
-def patch_team(team_id: int, body: TeamPatch, user: User = Depends(current_user)):
+async def patch_team(team_id: int, body: TeamPatch, user: User = Depends(current_user)):
     _need(body.bot_sharing in (None, "everyone", "admins"), 400, "bot_sharing: everyone | admins")
     _need(body.name is None or body.name.strip(), 400, "the project needs a name")
     data = body.model_dump(exclude_unset=True)
@@ -471,6 +504,8 @@ def patch_team(team_id: int, body: TeamPatch, user: User = Depends(current_user)
         _need(data["budget_currency"] in ("USD", "EUR"), 400, "budget_currency: USD | EUR")
     if "monthly_budget" in data and data["monthly_budget"] is not None:
         _need(data["monthly_budget"] >= 0, 400, "monthly_budget must be 0 or more")
+    android_changed = any(k in data for k in (
+        "android_enabled", "android_software", "android_memory_mb", "android_cpus"))
     with session() as s:
         _need(team_role(s, user.id, team_id) == "admin")
         t = s.get(Team, team_id)
@@ -486,9 +521,35 @@ def patch_team(team_id: int, body: TeamPatch, user: User = Depends(current_user)
             t.budget_currency = data["budget_currency"]
         if "budget_block" in data:
             t.budget_block = bool(data["budget_block"])
+        if android_changed:
+            enabled = t.android_enabled if body.android_enabled is None else bool(body.android_enabled)
+            software = t.android_software if body.android_software is None else bool(body.android_software)
+            mem = t.android_memory_mb if body.android_memory_mb is None else body.android_memory_mb
+            cpus = t.android_cpus if body.android_cpus is None else body.android_cpus
+            try:
+                mem, cpus = sandbox.validate_android_limits(mem, cpus)
+                sandbox.validate_android_enable(enabled=enabled, software=software)
+            except (ValueError, sandbox.AndroidUnavailable) as e:
+                raise HTTPException(400, str(e)) from e
+            t.android_enabled = enabled
+            t.android_software = software
+            t.android_memory_mb = mem
+            t.android_cpus = cpus
         s.add(t)
         s.commit()
-    return {"ok": True}
+        out = {"ok": True,
+               "android_enabled": bool(t.android_enabled),
+               "android_software": bool(t.android_software),
+               "android_memory_mb": int(t.android_memory_mb or 6144),
+               "android_cpus": int(t.android_cpus or 4),
+               "sandbox_restarted": False}
+    if android_changed:
+        try:
+            applied = await sandbox.apply_spec(f"p{team_id}")
+        except sandbox.AndroidUnavailable as e:
+            raise HTTPException(400, str(e)) from e
+        out["sandbox_restarted"] = applied.get("restarted", False)
+    return out
 
 
 @router.delete("/teams/{team_id}")
@@ -545,7 +606,7 @@ def delete_team(team_id: int, confirm: str = Query(default=""), user: User = Dep
         s.delete(s.get(Team, team_id))
         s.commit()
     # 3) Remove the project's workspace: the Docker container and volume, and any local dir.
-    vol = f"tb-p{team_id}"
+    vol = sandbox.workspace_volume(f"p{team_id}")
     try:
         subprocess.run(["docker", "rm", "-f", vol], capture_output=True, timeout=30)
         subprocess.run(["docker", "volume", "rm", vol], capture_output=True, timeout=30)
