@@ -1355,14 +1355,20 @@ def mcp_oauth_start(server_id: int, user: User = Depends(current_user)):
     return {"url": url}
 
 
-@router.get("/mcp/oauth/callback")
-async def mcp_oauth_callback(code: str = Query(default=""), state: str = Query(default=""),
-                            error: str = Query(default="")):
-    """Provider redirect: exchange the code for this user's tokens (identity comes from state)."""
+@router.api_route("/mcp/oauth/callback", methods=["GET", "POST"])
+async def mcp_oauth_callback(request: Request, code: str = Query(default=""),
+                            state: str = Query(default=""), error: str = Query(default="")):
+    """Provider redirect (GET query or POST form_post): exchange the code; identity comes from state."""
     from . import mcp_oauth
 
     def back(flag: str) -> RedirectResponse:
         return RedirectResponse(f"/#mcp={flag}", status_code=302)
+
+    if request.method == "POST":
+        form = await request.form()
+        code = (form.get("code") or code) or ""
+        state = (form.get("state") or state) or ""
+        error = (form.get("error") or error) or ""
 
     if error or not code or not state:
         return back("error")
