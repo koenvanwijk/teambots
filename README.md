@@ -38,7 +38,8 @@ Docker sandbox backend, a real model, and anything on Windows or Hetzner.
 ## Run it on Linux
 
 Needs Docker Engine with the compose plugin. `./start.sh`, then open http://localhost:8080. The
-script creates `.env` with a random `TB_SECRET_KEY` on first run. Logs: `docker compose logs -f app`.
+script creates `.env` with a random `TB_SECRET_KEY` on first run and uses `docker-compose.local.yml`
+(the laptop compose file, without the VPS Tailscale bind). Logs: `docker compose -f docker-compose.local.yml logs -f app`.
 To run the tests instead: `pip install -r requirements.txt && pytest -q` (the screen test also
 needs Xvfb, xdotool, ImageMagick and a Chromium, and is skipped without them).
 
@@ -49,7 +50,7 @@ http://localhost:8080. The script creates `.env` with a random `TB_SECRET_KEY` o
 A model server on the laptop itself is reachable as `http://host.docker.internal:<port>/v1`.
 The local (non-Docker) backend needs a Unix shell and does not work on plain Windows.
 
-For Hetzner see `deploy/hetzner.md`.
+For a Hetzner VPS (host Tailscale, port 18080 on loopback and the Tailscale IP only) see `docs/deploy-vps.md`.
 
 ## Run it without Docker (Linux, macOS, WSL)
 
@@ -67,15 +68,22 @@ To try it without a real model: `uvicorn tests.mock_llm:app --port 8791`, then a
 A message with `SLOW 20` in it makes the mock wait 20 seconds, so you can try typing while the bot
 is busy.
 
-## Run it on a VPS or DGX Spark
+## Run it on a VPS
+
+The default `docker-compose.yml` is meant for a VPS. The app uses the host's Tailscale (joined
+with an interactive `tailscale up`) and listens on port 18080, published on `127.0.0.1` and the
+host's Tailscale IPv4 (`TB_TAILSCALE_IP`). It is not published on the public NIC. Full procedure
+(interactive login, trial run, cutover, backups, rollback): `docs/deploy-vps.md`.
 
 ```bash
-echo "TB_SECRET_KEY=$(openssl rand -hex 32)" > .env
+cp .env.example .env   # set TB_SECRET_KEY and TB_TAILSCALE_IP (`tailscale ip -4`)
 docker compose up -d --build
 ```
 
-Put a TLS reverse proxy (Caddy, Traefik, nginx) in front of port 8080. Keep `TB_SECRET_KEY`
-safe: it encrypts the stored API keys and secrets, and losing it makes them unreadable.
+Keep `TB_SECRET_KEY` safe: it encrypts the stored API keys and secrets, and losing it makes them
+unreadable. Do not put a public reverse proxy or tunnel in front until that is agreed.
+
+A laptop or Docker Desktop should keep using `./start.sh` / `docker-compose.local.yml` (port 8080).
 
 ## First steps in the UI
 

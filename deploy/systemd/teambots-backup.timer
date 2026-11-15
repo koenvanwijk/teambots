@@ -1,0 +1,11 @@
+[Unit]
+Description=Nightly SQLite backup of the TeamBots database
+
+[Timer]
+# 03:15 Europe/Amsterdam (set the host timezone, see docs/deploy-vps.md).
+OnCalendar=*-*-* 03:15:00
+Persistent=true
+RandomizedDelaySec=10m
+
+[Install]
+WantedBy=timers.target

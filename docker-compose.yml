@@ -1,31 +1,66 @@
+# TeamBots on a VPS. The app uses the *host's* Tailscale (the node you join
+# with an interactive `tailscale up`) to reach the tailnet. There is no
+# sidecar: a second tailscaled would be another node, and the official
+# Tailscale image exits when TS_AUTHKEY is empty — which does not fit an
+# interactive login.
+#
+# The UI is published on 127.0.0.1 and on the host's Tailscale IPv4, never
+# on 0.0.0.0 / the public NIC. network_mode: host is avoided for the same
+# reason: uvicorn would then listen on the public address too.
+# Sandboxes join the `teambots` Docker network so the app can reach their
+# interactive screens. See docs/deploy-vps.md.
+#
+#   cp .env.example .env   # fill TB_SECRET_KEY and TB_TAILSCALE_IP
+#   docker compose up -d --build
+#
+# For a laptop / Docker Desktop, use docker-compose.local.yml
+# (./start.sh and .\start.ps1).
 services:
-  sandbox-image:            # only builds the image the app starts project sandboxes from
+  sandbox-image:
     build: ./sandbox
     image: teambots-sandbox:latest
     command: ["true"]
     restart: "no"
+
   app:
     build: .
-    depends_on: [sandbox-image]
-    ports: ["${TB_BIND:-127.0.0.1}:8080:8080"]   # local only by default; Caddy fronts it on a server
+    image: teambots-app:latest
+    depends_on:
+      sandbox-image:
+        condition: service_completed_successfully
+    command:
+      - sh
+      - -c
+      - mkdir -p /data/claude-home /data/claude-cli-cwd && exec uvicorn app.main:app --host 0.0.0.0 --port 18080 --proxy-headers --forwarded-allow-ips '*'
+    ports:
+      - "127.0.0.1:18080:18080"
+      - "${TB_TAILSCALE_IP:?set TB_TAILSCALE_IP to the host Tailscale IPv4 (tailscale ip -4)}:18080:18080"
     environment:
       TB_SECRET_KEY: ${TB_SECRET_KEY:?set TB_SECRET_KEY in .env (long random string)}
-      TB_TIMEZONE: Europe/Amsterdam
+      TB_TIMEZONE: ${TB_TIMEZONE:-Europe/Amsterdam}
       TB_SANDBOX: docker
-      TB_HTTP_ALLOW_PRIVATE: ${TB_HTTP_ALLOW_PRIVATE:-0}
-    extra_hosts: ["host.docker.internal:host-gateway"]   # reach a model server on the host machine
+      TB_SANDBOX_IMAGE: teambots-sandbox:latest
+      TB_SANDBOX_NETWORK: teambots
+      TB_HTTP_ALLOW_PRIVATE: ${TB_HTTP_ALLOW_PRIVATE:-1}
+      TB_PUBLIC_URL: ${TB_PUBLIC_URL:-}
+      TB_DATA_DIR: /data
+      TB_CLAUDE_CLI: claude
+      TB_CLAUDE_CLI_CWD: /data/claude-cli-cwd
+      HOME: /data/claude-home
     volumes:
-      - tb-data:/data
-      # Gives the app control over the host Docker daemon. See README, "Security".
+      - ${TB_HOST_DATA:-./data}:/data
       - /var/run/docker.sock:/var/run/docker.sock
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    networks: [teambots]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:18080/', timeout=5)"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 25s
     restart: unless-stopped
-  caddy:                    # TLS front for a server: docker compose --profile server up -d
-    profiles: ["server"]
-    image: caddy:2
-    ports: ["80:80", "443:443"]
-    command: caddy reverse-proxy --from ${TB_DOMAIN:-localhost} --to app:8080
-    volumes: [caddy-data:/data]
-    restart: unless-stopped
-volumes:
-  tb-data:
-  caddy-data:
+
+networks:
+  teambots:
+    name: teambots

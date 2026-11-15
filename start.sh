@@ -1,5 +1,6 @@
 #!/usr/bin/env sh
 # Start TeamBots on a Linux machine with Docker Engine and the compose plugin:  ./start.sh
+# Uses docker-compose.local.yml (laptop / Docker Desktop). On a VPS see docs/deploy-vps.md.
 set -e
 command -v docker >/dev/null || { echo "Docker is not installed." >&2; exit 1; }
 if [ ! -f .env ]; then
@@ -7,6 +8,6 @@ if [ ! -f .env ]; then
   chmod 600 .env
   echo "Created .env with a new TB_SECRET_KEY. Keep this file: it decrypts your stored keys and secrets."
 fi
-docker compose up -d --build
+docker compose -f docker-compose.local.yml up -d --build
 echo "TeamBots runs at http://localhost:8080"
 echo "A model server on this machine is reachable from the app as http://host.docker.internal:<port>/v1"

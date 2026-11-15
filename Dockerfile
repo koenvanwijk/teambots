@@ -1,10 +1,16 @@
 FROM python:3.12-slim
 # The docker CLI lets the app start one sandbox container per user/channel on the host daemon.
-RUN apt-get update && apt-get install -y --no-install-recommends docker.io && rm -rf /var/lib/apt/lists/*
+# curl is used to install the official Claude Code CLI; credentials are not baked in.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        docker.io curl ca-certificates sqlite3 \
+    && curl -fsSL https://claude.ai/install.sh | bash \
+    && ln -sf /root/.local/bin/claude /usr/local/bin/claude \
+    && command -v claude \
+    && rm -rf /var/lib/apt/lists/*
 WORKDIR /srv
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 COPY app ./app
-ENV TB_DATA_DIR=/data TB_SANDBOX=docker
+ENV TB_DATA_DIR=/data TB_SANDBOX=docker TB_CLAUDE_CLI=/usr/local/bin/claude
 EXPOSE 8080
 CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8080", "--proxy-headers", "--forwarded-allow-ips", "*"]
