@@ -21,7 +21,7 @@ from . import config, llm, mcp_client, sandbox, screen, secrets_http
 from .access import bot_role
 from .db import (Approval, ApprovalRule, Bot, ChannelMember, Conversation, Endpoint, McpServer, Memory,
                  Message, Routine, Secret, Skill, Team, User, select, session)
-from .events import publish
+from .events import publish, publish_bot
 
 log = logging.getLogger("teambots.agent")
 RISKY_TOOLS = {"run_command", "write_file", "create_routine", "http_request", "add_mcp_server"}
@@ -420,6 +420,7 @@ async def _execute(ctx: Ctx, name: str, args: dict, mcp_map: dict) -> str:
             s.commit()
             s.refresh(new_mcp)
             new_mcp_oauth = auth_mode == "oauth"
+            publish_bot(bot.id, "mcp", action="add", id=new_mcp.id)
         if name == "ask_bot":
             if ctx.depth >= 1:
                 return "error: a bot that was handed a task cannot hand it on again"

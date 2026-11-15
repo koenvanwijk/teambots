@@ -1262,10 +1262,29 @@ function secretGuard(found, { swap, send, focus }) {
 }
 
 // ---------------------------------------------------------------- bot settings
-function closeDrawer() { const d = el('drawer'); if (d) { d.classList.remove('open'); d.replaceChildren(); } clearInterval(S.screenTimer); clearInterval(S.previewTimer); }
+function stopBotEvents() { if (S.botEs) { S.botEs.close(); S.botEs = null; } clearTimeout(S.botEsTimer); S.botEsBotId = null; }
+function closeDrawer() { const d = el('drawer'); if (d) { d.classList.remove('open'); d.replaceChildren(); } clearInterval(S.screenTimer); clearInterval(S.previewTimer); stopBotEvents(); S.drawerBot = null; S.drawerTab = null; }
+function listenBotEvents(bot) {
+  // Keep one EventSource per open drawer so a tool or another member adding an MCP server refreshes the list.
+  if (S.botEs && S.botEsBotId === bot.id) return;
+  stopBotEvents();
+  S.botEsBotId = bot.id;
+  const es = new EventSource(withToken(`/bots/${bot.id}/events`));
+  S.botEs = es;
+  es.onmessage = ev => {
+    let data = {};
+    try { data = JSON.parse(ev.data); } catch { return; }
+    if (data.kind !== 'mcp') return;
+    if (!el('drawer') || !el('drawer').classList.contains('open')) return;
+    if (!S.drawerBot || S.drawerBot.id !== bot.id || S.drawerTab !== 'connections') return;
+    clearTimeout(S.botEsTimer);
+    S.botEsTimer = setTimeout(() => openDrawer(S.drawerBot, 'connections'), 40);
+  };
+}
 async function openDrawer(bot, tab = 'setup') {
   const p = el('drawer'), manage = bot.role !== 'collaborator', again = t => openDrawer(bot, t || tab);
   clearInterval(S.screenTimer); clearInterval(S.previewTimer);
+  S.drawerBot = bot; S.drawerTab = tab; listenBotEvents(bot);
   const tabs = [['setup', 'Setup'], manage && bot.is_team && ['sharing', 'Sharing'], ['knowledge', 'Memory and skills'], ['routines', 'Routines'], ['connections', manage ? 'Secrets and tools' : 'Tools']].filter(Boolean);
   const body = $('div', { className: 'dbody' });
   // A live screen preview above the tabs, refreshed every 5s. Each bot has its own screen on
@@ -1286,7 +1305,7 @@ async function openDrawer(bot, tab = 'setup') {
   p.classList.add('open');
   const head = (title, addLabel, add) => $('h4', {}, title, add && $('button', { className: 'btn sm', onclick: guard(add) }, icon('plus', 14), addLabel));
   const hint = text => $('p', { className: 'hint', textContent: text });
-  const li = (text, sub, ...tail) => $('div', { className: 'li' }, $('div', { className: 'tx' }, text, sub && $('small', { textContent: sub })), tail);
+  const li = (text, sub, ...tail) => $('div', { className: 'li' }, $('div', { className: 'tx', title: typeof text === 'string' ? text : undefined }, text, sub && $('small', { textContent: sub, title: sub })), tail.length ? $('div', { className: 'li-act' }, tail) : null);
   const del = (path, what) => ib('trash', 'Remove', guard(async () => { if (!await confirmBox({ title: `Remove ${what}?`, text: 'This cannot be undone.', ok: 'Remove', danger: true })) return; await api('DELETE', path); if (S.conv) await loadCtx(S.conv); again(); }), 15);
   const none = text => $('div', { className: 'none', textContent: text });
   const get = path => api('GET', `/bots/${bot.id}/${path}`);
