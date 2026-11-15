@@ -16,7 +16,7 @@ USER root
 # Runtime libs for QEMU/emulator + JDK for sdkmanager. curl/unzip/wget for the
 # first-boot SDK download. procps/file are handy when debugging inside the box.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        openjdk-17-jre-headless curl wget unzip ca-certificates \
+        openjdk-21-jre-headless curl wget unzip ca-certificates \
         libpulse0 libnss3 libx11-6 libgl1 libxcb1 libxcomposite1 \
         libxcursor1 libxdamage1 libxi6 libxtst6 libglib2.0-0 libxrandr2 \
         libasound2 libgcc-s1 libstdc++6 procps file \
