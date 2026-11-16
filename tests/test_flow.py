@@ -27,17 +27,42 @@ from fastapi.testclient import TestClient  # noqa: E402
 import mock_llm  # noqa: E402
 from app.main import app  # noqa: E402
 
-LLM_URL = "http://127.0.0.1:8791/v1"
 MCP_URL = "http://127.0.0.1:18792/mcp"
+LLM_PORT = 0  # actual bound port, set by fixture c
+LLM_URL = ""
+
+
+def _requested_mock_llm_port() -> int:
+    raw = os.environ.get("TB_MOCK_LLM_PORT")
+    return int(raw) if raw not in (None, "") else 0
+
+
+def _started_port(server: uvicorn.Server) -> int:
+    for srv in server.servers:
+        for sock in srv.sockets:
+            return sock.getsockname()[1]
+    raise RuntimeError("mock LLM did not bind a port")
 
 
 @pytest.fixture(scope="module")
 def c():
-    server = uvicorn.Server(uvicorn.Config(mock_llm.app, host="127.0.0.1", port=8791, log_level="warning"))
+    global LLM_PORT, LLM_URL
+    server = uvicorn.Server(uvicorn.Config(
+        mock_llm.app, host="127.0.0.1", port=_requested_mock_llm_port(), log_level="warning"))
     threading.Thread(target=server.run, daemon=True).start()
     mcp_proc = subprocess.Popen([sys.executable, os.path.join(os.path.dirname(__file__), "mock_mcp.py")],
                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    time.sleep(2.5)
+    deadline = time.time() + 2.5
+    while time.time() < deadline and not server.started:
+        time.sleep(0.05)
+    if not server.started:
+        mcp_proc.terminate()
+        raise RuntimeError("mock LLM failed to start")
+    LLM_PORT = _started_port(server)
+    LLM_URL = f"http://127.0.0.1:{LLM_PORT}/v1"
+    leftover = deadline - time.time()
+    if leftover > 0:
+        time.sleep(leftover)
     with TestClient(app) as client:
         yield client
     server.should_exit = True
@@ -330,7 +355,7 @@ def test_secrets_stay_outside_sandbox_and_model(c):
     out = say(c, "alice", S["dm_alice"], tool("run_command", command="echo token=[$API_TOKEN]"))[-1]["content"]
     assert "token=[]" in out
     # filled in outside the sandbox for the bound host; the echoed value is masked on the way back
-    call = tool("http_request", method="POST", url="http://127.0.0.1:8791/echo",
+    call = tool("http_request", method="POST", url=f"http://127.0.0.1:{LLM_PORT}/echo",
                 headers={"Authorization": "Bearer {{secret:API_TOKEN}}"}, body="x={{secret:API_TOKEN}}")
     say(c, "bob", S["dm_bob"], call)
     out = approve(c, "bob", S["dm_bob"])[-1]["content"]
@@ -338,7 +363,7 @@ def test_secrets_stay_outside_sandbox_and_model(c):
     stored = c.get(f"/api/conversations/{S['dm_bob']}/messages", headers=H("bob")).json()
     assert "s3cret" not in json.dumps([m for m in stored if m["is_bot"]])  # nothing the bot wrote or received
     # another host: refused before anything is sent
-    say(c, "bob", S["dm_bob"], tool("http_request", method="GET", url="http://localhost:8791/echo",
+    say(c, "bob", S["dm_bob"], tool("http_request", method="GET", url=f"http://localhost:{LLM_PORT}/echo",
                                     headers={"Authorization": "{{secret:API_TOKEN}}"}))
     assert "not bound to host localhost; nothing was sent" in approve(c, "bob", S["dm_bob"])[-1]["content"]
     from app import secrets_http
@@ -389,7 +414,7 @@ def test_own_screen_and_computer_use(c):
         assert img.content[:2] == b"\xff\xd8"
         blank = len(img.content)
         # acting asks first; one "always allow" covers the whole screen group
-        say(c, "alice", dm, tool("screen_open", url="http://127.0.0.1:8791/docs"))
+        say(c, "alice", dm, tool("screen_open", url=f"http://127.0.0.1:{LLM_PORT}/docs"))
         assert "opened" in approve(c, "alice", dm, always=True)[-1]["content"]
         assert "done" in say(c, "alice", dm, tool("screen_click", x=640, y=400))[-1]["content"]
         assert "done" in say(c, "alice", dm, tool("screen_key", keys="Tab"))[-1]["content"]
