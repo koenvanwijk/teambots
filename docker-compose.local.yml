@@ -21,6 +21,9 @@ services:
       TB_TIMEZONE: ${TB_TIMEZONE:-Europe/Amsterdam}
       TB_SANDBOX: docker
       TB_HTTP_ALLOW_PRIVATE: ${TB_HTTP_ALLOW_PRIVATE:-0}
+      TB_OPEN_REGISTRATION: ${TB_OPEN_REGISTRATION:-0}
+      TB_ENABLE_DOCS: ${TB_ENABLE_DOCS:-0}
+      TB_AUTH_RATE_LIMIT: ${TB_AUTH_RATE_LIMIT:-10}
     extra_hosts: ["host.docker.internal:host-gateway"]
     volumes:
       - tb-data:/data

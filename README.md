@@ -87,7 +87,7 @@ A laptop or Docker Desktop should keep using `./start.sh` / `docker-compose.loca
 
 ## First steps in the UI
 
-1. Create an account, then a team. Share the invite code with teammates.
+1. Create the first account, then a team. Share the invite link (`/?invite=…`) with teammates; they use it to create their account and join. Open registration is off unless `TB_OPEN_REGISTRATION=1`.
 2. Add an endpoint and click it to run the connection test. "tool calling: true" is required (the Claude CLI uses a JSON tool-call fallback). For GitHub Copilot, pick that provider type and enter the GitHub domain (for example `ictgroup.ghe.com`) plus a GitHub OAuth token; TeamBots exchanges it for a short-lived Copilot session and does not store that session token. For **Claude CLI**, pick that provider and set the default model to an alias (`fable`, `haiku`, `sonnet`, `opus`) or an id such as `claude-fable-5-2`; no base URL or key is needed. It shells out to the local `claude` binary (`-p --output-format json`, one turn, no host MCP tools), reusing that host's Claude Code login. Tokens and `total_cost_usd` from the CLI JSON are logged; if the CLI reports no cost, the call is stored as a subscription with unknown price. Every bot shares that one account and its rate/spend limits; the binary plus a valid login must be present on the host that runs TeamBots. Override the binary with `TB_CLAUDE_CLI` and its working directory with `TB_CLAUDE_CLI_CWD`. Using a Claude Code / subscription login as a shared bot backend is a licensing question for your organization to clear. For a **Router**, pick that provider; default rules use Spark, cheap/normal/heavy Copilot models, and Claude CLI when one exists. Edit the rules from the endpoint dialog. Do not point existing bots at it unless you mean to; a Router endpoint is added for you to choose.
 3. Create a bot. For a Team Bot: write instructions, add secrets / MCP servers / skills, then
    tick Published under Sharing. An MCP server can use a static token or OAuth (each member
@@ -157,6 +157,9 @@ TeamBots is meant to sit behind a TLS reverse proxy. It honours `X-Forwarded-Pro
 | `TB_TIMEZONE` | `Europe/Amsterdam` | Time zone for cron expressions |
 | `TB_MAX_STEPS` | `12` | Tool-call rounds per turn |
 | `TB_MAX_TOKENS` | `8192` | Completion budget sent to the model (thinking models need headroom so `reasoning_content` does not eat the whole reply) |
+| `TB_OPEN_REGISTRATION` | `0` | `1` lets anyone create an account. When off, only the first user or someone with a valid project invite code (`?invite=`) can register |
+| `TB_ENABLE_DOCS` | `0` | `1` serves `/docs`, `/redoc` and `/openapi.json` |
+| `TB_AUTH_RATE_LIMIT` | `10` | Max `/api/login` and `/api/register` attempts per IP per minute (`0` disables) |
 
 ## Layout
 
@@ -196,6 +199,9 @@ docs/router.md     model router (Option A implemented; B/C still described)
   whoever can use the bot can make requests with its secrets to the bound hosts.
 - `http_request` runs in the app, outside the sandbox. It refuses private and link-local addresses
   unless `TB_HTTP_ALLOW_PRIVATE=1`.
+- Registration is closed once the first account exists, unless `TB_OPEN_REGISTRATION=1` or the
+  request includes a valid project invite code. `/docs` and `/openapi.json` are off unless
+  `TB_ENABLE_DOCS=1`. Login and register are rate-limited per IP.
 - One sandbox per project means every project member and bot can read and change the same files,
   and can see every bot's screen. Do not put two clients in one project.
 - The activity feed publishes a model-written summary of private-chat tasks to everyone in the

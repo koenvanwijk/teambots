@@ -20,7 +20,7 @@ from pydantic import BaseModel
 import httpx
 import websockets
 
-from . import agent, config, copilot, events, home, llm, mcp_client, oauth, routines, sandbox, screen, secrets_http
+from . import agent, config, copilot, events, home, llm, mcp_client, oauth, ratelimit, routines, sandbox, screen, secrets_http
 from .access import bot_role, can_manage, can_read_conversation, team_role
 from .db import (Approval, ApprovalRule, AuthToken, Bot, BotAccess, ChannelMember, Conversation, Endpoint, Identity,
                  LlmUsage, McpCredential, McpServer, Memory, Message, OAuthState, Routine, Secret, Skill, Team,
@@ -73,24 +73,20 @@ class Credentials(BaseModel):
     username: str
     password: str
     display_name: str = ""
+    invite_code: str = ""
 
 
-@router.post("/register")
-def register(body: Credentials):
-    _need(re.fullmatch(r"[a-z0-9_.-]{2,32}", body.username), 400, "username: 2-32 chars of a-z 0-9 _ . -")
-    _need(len(body.password) >= 8, 400, "password needs at least 8 characters")
-    with session() as s:
-        _need(not s.exec(select(User).where(User.username == body.username)).first(), 409, "username is taken")
-        salt = secrets.token_hex(8)
-        u = User(username=body.username, display_name=body.display_name or body.username,
-                 password_hash=f"{salt}${_hash(body.password, salt)}")
-        s.add(u)
-        s.commit()
-    return login(body)
+def _auth_rate_limit(request: Request) -> None:
+    if config.AUTH_RATE_LIMIT <= 0:
+        return
+    ip = ratelimit.client_ip(request)
+    if not ratelimit.AUTH_LIMITER.allow(ip, config.AUTH_RATE_LIMIT):
+        retry = ratelimit.AUTH_LIMITER.retry_after(ip)
+        raise HTTPException(429, "too many attempts, try again later",
+                            headers={"Retry-After": str(retry)})
 
 
-@router.post("/login")
-def login(body: Credentials):
+def _password_login(body: Credentials) -> dict:
     with session() as s:
         u = s.exec(select(User).where(User.username == body.username)).first()
         salt, _, digest = (u.password_hash if u else "x$x").partition("$")
@@ -99,6 +95,36 @@ def login(body: Credentials):
         s.add(AuthToken(token=tok, user_id=u.id))
         s.commit()
     return {"token": tok, "user": {"id": u.id, "username": u.username, "display_name": u.display_name}}
+
+
+@router.post("/register")
+def register(body: Credentials, request: Request):
+    _auth_rate_limit(request)
+    _need(re.fullmatch(r"[a-z0-9_.-]{2,32}", body.username), 400, "username: 2-32 chars of a-z 0-9 _ . -")
+    _need(len(body.password) >= 8, 400, "password needs at least 8 characters")
+    invite = (body.invite_code or "").strip()
+    with session() as s:
+        first_user = s.exec(select(User).limit(1)).first() is None
+        team = s.exec(select(Team).where(Team.invite_code == invite)).first() if invite else None
+        if not first_user and not config.OPEN_REGISTRATION:
+            _need(team, 403, "You need a valid invite code to create an account.")
+        _need(not s.exec(select(User).where(User.username == body.username)).first(), 409, "username is taken")
+        salt = secrets.token_hex(8)
+        u = User(username=body.username, display_name=body.display_name or body.username,
+                 password_hash=f"{salt}${_hash(body.password, salt)}")
+        s.add(u)
+        s.commit()
+        s.refresh(u)
+        # Same as the OAuth invite flow: a valid project invite also joins the team.
+        _maybe_join(s, u.id, invite)
+        s.commit()
+    return _password_login(body)
+
+
+@router.post("/login")
+def login(body: Credentials, request: Request):
+    _auth_rate_limit(request)
+    return _password_login(body)
 
 
 @router.get("/me")

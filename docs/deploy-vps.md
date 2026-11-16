@@ -191,12 +191,28 @@ Voor een complete snapshot (database, `.env` en projectvolumes) blijft
 4. De VPS mag aan blijven staan; start de compose-stack daar niet opnieuw
    met dezelfde database.
 
-## 8. Daarna (alleen met expliciet akkoord)
+## 8. Publieke HTTPS-tunnel (alleen met expliciet akkoord)
 
-- Een cloudflared-tunnel voor de voice-API.
+Zet geen poorten open naar internet en start geen publieke tunnel voordat
+dat is afgesproken. Als je de UI via cloudflared (of Caddy) op het internet
+zet, gelden deze instellingen:
+
+- **Registratie is dicht.** Zodra het eerste account bestaat, weigert
+  `POST /api/register` verzoeken zonder geldige project-invite. Deel de
+  invite-link (`https://…/?invite=…`) met nieuwe mensen; bij het aanmaken
+  van het account worden ze meteen lid van dat project. Zet
+  `TB_OPEN_REGISTRATION=1` alleen als je bewust open inschrijving wilt.
+- **`/docs`, `/redoc` en `/openapi.json` zijn uit**, tenzij je
+  `TB_ENABLE_DOCS=1` zet.
+- **Rate-limit** op `/api/login` en `/api/register`: standaard 10 pogingen
+  per IP per minuut (`TB_AUTH_RATE_LIMIT`). De app gebruikt
+  `CF-Connecting-IP` of `X-Forwarded-For` alleen als de directe peer een
+  lokale of private proxy is (cloudflared of Caddy op de host).
+- Zet `TB_PUBLIC_URL` op de https-URL van de tunnel en herstart de app,
+  zodat OAuth-redirects kloppen.
+
+Ook later, alleen met akkoord:
+
 - De publieke SSH-poort sluiten zodra inloggen via Tailscale werkt.
 - Eventueel de rootschijf vergroten of Docker-data naar een extra volume
   verplaatsen als de schijf vol raakt.
-
-Zet geen poorten open naar internet en start geen publieke tunnel voordat
-dat is afgesproken.

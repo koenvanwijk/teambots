@@ -48,6 +48,14 @@ OAUTH_ALLOWLIST = [x.strip().lower() for x in os.environ.get("TB_OAUTH_ALLOWLIST
 # Login tokens (password or OAuth) expire after this many days. 0 = never. Tokens created before
 # this setting existed have no timestamp and stay valid.
 TOKEN_TTL_DAYS = int(os.environ.get("TB_TOKEN_TTL_DAYS", "30"))
+# Once a first user exists, POST /api/register requires a valid project invite
+# code unless this is set. The first account can always be created.
+OPEN_REGISTRATION = os.environ.get("TB_OPEN_REGISTRATION", "0") == "1"
+# Serve /docs, /redoc and /openapi.json. Off by default so a public URL does
+# not advertise the API.
+ENABLE_DOCS = os.environ.get("TB_ENABLE_DOCS", "0") == "1"
+# Max /api/login and /api/register attempts per IP per minute. 0 disables.
+AUTH_RATE_LIMIT = int(os.environ.get("TB_AUTH_RATE_LIMIT", "10"))
 
 _fernet = Fernet(base64.urlsafe_b64encode(hashlib.sha256(SECRET_KEY.encode()).digest()))
 
