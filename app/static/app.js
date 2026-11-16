@@ -326,7 +326,7 @@ function renderSide() {
     const more = items => ib('dots', 'Rename and more', e => { e.stopPropagation(); popmenu(e.currentTarget, items); }, 15);
     for (const b of S.bots) {
       list.append(item(c && c.kind === 'dm' && c.bot_id === b.id, () => openBot(b), avatar(b.name, 'bot'), b.name, botTag(b), botCostTag(b),
-        more([b.role !== 'collaborator' && { icon: 'edit', label: 'Rename', onclick: guard(() => renameBot(b)) }, { icon: 'sliders', label: 'Settings', onclick: guard(async () => { await openBot(b); openDrawer(b); }) }])));
+        more([{ icon: 'edit', label: 'Rename', onclick: guard(() => renameBot(b)) }, { icon: 'sliders', label: 'Settings', onclick: guard(async () => { await openBot(b); openDrawer(b); }) }])));
       for (const h of (S.handoffs || []).filter(x => x.bot_id === b.id)) {
         const label = h.peer_handle ? ('From @' + h.peer_handle) : (h.name || 'Bot conversation');
         list.append(item(c && c.id === h.id, () => openConv(h, b), $('span', { className: 'lead sub' }, icon('arrow', 14)), label,
@@ -920,7 +920,7 @@ async function loadCtx(conv) {
     const lists = await Promise.all(ctx.mem.bots.map(b => quiet(api('GET', `/bots/${b.id}/skills`))));
     ctx.mem.bots.forEach((b, i) => lists[i].forEach(k => ctx.skills.push({ ...k, of: b.handle })));
   } else if ((conv.kind === 'dm' || conv.kind === 'handoff') && S.bot) {
-    [ctx.skills, ctx.secrets] = await Promise.all([quiet(api('GET', `/bots/${S.bot.id}/skills`)), S.bot.role !== 'collaborator' ? quiet(api('GET', `/bots/${S.bot.id}/secrets`)) : []]);
+    [ctx.skills, ctx.secrets] = await Promise.all([quiet(api('GET', `/bots/${S.bot.id}/skills`)), quiet(api('GET', `/bots/${S.bot.id}/secrets`))]);
   }
   if (S.conv === conv) S.ctx = ctx;
 }
@@ -944,7 +944,7 @@ function renderTop() {
   if (c.kind === 'dm' || c.kind === 'home') {
     const b = S.bot, shared = b && b.is_team && b.published && c.kind === 'dm';
     const cb = $('input', { type: 'checkbox', checked: c.share_activity, onchange: guard(async () => { Object.assign(c, await api('PATCH', `/conversations/${c.id}`, { share_activity: cb.checked })); toast(cb.checked ? 'Task summaries go to the activity feed' : 'Nothing from this chat is shared'); }) });
-    const canRename = b && b.role !== 'collaborator';
+    const canRename = !!b;
     return fill(top, ...lead, avatar(c.name, 'bot'), $(canRename ? 'button' : 'span', { className: 'title', textContent: c.name, title: canRename ? 'Rename' : '', onclick: canRename ? guard(() => renameBot(b)) : null }), b && $('span', { className: 'sub', textContent: '@' + b.handle }),
       $('span', { className: 'pill hidesm', title: 'Only you can read this chat. Not even the owner of the bot can.' }, icon('lock', 12), 'Private'), $('span', { className: 'grow' }),
       shared && $('label', { className: 'switch hidesm', title: 'When on, a short summary of each finished task is posted to the shared activity feed. The chat itself is never shared.' }, cb, 'Share summaries'),
@@ -964,10 +964,10 @@ async function channelMembers() {
   const c = S.conv, again = guard(async () => { d.close(); await loadCtx(c); renderTop(); renderDock(); await channelMembers(); });
   const m = S.ctx.mem, inU = new Set(m.users.map(u => u.id)), inB = new Set(m.bots.map(b => b.id)), admin = S.team.role === 'admin';
   const inviteUrl = location.origin + '/?invite=' + encodeURIComponent(S.team.invite_code);
-  const people = S.members.filter(x => !inU.has(x.user_id)), bots = S.bots.filter(b => !inB.has(b.id) && b.role !== 'collaborator'), picks = [];
+  const people = S.members.filter(x => !inU.has(x.user_id)), bots = S.bots.filter(b => !inB.has(b.id)), picks = [];
   const pick = (kind, id, text) => { const cb = $('input', { type: 'checkbox' }); picks.push({ kind, id, cb }); return $('label', { className: 'check', style: 'margin:8px 0' }, cb, $('span', { textContent: text })); };
   const botRow = b => {
-    const mine = admin || S.bots.some(x => x.id === b.id && x.role !== 'collaborator');
+    const mine = admin || S.bots.some(x => x.id === b.id);
     const sw = $('input', { type: 'checkbox', checked: b.mention_only, onchange: guard(async () => { await api('PATCH', `/channels/${c.id}/members/bots/${b.id}`, { mention_only: sw.checked }); b.mention_only = sw.checked; renderTop(); renderDock(); }) });
     return $('div', { className: 'li' }, avatar(b.name, 'bot'), $('div', { className: 'tx' }, b.name, $('small', { textContent: '@' + b.handle })),
       mine ? $('label', { className: 'switch', title: 'On: the bot answers only when someone mentions its @handle. Off: it replies to every message.' }, sw, 'Mention only') : $('span', { className: 'tag', textContent: b.mention_only ? 'mention only' : 'replies to all' }),
@@ -985,7 +985,7 @@ async function channelMembers() {
 }
 
 // ---------- messages
-const TOOLS = { run_command: ['term', 'Run command'], write_file: ['file', 'Write file'], read_file: ['file', 'Read file'], http_request: ['globe', 'HTTP request'], remember: ['book', 'Remember'], forget: ['book', 'Forget'], memory: ['book', 'Update memory'], skill_manage: ['zap', 'Update skill'], search_history: ['search', 'Search history'],
+const TOOLS = { run_command: ['term', 'Run command'], write_file: ['file', 'Write file'], read_file: ['file', 'Read file'], http_request: ['globe', 'HTTP request'], remember: ['book', 'Remember'], forget: ['book', 'Forget'], memory: ['book', 'Update memory'], skill_manage: ['zap', 'Update skill'], knowledge_list: ['book', 'List knowledge'], knowledge_read: ['book', 'Read knowledge'], knowledge_write: ['book', 'Write knowledge'], knowledge_patch: ['book', 'Edit knowledge'], knowledge_delete: ['book', 'Delete knowledge'], knowledge_history: ['book', 'Knowledge history'], search_history: ['search', 'Search history'],
   save_skill: ['zap', 'Save skill'], use_skill: ['zap', 'Use skill'], ask_bot: ['bot', 'Ask another bot'], create_routine: ['clock', 'Create routine'], list_workspace: ['grid', 'List projects'], get_overview: ['home', 'Overview'], read_messages: ['book', 'Read messages'], post_to_channel: ['hash', 'Post to team chat'], list_routines: ['clock', 'List routines'], update_routine: ['edit', 'Update routine'], delete_routine: ['trash', 'Delete routine'], run_routine: ['play', 'Run routine'] };
 function toolInfo(name) {
   if (TOOLS[name]) return TOOLS[name];
@@ -1183,7 +1183,7 @@ function mentionItems() {
   if (ch && mem) {
     const inB = new Set(mem.bots.map(b => b.id)), inU = new Set(mem.users.map(u => u.id));
     for (const b of mem.bots) add('Bots in this team chat', 'bot', b.name, b.mention_only ? 'Answers only when mentioned' : 'Mention to address only this bot', '@' + b.handle);
-    for (const b of S.bots) if (!inB.has(b.id) && b.role !== 'collaborator') add('Add a bot', 'plus', b.name, 'Add to this team chat and mention', '@' + b.handle, () => addToChannel({ bot_ids: [b.id] }));
+    for (const b of S.bots) if (!inB.has(b.id)) add('Add a bot', 'plus', b.name, 'Add to this team chat and mention', '@' + b.handle, () => addToChannel({ bot_ids: [b.id] }));
     for (const m of S.members) if (m.user_id !== S.me.id && inU.has(m.user_id)) add('People', 'user', m.display_name, 'In this team chat', '@' + m.username);
     for (const m of S.members) if (!inU.has(m.user_id)) add('Add people', 'plus', m.display_name, 'Add to this team chat and mention', '@' + m.username, () => addToChannel({ user_ids: [m.user_id] }));
   }
@@ -1331,7 +1331,7 @@ function renderDock() {
 
 /** A message that seems to hold a credential: keep it out of the chat and give the bot a placeholder instead. */
 function secretGuard(found, { swap, send, focus }) {
-  const c = S.conv, b = S.bot, canSave = c.kind === 'dm' && b && b.role !== 'collaborator';
+  const c = S.conv, b = S.bot, canSave = c.kind === 'dm' && !!b;
   const veil = v => v.startsWith('-----') ? 'key block' : v.length > 12 ? v.slice(0, 4) + '…' + v.slice(-2) : '•'.repeat(6);
   let open = found.length;
   const done = (row, name) => { row.querySelector('.act').replaceChildren($('span', { className: 'tag ok', textContent: `{{secret:${name}}}` })); if (--open === 0) { d.close(); send(false); } };
@@ -1349,7 +1349,7 @@ function secretGuard(found, { swap, send, focus }) {
     return row;
   });
   const d = openDialog('', $('div', { className: 'pad' }, $('h2', { textContent: 'This looks like a secret' }),
-    $('p', { className: 'intro', textContent: 'Your message was not sent. A secret in the chat is stored with the conversation and read by the model. ' + (canSave ? 'Save it as a secret instead: the bot gets a placeholder, and the real value is filled in outside the sandbox.' : found.some(f => f.name) ? 'Use the placeholder instead of the value.' : 'Take it out of the message. An owner or manager of the bot can add it under Secrets, and then you use the placeholder.') }),
+    $('p', { className: 'intro', textContent: 'Your message was not sent. A secret in the chat is stored with the conversation and read by the model. ' + (canSave ? 'Save it as a secret instead: the bot gets a placeholder, and the real value is filled in outside the sandbox.' : found.some(f => f.name) ? 'Use the placeholder instead of the value.' : 'Take it out of the message. Anyone who can use the bot can add it under Secrets, and then you use the placeholder.') }),
     rows, $('div', { className: 'dfoot', style: 'margin-top:16px' }, $('button', { className: 'btn danger', textContent: 'Send anyway', title: 'It is not a secret, or you accept that it ends up in the chat', onclick: () => { d.close(); send(true); } }),
       $('button', { className: 'btn primary', textContent: 'Edit message', onclick: () => d.close() }))));
   d.addEventListener('close', focus);
@@ -1375,6 +1375,52 @@ function listenBotEvents(bot) {
     S.botEsTimer = setTimeout(() => openDrawer(S.drawerBot, 'connections'), 40);
   };
 }
+/** Edit one knowledge base file. Saving passes the hash it was loaded with; a conflict shows who changed it. */
+async function editKnowledge(bot, path, done) {
+  const base = `/bots/${bot.id}/knowledge`;
+  let cur = await api('GET', `${base}/file?path=${encodeURIComponent(path)}`);
+  const ta = $('textarea', { rows: 18, value: cur.content, className: 'mono', style: 'width:100%;font:13px/1.5 var(--mono)' });
+  const count = $('small', { className: 'muted' }), hashTag = $('small', { className: 'muted' });
+  const upd = () => { count.textContent = `${ta.value.length.toLocaleString()} characters`; hashTag.textContent = cur.exists ? ` · version ${cur.hash}` : ' · new file'; };
+  ta.addEventListener('input', upd); upd();
+  const box = $('div', { className: 'kbconflict', role: 'alert' });
+  const save = async force => {
+    try {
+      const r = await api('PUT', `${base}/file`, { path, content: ta.value, base_hash: force || (cur.exists ? cur.hash : null) });
+      cur = { ...cur, exists: true, hash: r.hash, content: ta.value }; box.replaceChildren(); upd(); toast(r.commit ? 'Saved' : 'No changes'); if (S.conv) await loadCtx(S.conv); done && done();
+    } catch (e) {
+      const c = e.detail;
+      if (!c || c.error !== 'conflict') throw e;
+      const mine = ta.value, who = c.last_change ? `${c.last_change.author} changed it on ${new Date(c.last_change.date).toLocaleString()} (${c.last_change.message}).` : '';
+      box.replaceChildren($('p', {}, $('b', { textContent: 'Someone else changed this file while you were editing. ' }), who),
+        $('details', {}, $('summary', { textContent: 'What changed since you opened it' }), $('pre', { textContent: c.diff || '' })),
+        $('div', { className: 'rowbtns' },
+          $('button', { className: 'btn sm', type: 'button', textContent: 'Load their version', onclick: guard(async () => { cur = await api('GET', `${base}/file?path=${encodeURIComponent(path)}`); ta.value = cur.content; upd(); box.replaceChildren($('details', { open: true }, $('summary', { textContent: 'Your text (copy what you want to keep into the editor)' }), $('pre', { textContent: mine }))); }) }),
+          $('button', { className: 'btn sm danger', type: 'button', textContent: 'Overwrite with mine', onclick: guard(() => c.exists ? save(c.current_hash) : (cur.exists = false, save(null))) })));
+    }
+  };
+  const d = openDialog('wide', $('div', { className: 'pad' }, $('h2', { textContent: path }), $('p', { className: 'intro' }, count, hashTag), box, ta,
+    $('div', { className: 'dfoot' },
+      $('button', { className: 'btn', type: 'button', textContent: 'History', onclick: guard(() => { d.close(); return knowledgeHistory(bot, path, done); }) }),
+      cur.exists && $('button', { className: 'btn danger', type: 'button', textContent: 'Delete', onclick: guard(async () => { if (!await confirmBox({ title: `Delete ${path}?`, text: 'You can bring it back from the history.', ok: 'Delete', danger: true })) return; await api('DELETE', `${base}/file?path=${encodeURIComponent(path)}&base_hash=${cur.hash}`); d.close(); if (S.conv) await loadCtx(S.conv); done && done(); }) }),
+      $('button', { className: 'btn', type: 'button', textContent: 'Close', onclick: () => d.close() }),
+      $('button', { className: 'btn primary', type: 'button', textContent: 'Save', onclick: guard(() => save()) }))));
+}
+/** Who changed a file (or the whole knowledge base) when, with view and restore. */
+async function knowledgeHistory(bot, path, done) {
+  const base = `/bots/${bot.id}/knowledge`;
+  const rows = await api('GET', `${base}/history?path=${encodeURIComponent(path)}`);
+  const view = $('div');
+  const d = openDialog('wide', $('div', { className: 'pad' }, $('h2', { textContent: path ? `History of ${path}` : 'History of the knowledge base' }),
+    rows.length ? rows.map(h => $('div', { className: 'li' }, $('div', { className: 'tx' }, h.message, $('small', { textContent: `${h.author} · ${new Date(h.date).toLocaleString()} · ${h.short}` })),
+      path && $('div', { className: 'li-act' },
+        ib('file', 'View this version', guard(async () => { const v = await api('GET', `${base}/version?path=${encodeURIComponent(path)}&commit=${h.commit}`); view.replaceChildren($('h4', { textContent: `${path} at ${h.short}` }), $('pre', { className: 'kbview', textContent: v.exists ? v.content : '(the file did not exist in this version)' })); }), 15),
+        ib('arrow', 'Restore this version', guard(async () => {
+          if (!await confirmBox({ title: 'Restore this version?', text: `${path} goes back to how it was at ${new Date(h.date).toLocaleString()}. This is saved as a new change, so nothing is lost.`, ok: 'Restore' })) return;
+          const now = await api('GET', `${base}/file?path=${encodeURIComponent(path)}`);
+          await api('POST', `${base}/revert`, { path, commit: h.commit, base_hash: now.exists ? now.hash : null }); toast('Restored'); d.close(); if (S.conv) await loadCtx(S.conv); done && done(); }), 15)))) : $('div', { className: 'none', textContent: 'No history yet.' }),
+    view, $('div', { className: 'dfoot' }, $('button', { className: 'btn primary', type: 'button', textContent: 'Close', onclick: () => d.close() }))));
+}
 async function showPrompt(bot) {
   const p = await api('GET', `/bots/${bot.id}/prompt-preview`);
   const tierName = { stable: 'Always the same', context: 'Bot and project', volatile: 'Memory, skills and setup' };
@@ -1383,10 +1429,10 @@ async function showPrompt(bot) {
     $('div', { className: 'dfoot' }, $('button', { className: 'btn', type: 'button', textContent: 'Copy all', onclick: () => copyText(p.sections.map(x => x.text).join('\n\n'), 'Prompt copied') }), $('button', { className: 'btn primary', type: 'button', textContent: 'Close', onclick: () => d.close() }))));
 }
 async function openDrawer(bot, tab = 'setup') {
-  const p = el('drawer'), manage = bot.role !== 'collaborator', again = t => openDrawer(bot, t || tab);
+  const p = el('drawer'), manage = true, share = bot.role !== 'collaborator', again = t => openDrawer(bot, t || tab);
   clearInterval(S.screenTimer); clearInterval(S.previewTimer);
   S.drawerBot = bot; S.drawerTab = tab; listenBotEvents(bot);
-  const tabs = [['setup', 'Setup'], manage && bot.is_team && ['sharing', 'Sharing'], ['knowledge', 'Knowledge'], ['routines', 'Routines'], ['connections', manage ? 'Secrets and tools' : 'Tools']].filter(Boolean);
+  const tabs = [['setup', 'Setup'], share && bot.is_team && ['sharing', 'Sharing'], ['knowledge', 'Knowledge'], ['routines', 'Routines'], ['connections', manage ? 'Secrets and tools' : 'Tools']].filter(Boolean);
   const body = $('div', { className: 'dbody' });
   // A live screen preview above the tabs, refreshed every 5s. Each bot has its own screen on
   // the project computer, so this shows only when the bot has computer use.
@@ -1451,36 +1497,32 @@ async function openDrawer(bot, tab = 'setup') {
         bot.published = pub.checked; bot.access = acc.value; renderSide(); renderTop(); toast(pub.checked ? 'Published' : 'Saved as draft'); again(); }) })));
   }
   if (tab === 'knowledge') {
-    const [mems, skills, pctx] = await Promise.all([get('memories'), get('skills'), bot.is_home ? null : api('GET', `/teams/${bot.team_id}/context`).catch(() => null)]);
-    const review = (m, approve) => guard(async () => { await api('POST', `/memories/${m.id}/review`, { approve }); again(); });
-    const meterOf = (rows, limit) => { const n = rows.reduce((a, m) => a + m.content.length, 0); return `${n.toLocaleString()} / ${limit.toLocaleString()} characters`; };
-    const editMem = m => guard(async () => { if (await form({ title: 'Edit memory', ok: 'Save', fields: [{ name: 'content', label: 'Memory', type: 'textarea', value: m.content, required: true }], onSubmit: v => api('PATCH', `/memories/${m.id}`, v) })) again(); });
-    const memLi = m => li(m.content, m.status === 'pending' ? 'Proposed by ' + m.proposed_by + ' (from before memory became project-wide)' : null,
-      m.status === 'pending' && [ib('check', 'Accept', review(m, true), 15), ib('x', 'Drop', review(m, false), 15)],
-      m.status !== 'pending' && ib('edit', 'Edit', editMem(m), 15), m.status !== 'pending' && del(`/memories/${m.id}`, 'this memory'));
-    const team = mems.filter(m => m.scope === 'team'), mine = mems.filter(m => m.scope === 'personal');
-    const teamLimit = (team[0] && team[0].limit) || 3000, mineLimit = (mine[0] && mine[0].limit) || 1500;
-    const addMem = scope => async () => { if (await form({ title: scope === 'team' ? 'Add to team memory' : 'Add to your profile', ok: 'Remember', fields: [{ name: 'content', label: scope === 'team' ? 'A fact everyone in this project should know' : 'Something about you the bot should know', type: 'textarea', required: true }], onSubmit: v => api('POST', `/bots/${bot.id}/memories`, { ...v, scope }) })) again(); };
-    let ctxBox = null;
-    if (pctx) {
-      const ta = $('textarea', { rows: 8, value: pctx.content, placeholder: '# What this project is\nWho is involved, conventions, where things are…', className: 'mono' });
-      const count = $('small', { className: 'muted' }); const upd = () => { count.textContent = `${ta.value.length.toLocaleString()} / ${pctx.limit.toLocaleString()} characters`; }; ta.addEventListener('input', upd); upd();
-      ctxBox = [head('Project context'), hint(`${pctx.path} on the project computer. Every bot in this project reads it in every chat, and everyone (people and bots) may edit it.`), ta,
-        $('div', { className: 'rowbtns', style: 'margin:8px 0 16px' }, count, $('button', { className: 'btn primary sm', textContent: 'Save context', onclick: guard(async () => { await api('PUT', `/teams/${bot.team_id}/context`, { content: ta.value }); toast('Saved'); }) }))];
+    const t = await get('knowledge');
+    const budget = path => t.limits[path] || (path.startsWith('memory/') ? t.limits['memory/'] : 0);
+    const special = { 'AGENTS.md': 'Project context: every bot of this project reads it', [t.profile_path]: 'Your profile: only in your private chats' };
+    const memChars = t.files.filter(f => f.path.startsWith('memory/')).reduce((n, f) => n + f.size, 0);
+    const newFile = async (dir = '') => { const v = await form({ title: 'New file', intro: 'Markdown text. Directories in the path are created for you.', ok: 'Create', fields: [{ name: 'path', label: 'Path', mono: true, required: true, value: dir ? dir + '/' : '', placeholder: 'memory/clients.md' }, { name: 'content', label: 'Content', type: 'textarea', rows: 8 }], onSubmit: v => api('PUT', `/bots/${bot.id}/knowledge/file`, { path: v.path, content: v.content || '', base_hash: null }) }); if (v) { if (S.conv) await loadCtx(S.conv); again(); } };
+    const newDir = async () => { if (await form({ title: 'New folder', ok: 'Create', fields: [{ name: 'path', label: 'Path', mono: true, required: true, placeholder: 'clients/acme' }], onSubmit: v => api('POST', `/bots/${bot.id}/knowledge/dir`, v) })) again(); };
+    const rows = [];
+    const depth = p => p.split('/').length - 1;
+    const items = [...t.dirs.map(d => ({ dir: true, path: d })), ...t.files].sort((a, b) => a.path.localeCompare(b.path));
+    for (const it of items) {
+      const name = it.path.split('/').pop(), pad = { style: `padding-left:${depth(it.path) * 16}px` };
+      if (it.dir) {
+        const empty = !items.some(x => x !== it && x.path.startsWith(it.path + '/'));
+        rows.push($('div', { className: 'li kbdir', ...pad }, $('div', { className: 'tx' }, icon('folder', 14), ' ', name + '/'), $('div', { className: 'li-act' }, ib('plus', 'New file here', guard(() => newFile(it.path)), 15), empty && ib('trash', 'Remove folder', guard(async () => { await api('DELETE', `/bots/${bot.id}/knowledge/file?path=${encodeURIComponent(it.path)}`); again(); }), 15))));
+      } else {
+        const lim = budget(it.path), sub = [special[it.path], lim ? `${it.size.toLocaleString()} chars, ${lim.toLocaleString()} go into the prompt` : `${it.size.toLocaleString()} chars`].filter(Boolean).join(' · ');
+        rows.push($('div', { className: 'li kbfile', ...pad, onclick: guard(() => editKnowledge(bot, it.path, again)) }, $('div', { className: 'tx' }, $('span', {}, icon('file', 14), ' ', name), $('small', { textContent: sub })), $('div', { className: 'li-act' }, ib('clock', 'History', guard(e => { e && e.stopPropagation && e.stopPropagation(); return knowledgeHistory(bot, it.path, again); }), 15))));
+      }
     }
-    const editSkill = k => guard(async () => { if (await form({ title: 'Edit skill', ok: 'Save', fields: [{ name: 'name', label: 'Name', value: k.name, required: true }, { name: 'description', label: 'One-line description', value: k.description }, { name: 'instructions', label: 'Step-by-step instructions', type: 'textarea', rows: 9, value: k.instructions, required: true }], onSubmit: v => api('PATCH', `/skills/${k.id}`, v) })) { if (S.conv) await loadCtx(S.conv); again(); } });
-    put(body, ctxBox,
-      head(bot.is_home ? 'Memory' : 'Team memory', 'Add', addMem('team')),
-      hint((bot.is_home ? 'Facts this bot keeps for you. ' : 'Shared by every bot and everyone in this project. ') + meterOf(team, teamLimit) + '. The bot keeps it short and up to date itself.'),
-      team.length ? team.map(memLi) : none('Nothing remembered yet.'),
-      head('Your profile', 'Add', addMem('personal')),
-      hint('Only you see this, and bots only use it in your private chats. ' + meterOf(mine, mineLimit) + '.'),
-      mine.length ? mine.map(memLi) : none('Nothing about you yet.'),
-      head('Skills', 'Add', async () => { if (await form({ title: 'New skill', intro: 'Steps for a task that comes back. Add it to a message with @skill.', ok: 'Save skill', fields: [{ name: 'name', label: 'Name', required: true, placeholder: 'weekly-report' }, { name: 'description', label: 'One-line description' }, { name: 'instructions', label: 'Step-by-step instructions', type: 'textarea', rows: 7, required: true }], onSubmit: v => api('POST', `/bots/${bot.id}/skills`, v) })) { await loadCtx(S.conv); again(); } }),
-      hint('The bot saves and fixes skills itself after a task worked, or you write one here.'),
-      skills.length ? skills.map(k => li(k.name, k.description, ib('copy', 'Copy the @skill mention', () => copyText('@skill:' + quote(k.name), 'Mention copied'), 15), ib('edit', 'Edit', editSkill(k), 15), del(`/skills/${k.id}`, 'this skill'))) : none('No skills yet.'),
-      head('What the bot sees'), hint('The full instructions this bot gets in your private chat: its rules, the project context, memory and skills.'),
-      $('div', { className: 'rowbtns' }, $('button', { className: 'btn sm', onclick: guard(() => showPrompt(bot)) }, icon('book', 14), 'Show prompt')));
+    put(body,
+      hint('The knowledge base of this project: a folder of files kept in git. Everyone in the project and every bot may change it; each change is saved with who made it, and you can go back to an earlier version.'),
+      $('div', { className: 'rowbtns', style: 'margin:6px 0 10px' }, $('button', { className: 'btn sm', onclick: guard(() => newFile()) }, icon('plus', 14), 'New file'), $('button', { className: 'btn sm', onclick: guard(newDir) }, icon('plus', 14), 'New folder'), $('button', { className: 'btn sm', onclick: guard(() => knowledgeHistory(bot, '', again)) }, icon('clock', 14), 'History'), $('button', { className: 'btn sm', onclick: guard(() => showPrompt(bot)) }, icon('book', 14), 'Show prompt')),
+      !t.files.some(f => f.path === 'AGENTS.md') && !bot.is_home && $('div', { className: 'li kbfile', onclick: guard(async () => { await api('PUT', `/bots/${bot.id}/knowledge/file`, { path: 'AGENTS.md', content: '# Project\n\nWhat this project is, who is involved, conventions, where things are.\n', base_hash: null }); await editKnowledge(bot, 'AGENTS.md', again); }) }, $('div', { className: 'tx' }, $('span', {}, icon('plus', 14), ' Create AGENTS.md'), $('small', { textContent: 'Project context that every bot of this project reads' }))),
+      !t.files.some(f => f.path === t.profile_path) && $('div', { className: 'li kbfile', onclick: guard(async () => { await api('PUT', `/bots/${bot.id}/knowledge/file`, { path: t.profile_path, content: `# Profile of ${S.me.display_name}\n\n- \n`, base_hash: null }); await editKnowledge(bot, t.profile_path, again); }) }, $('div', { className: 'tx' }, $('span', {}, icon('plus', 14), ' Create your profile'), $('small', { textContent: 'What the bots should know about you (only in your private chats)' }))),
+      memChars > t.limits['memory/'] && hint(`Team memory holds ${memChars.toLocaleString()} characters; ${t.limits['memory/'].toLocaleString()} go into the prompt and the rest is listed as pointers.`),
+      rows.length ? rows : none('The knowledge base is empty.'));
   }
   if (tab === 'routines') {
     const rs = await get('routines'), here = S.conv && S.conv.kind !== 'feed';

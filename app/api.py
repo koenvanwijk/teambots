@@ -22,7 +22,7 @@ import httpx
 import websockets
 
 from . import agent, config, copilot, events, home, llm, mcp_client, oauth, ratelimit, routines, sandbox, screen, secrets_http
-from .access import bot_role, can_manage, can_read_conversation, team_role
+from .access import bot_role, can_manage, can_read_conversation, can_share, team_role
 from .db import (Approval, ApprovalRule, AuthToken, Bot, BotAccess, ChannelMember, Conversation, Endpoint, Identity,
                  LlmUsage, McpCredential, McpServer, Memory, Message, OAuthState, Routine, Secret, Skill, Team,
                  TeamMember, User, now, select, session)
@@ -56,11 +56,13 @@ def _need(cond, code=403, msg="not allowed"):
         raise HTTPException(code, msg)
 
 
-def _bot(s, bot_id: int, user: User, manage: bool = False) -> Bot:
+def _bot(s, bot_id: int, user: User, manage: bool = False, share: bool = False) -> Bot:
     bot = s.get(Bot, bot_id)
     _need(bot and bot_role(s, user.id, bot), 404, "bot not found")
     if manage:
         _need(can_manage(s, user.id, bot))
+    if share:
+        _need(can_share(s, user.id, bot), 403, "only the owner or a manager of this bot can change who may use it")
     return bot
 
 
@@ -676,6 +678,8 @@ def delete_team(team_id: int, confirm: str = Query(default=""), user: User = Dep
     local = os.path.join(config.DATA_DIR, "workspaces", f"p{team_id}")
     if os.path.isdir(local):
         shutil.rmtree(local, ignore_errors=True)
+    from . import knowledge
+    knowledge.remove_all(knowledge.key_for_team(team_id))  # the project's knowledge base and its history
     return {"deleted": name}
 
 
@@ -1028,7 +1032,8 @@ def patch_bot(bot_id: int, body: BotPatch, user: User = Depends(current_user)):
 
 @router.delete("/bots/{bot_id}")
 async def delete_bot(bot_id: int, user: User = Depends(current_user)):
-    """Owner only. Removes the bot for everyone, with its chats, memory, skills and routines."""
+    """Owner only. Removes the bot for everyone, with its chats and routines. The project's knowledge base
+    (memory, skills, AGENTS.md) stays."""
     with session() as s:
         b = s.get(Bot, bot_id)
         _need(b and b.owner_id == user.id, 404, "bot not found")
@@ -1067,7 +1072,7 @@ class ShareIn(BaseModel):
 @router.get("/bots/{bot_id}/share")
 def get_share(bot_id: int, user: User = Depends(current_user)):
     with session() as s:
-        b = _bot(s, bot_id, user, manage=True)
+        b = _bot(s, bot_id, user, share=True)
         rows = s.exec(select(BotAccess).where(BotAccess.bot_id == bot_id)).all()
         return {"published": b.published, "access": b.access,
                 "members": [{"user_id": r.user_id, "role": r.role} for r in rows]}
@@ -1077,7 +1082,7 @@ def get_share(bot_id: int, user: User = Depends(current_user)):
 def share_bot(bot_id: int, body: ShareIn, user: User = Depends(current_user)):
     _need(body.access in ("team", "selected"), 400, "access: team | selected")
     with session() as s:
-        b = _bot(s, bot_id, user, manage=True)
+        b = _bot(s, bot_id, user, share=True)
         _need(b.is_team, 400, "only a Team Bot can be shared")
         team = s.get(Team, b.team_id)
         _need(team.bot_sharing == "everyone" or team_role(s, user.id, b.team_id) == "admin",
@@ -1094,205 +1099,125 @@ def share_bot(bot_id: int, body: ShareIn, user: User = Depends(current_user)):
     return {"ok": True}
 
 
-# ---------------------------------------------------------------- memory, skills, secrets, MCP
+# ---------------------------------------------------------------- knowledge base (memory, skills, AGENTS.md)
+# A git-backed directory tree per project (app/knowledge.py). Every project member may read and change
+# everything; each write is a commit authored by that person and must pass the hash it is based on.
 
-def _memory_rows(s, bot: Bot, user: User) -> list[Memory]:
-    """Team memory of the bot's project (any status) and this person's own profile in it."""
-    q = select(Memory).where(Memory.team_id == (bot.team_id or 0))
-    if not bot.team_id:  # the overview bot has no project: its memory is its own
-        q = q.where(Memory.bot_id == bot.id)
-    return [m for m in s.exec(q.order_by(Memory.id)).all()
-            if m.scope == "team" or (m.scope == "personal" and m.user_id == user.id)]
-
-
-def _memory_access(s, m: Memory, user: User) -> None:
-    """Team memory belongs to the project: every member may change it. A profile only to its person."""
-    _need(m, 404, "memory not found")
-    if m.scope == "personal":
-        _need(m.user_id == user.id, 404, "memory not found")
-    elif m.team_id:
-        _need(team_role(s, user.id, m.team_id), 404, "memory not found")
-    else:
-        b = s.get(Bot, m.bot_id)
-        _need(b and bot_role(s, user.id, b), 404, "memory not found")
+class KnowledgeWrite(BaseModel):
+    path: str
+    content: str
+    base_hash: Optional[str] = None  # None: create a new file
+    message: str = ""
+    allow_secret: bool = False
 
 
-@router.get("/bots/{bot_id}/memories")
-def list_memories(bot_id: int, user: User = Depends(current_user)):
-    """The project's team memory and your own profile, as the bot sees them, with budget usage."""
-    from . import memory as mem
+class KnowledgePath(BaseModel):
+    path: str
+
+
+class KnowledgeRevert(BaseModel):
+    path: str
+    commit: str
+    base_hash: Optional[str] = None
+
+
+def _kb(bot_id: int, user: User) -> tuple[str, list[int]]:
+    from . import knowledge
     with session() as s:
         b = _bot(s, bot_id, user)
-        rows = _memory_rows(s, b, user)
-        names = {u.id: u.display_name for u in s.exec(select(User)).all()}
-    return [{"id": m.id, "scope": m.scope, "content": m.content, "status": m.status,
-             "proposed_by": names.get(m.proposed_by, ""),
-             "limit": mem.TEAM_LIMIT if m.scope == "team" else mem.USER_LIMIT} for m in rows]
+        bot_ids = [x.id for x in s.exec(select(Bot).where(Bot.team_id == b.team_id)).all()] if b.team_id else [b.id]
+        key = knowledge.key_for(b)
+    knowledge.ensure(key)
+    return key, bot_ids
 
 
-class MemoryIn(BaseModel):
-    content: str
-    scope: str = "personal"
+def _kb_do(fn):
+    from . import knowledge
+    try:
+        return fn()
+    except knowledge.Conflict as c:
+        raise HTTPException(409, c.info) from None
+    except knowledge.KnowledgeError as e:
+        raise HTTPException(400, str(e)) from None
 
 
-def _memory_result(result: str) -> dict:
-    _need(not result.startswith("error"), 400, result.split("\nCurrent entries:")[0].removeprefix("error: "))
-    return {"ok": True, "result": result}
+@router.get("/bots/{bot_id}/knowledge")
+def knowledge_tree(bot_id: int, user: User = Depends(current_user)):
+    """Directories and files of the bot's knowledge base, with the prompt budgets."""
+    from . import knowledge, memory, prompt
+    key, _ = _kb(bot_id, user)
+    return {**knowledge.tree(key), "profile_path": memory.user_path(user),
+            "limits": {memory.CONTEXT_FILE: prompt.PROJECT_CONTEXT_LIMIT, "memory/": memory.TEAM_LIMIT,
+                       memory.user_path(user): memory.USER_LIMIT, "skills/": prompt.SKILLS_LIMIT}}
 
 
-@router.post("/bots/{bot_id}/memories")
-def add_memory(bot_id: int, body: MemoryIn, user: User = Depends(current_user)):
-    from . import memory as mem
-    with session() as s:
-        b = _bot(s, bot_id, user)
-        target = "team" if body.scope == "team" else "user"
-        return _memory_result(mem.apply(s, b, user.id, target, [{"action": "add", "content": body.content}]))
+@router.get("/bots/{bot_id}/knowledge/file")
+def knowledge_read(bot_id: int, path: str, user: User = Depends(current_user)):
+    from . import knowledge
+    key, _ = _kb(bot_id, user)
+    return _kb_do(lambda: knowledge.read(key, path))
 
 
-class MemoryPatch(BaseModel):
-    content: str
+@router.put("/bots/{bot_id}/knowledge/file")
+def knowledge_write(bot_id: int, body: KnowledgeWrite, user: User = Depends(current_user)):
+    from . import knowledge
+    key, bot_ids = _kb(bot_id, user)
+    if not body.allow_secret:
+        found = secrets_http.find_leaks(body.content, bot_ids)
+        if found:
+            raise HTTPException(409, {"code": "secret", "found": found, "message":
+                                      "this text seems to contain a secret; store secrets with the bot instead"})
+    return _kb_do(lambda: knowledge.write(key, body.path, body.content, body.base_hash or None,
+                                          knowledge.user_author(user), body.message.strip()))
 
 
-@router.patch("/memories/{memory_id}")
-def edit_memory(memory_id: int, body: MemoryPatch, user: User = Depends(current_user)):
-    from . import memory as mem
-    with session() as s:
-        m = s.get(Memory, memory_id)
-        _memory_access(s, m, user)
-        b = s.get(Bot, m.bot_id)
-        _need(b, 404, "memory not found")
-        if m.status != "active":  # an old pending learning: editing it accepts it
-            m.status = "active"
-            s.add(m)
-            s.commit()
-        target = "team" if m.scope == "team" else "user"
-        return _memory_result(mem.apply(s, b, m.user_id or user.id, target,
-                                        [{"action": "patch", "id": m.id, "content": body.content}]))
+@router.delete("/bots/{bot_id}/knowledge/file")
+def knowledge_delete(bot_id: int, path: str, base_hash: str = "", user: User = Depends(current_user)):
+    from . import knowledge
+    key, _ = _kb(bot_id, user)
+    return _kb_do(lambda: knowledge.delete(key, path, base_hash or None, knowledge.user_author(user)))
 
 
-class ReviewIn(BaseModel):
-    approve: bool
+@router.post("/bots/{bot_id}/knowledge/dir")
+def knowledge_mkdir(bot_id: int, body: KnowledgePath, user: User = Depends(current_user)):
+    from . import knowledge
+    key, _ = _kb(bot_id, user)
+    return _kb_do(lambda: knowledge.mkdir(key, body.path, knowledge.user_author(user)))
 
 
-@router.post("/memories/{memory_id}/review")
-def review_memory(memory_id: int, body: ReviewIn, user: User = Depends(current_user)):
-    """Learnings proposed before memory became project-wide: any project member accepts or drops them."""
-    with session() as s:
-        m = s.get(Memory, memory_id)
-        _need(m and m.status == "pending", 404, "no pending learning with this id")
-        _memory_access(s, m, user)
-        if body.approve:
-            m.status = "active"
-            s.add(m)
-        else:
-            s.delete(m)
-        s.commit()
-    return {"ok": True}
+@router.get("/bots/{bot_id}/knowledge/history")
+def knowledge_history(bot_id: int, path: str = "", user: User = Depends(current_user)):
+    from . import knowledge
+    key, _ = _kb(bot_id, user)
+    return _kb_do(lambda: knowledge.history(key, path, 50))
 
 
-@router.delete("/memories/{memory_id}")
-def delete_memory(memory_id: int, user: User = Depends(current_user)):
-    with session() as s:
-        m = s.get(Memory, memory_id)
-        _memory_access(s, m, user)
-        s.delete(m)
-        s.commit()
-    return {"ok": True}
+@router.get("/bots/{bot_id}/knowledge/version")
+def knowledge_version(bot_id: int, path: str, commit: str, user: User = Depends(current_user)):
+    from . import knowledge
+    key, _ = _kb(bot_id, user)
+    content = _kb_do(lambda: knowledge.version(key, path, commit))
+    return {"path": path, "commit": commit, "exists": content is not None, "content": content or "",
+            "hash": knowledge.digest(content)}
 
 
-class SkillIn(BaseModel):
-    name: str
-    description: str = ""
-    instructions: str
-
-
-class SkillPatch(BaseModel):
-    name: Optional[str] = None
-    description: Optional[str] = None
-    instructions: Optional[str] = None
+@router.post("/bots/{bot_id}/knowledge/revert")
+def knowledge_revert(bot_id: int, body: KnowledgeRevert, user: User = Depends(current_user)):
+    from . import knowledge
+    key, _ = _kb(bot_id, user)
+    return _kb_do(lambda: knowledge.revert(key, body.path, body.commit, body.base_hash or None,
+                                           knowledge.user_author(user)))
 
 
 @router.get("/bots/{bot_id}/skills")
 def list_skills(bot_id: int, user: User = Depends(current_user)):
-    with session() as s:
-        _bot(s, bot_id, user)
-        return [k.model_dump() for k in s.exec(select(Skill).where(Skill.bot_id == bot_id)).all()]
+    """Skills of the bot's project (files in skills/), for the '@skill' menu."""
+    from . import memory
+    key, _ = _kb(bot_id, user)
+    return [{k: v for k, v in sk.items() if k != "instructions"} for sk in memory.skills(key)]
 
 
-@router.post("/bots/{bot_id}/skills")
-def add_skill(bot_id: int, body: SkillIn, user: User = Depends(current_user)):
-    """Everyone who can use the bot may add, change and remove its skills."""
-    _need(body.name.strip() and body.instructions.strip(), 400, "a skill needs a name and instructions")
-    with session() as s:
-        _bot(s, bot_id, user)
-        k = s.exec(select(Skill).where(Skill.bot_id == bot_id, Skill.name == body.name.strip())).first()
-        if k:
-            k.description, k.instructions = body.description, body.instructions
-        else:
-            k = Skill(bot_id=bot_id, created_by=user.id, **{**body.model_dump(), "name": body.name.strip()})
-        s.add(k)
-        s.commit()
-        return k.model_dump()
-
-
-@router.patch("/skills/{skill_id}")
-def edit_skill(skill_id: int, body: SkillPatch, user: User = Depends(current_user)):
-    with session() as s:
-        k = s.get(Skill, skill_id)
-        _need(k, 404, "skill not found")
-        _bot(s, k.bot_id, user)
-        for f in ("name", "description", "instructions"):
-            v = getattr(body, f)
-            if v is not None:
-                _need(f == "description" or v.strip(), 400, f"{f} cannot be empty")
-                setattr(k, f, v.strip() if f == "name" else v)
-        s.add(k)
-        s.commit()
-        return k.model_dump()
-
-
-@router.delete("/skills/{skill_id}")
-def delete_skill(skill_id: int, user: User = Depends(current_user)):
-    with session() as s:
-        k = s.get(Skill, skill_id)
-        _need(k, 404, "skill not found")
-        _bot(s, k.bot_id, user)
-        s.delete(k)
-        s.commit()
-    return {"ok": True}
-
-
-# ---------------------------------------------------------------- project context and prompt preview
-
-class ContextIn(BaseModel):
-    content: str
-
-
-@router.get("/teams/{team_id}/context")
-async def get_project_context(team_id: int, user: User = Depends(current_user)):
-    """The project's AGENTS.md: shared notes every bot of the project gets in its prompt."""
-    from . import prompt
-    with session() as s:
-        _need(team_role(s, user.id, team_id))
-    prompt.invalidate_project_context(team_id)
-    text = await prompt.project_context(team_id)
-    return {"path": prompt.CONTEXT_FILE, "content": text, "limit": prompt.PROJECT_CONTEXT_LIMIT}
-
-
-@router.put("/teams/{team_id}/context")
-async def put_project_context(team_id: int, body: ContextIn, user: User = Depends(current_user)):
-    from . import prompt
-    with session() as s:
-        _need(team_role(s, user.id, team_id))
-    found = secrets_http.find_leaks(body.content, [])
-    _need(not found, 409, "this text seems to contain a secret; store secrets with the bot instead")
-    try:
-        await sandbox.put_bytes(f"p{team_id}", prompt.CONTEXT_FILE, body.content.encode())
-    except Exception as e:  # noqa: BLE001
-        raise HTTPException(503, f"the project computer is not available: {e}") from e
-    prompt.invalidate_project_context(team_id)
-    return {"ok": True, "chars": len(body.content)}
-
+# ---------------------------------------------------------------- prompt preview
 
 @router.get("/bots/{bot_id}/prompt-preview")
 async def prompt_preview(bot_id: int, user: User = Depends(current_user)):
@@ -2148,7 +2073,7 @@ async def send_message(conv_id: int, body: MessageIn, user: User = Depends(curre
     with session() as s:
         conv = _conv(s, conv_id, user)
         _need(conv.kind != "feed", 400, "the activity feed is written by the bot only")
-        # Only someone who manages a bot may learn that a typed value equals one of its secrets.
+        # Only someone who may change a bot (any project member who can use it) learns that a typed value is a secret.
         bot_ids = [conv.bot_id] if conv.kind in ("dm", "home") else [m.bot_id for m in s.exec(select(ChannelMember).where(
             ChannelMember.conversation_id == conv_id, ChannelMember.bot_id != None)).all()]  # noqa: E711
         managed = [i for i in bot_ids if (b := s.get(Bot, i)) and can_manage(s, user.id, b)]

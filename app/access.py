@@ -24,6 +24,12 @@ def bot_role(s: Session, user_id: int, bot: Bot) -> Optional[str]:
 
 
 def can_manage(s: Session, user_id: int, bot: Bot) -> bool:
+    """Change the bot: instructions, model, secrets, tools. Within a project everyone who can use a bot may."""
+    return bot_role(s, user_id, bot) is not None
+
+
+def can_share(s: Session, user_id: int, bot: Bot) -> bool:
+    """Decide who may use the bot (sharing). This stays with the owner and the bot's managers."""
     return bot_role(s, user_id, bot) in ("owner", "manager")
 
 

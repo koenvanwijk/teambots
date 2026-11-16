@@ -219,7 +219,10 @@ class Message(SQLModel, table=True):
 
 
 class Memory(SQLModel, table=True):
-    """Team memory is per project (team_id); a personal memory is the person's profile in that project.
+    """LEGACY, read-only: memory now lives in the knowledge base (app/knowledge.py, memory/ and users/).
+    The rows are imported into it once and no longer written.
+
+    Team memory is per project (team_id); a personal memory is the person's profile in that project.
 
     bot_id is the bot that wrote it. The overview bot has no project (team_id 0), so its memory stays
     tied to that bot.
@@ -236,6 +239,7 @@ class Memory(SQLModel, table=True):
 
 
 class Skill(SQLModel, table=True):
+    """LEGACY, read-only: skills are files in skills/ of the project's knowledge base now."""
     id: Optional[int] = Field(default=None, primary_key=True)
     bot_id: int = Field(index=True)
     name: str
