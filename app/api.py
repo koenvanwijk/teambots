@@ -7,7 +7,6 @@ import mimetypes
 import os
 import re
 import secrets
-import shutil
 import subprocess
 import sys
 import uuid
@@ -666,15 +665,7 @@ def delete_team(team_id: int, confirm: str = Query(default=""), user: User = Dep
         s.delete(s.get(Team, team_id))
         s.commit()
     # 3) Remove the project's workspace: the Docker container and volume, and any local dir.
-    vol = f"tb-p{team_id}"
-    try:
-        subprocess.run(["docker", "rm", "-f", vol], capture_output=True, timeout=30)
-        subprocess.run(["docker", "volume", "rm", vol], capture_output=True, timeout=30)
-    except FileNotFoundError:
-        pass  # no docker here
-    local = os.path.join(config.DATA_DIR, "workspaces", f"p{team_id}")
-    if os.path.isdir(local):
-        shutil.rmtree(local, ignore_errors=True)
+    sandbox.destroy(f"p{team_id}")
     return {"deleted": name}
 
 

@@ -26,8 +26,9 @@ def _safe_key(key: str) -> str:
     return key
 
 
-async def _run(argv: list[str], stdin: bytes | None, timeout: float, cwd: str | None = None,
-               env: dict | None = None, raw: bool = False):
+async def _proc(argv: list[str], stdin: bytes | None, timeout: float, cwd: str | None = None,
+                env: dict | None = None) -> tuple[int, bytes, bool]:
+    """Run argv; (exit code, combined output, timed out). Killed on timeout or cancellation."""
     proc = await asyncio.create_subprocess_exec(
         *argv, stdin=asyncio.subprocess.PIPE if stdin is not None else asyncio.subprocess.DEVNULL,
         stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT, cwd=cwd, env=env)
@@ -36,43 +37,146 @@ async def _run(argv: list[str], stdin: bytes | None, timeout: float, cwd: str | 
     except asyncio.TimeoutError:
         proc.kill()
         await proc.wait()
-        return 124, (b"" if raw else f"[timed out after {int(timeout)}s]")
+        return 124, b"", True
     except asyncio.CancelledError:  # the turn was interrupted: do not leave the command running
         proc.kill()
         raise
+    return proc.returncode or 0, out, False
+
+
+def _format(code: int, out: bytes, timed_out: bool, timeout: float, raw: bool):
+    if timed_out:
+        return 124, (b"" if raw else f"[timed out after {int(timeout)}s]")
     if raw:
-        return proc.returncode or 0, out
+        return code, out
     text = out.decode(errors="replace")
     if len(text) > MAX_OUTPUT:
         text = text[:MAX_OUTPUT // 2] + "\n[... output truncated ...]\n" + text[-MAX_OUTPUT // 2:]
-    return proc.returncode or 0, text
+    return code, text
+
+
+async def _run(argv: list[str], stdin: bytes | None, timeout: float, cwd: str | None = None,
+               env: dict | None = None, raw: bool = False):
+    code, out, timed_out = await _proc(argv, stdin, timeout, cwd=cwd, env=env)
+    return _format(code, out, timed_out, timeout, raw)
+
+
+# ---------------------------------------------------------------- docker, direct or through sandboxd
+# With TB_SANDBOXD_SOCKET set, the app has no Docker access at all: every container operation
+# goes to sandboxd (app/sandboxd.py) over a Unix socket, and only sandboxd holds the Docker socket.
+# sandboxd itself calls the *_direct functions below.
+
+def _container_args(name: str) -> list[str]:
+    args = ["docker", "run", "-d", "--name", name, "--memory", "2g", "--cpus", "2",
+            "--pids-limit", "512", "--shm-size", "512m", "--cap-drop", "ALL", "--security-opt", "no-new-privileges",
+            "--network", config.SANDBOX_NETWORK, "-v", f"{name}:/workspace", "-w", "/workspace"]
+    if config.SANDBOX_RUNTIME:
+        args += ["--runtime", config.SANDBOX_RUNTIME]
+    return args + [config.SANDBOX_IMAGE, "sleep", "infinity"]
 
 
 async def _ensure_container(name: str) -> None:
     async with _lock:
         if name in _started:
             return
-        code, out = await _run(["docker", "inspect", "-f", "{{.State.Running}}", name], None, 20)
+        code, out = await _run(["docker", "inspect", "-f", "{{.State.Running}} {{.HostConfig.Runtime}}", name],
+                               None, 20)
+        running, _, runtime = out.strip().partition(" ") if code == 0 else ("", "", "")
+        if code == 0 and config.SANDBOX_RUNTIME and runtime != config.SANDBOX_RUNTIME:
+            # Created under another runtime (e.g. before gVisor): recreate it. The named volume,
+            # and so the workspace, is kept; only running processes are lost.
+            await _run(["docker", "rm", "-f", name], None, 60)
+            code = 1
         if code != 0:
-            code, out = await _run([
-                "docker", "run", "-d", "--name", name, "--memory", "2g", "--cpus", "2",
-                "--pids-limit", "512", "--shm-size", "512m", "--cap-drop", "ALL", "--security-opt", "no-new-privileges",
-                "--network", config.SANDBOX_NETWORK, "-v", f"{name}:/workspace", "-w", "/workspace",
-                config.SANDBOX_IMAGE, "sleep", "infinity"], None, 120)
+            code, out = await _run(_container_args(name), None, 120)
             if code != 0:
                 raise RuntimeError(f"could not start sandbox: {out.strip()[:300]}")
-        elif "true" not in out:
+        elif running != "true":
             await _run(["docker", "start", name], None, 60)
         _started.add(name)
 
 
-def _command(key: str, argv: list[str], env: dict, detach: bool = False) -> tuple[list[str], str | None, dict | None]:
-    """(argv, cwd, env) to run `argv` inside the sandbox `key`."""
-    if config.SANDBOX_BACKEND == "docker":
-        cmd = ["docker", "exec", "-d" if detach else "-i", "-w", "/workspace"]
-        for k, v in env.items():
-            cmd += ["-e", f"{k}={v}"]
-        return cmd + [f"tb-{key}"] + argv, None, None
+async def docker_exec_direct(name: str, argv: list[str], env: dict, stdin: bytes | None, timeout: float,
+                             detach: bool = False) -> tuple[int, bytes, bool]:
+    await _ensure_container(name)
+    cmd = ["docker", "exec", "-d" if detach else "-i", "-w", "/workspace"]
+    for k, v in env.items():
+        cmd += ["-e", f"{k}={v}"]
+    return await _proc(cmd + [name] + argv, stdin, timeout)
+
+
+async def docker_addr_direct(name: str) -> str:
+    await _ensure_container(name)
+    code, out = await _run([
+        "docker", "inspect", "-f",
+        "{{range .NetworkSettings.Networks}}{{.IPAddress}} {{end}}", name], None, 20)
+    return (out or "").split()[0] if code == 0 and (out or "").split() else ""
+
+
+def docker_destroy_direct(name: str) -> None:
+    """Remove the container and its volume. Blocking; never raises when Docker is missing."""
+    import subprocess
+    _started.discard(name)
+    try:
+        subprocess.run(["docker", "rm", "-f", name], capture_output=True, timeout=30)
+        subprocess.run(["docker", "volume", "rm", name], capture_output=True, timeout=30)
+    except FileNotFoundError:
+        pass  # no docker here
+
+
+def _sandboxd_transport(sync: bool = False):
+    import httpx
+    cls = httpx.HTTPTransport if sync else httpx.AsyncHTTPTransport
+    return cls(uds=config.SANDBOXD_SOCKET)
+
+
+async def _sandboxd(path: str, body: dict, timeout: float) -> dict:
+    import httpx
+    async with httpx.AsyncClient(transport=_sandboxd_transport(), base_url="http://sandboxd",
+                                 timeout=timeout) as client:
+        r = await client.post(path, json=body)
+    if r.status_code != 200:
+        raise RuntimeError(f"sandboxd {path}: {r.status_code} {r.text[:300]}")
+    return r.json()
+
+
+async def _docker_exec(name: str, argv: list[str], env: dict, stdin: bytes | None, timeout: float,
+                       detach: bool = False) -> tuple[int, bytes, bool]:
+    if not config.SANDBOXD_SOCKET:
+        return await docker_exec_direct(name, argv, env, stdin, timeout, detach)
+    import base64
+    res = await _sandboxd("/exec", {
+        "name": name, "argv": argv, "env": env, "timeout": timeout, "detach": detach,
+        "stdin": base64.b64encode(stdin).decode() if stdin is not None else None,
+    }, timeout + 150)  # room for a first container start
+    return int(res["code"]), base64.b64decode(res["output"]), bool(res["timed_out"])
+
+
+async def _docker_addr(name: str) -> str:
+    if not config.SANDBOXD_SOCKET:
+        return await docker_addr_direct(name)
+    return (await _sandboxd("/addr", {"name": name}, 150))["ip"]
+
+
+def destroy(key: str) -> None:
+    """Remove the sandbox `key` and its workspace for good (container, volume, local folder). Blocking."""
+    import shutil
+    key = _safe_key(key)
+    name = f"tb-{key}"
+    if config.SANDBOXD_SOCKET:
+        import httpx
+        with httpx.Client(transport=_sandboxd_transport(sync=True), base_url="http://sandboxd", timeout=90) as c:
+            r = c.post("/destroy", json={"name": name})
+            if r.status_code != 200:
+                raise RuntimeError(f"sandboxd /destroy: {r.status_code} {r.text[:300]}")
+    else:
+        docker_destroy_direct(name)
+    local = os.path.join(config.DATA_DIR, "workspaces", key)
+    if os.path.isdir(local):
+        shutil.rmtree(local, ignore_errors=True)
+
+
+def _local_command(key: str, argv: list[str], env: dict) -> tuple[list[str], str, dict]:
     workdir = os.path.abspath(os.path.join(config.DATA_DIR, "workspaces", key))
     os.makedirs(workdir, exist_ok=True)
     return argv, workdir, {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": workdir, **env}
@@ -92,8 +196,9 @@ async def sb_exec(key: str, argv: list[str], stdin: bytes | None = None, env: di
     key = _safe_key(key)
     async with _key_lock(key):
         if config.SANDBOX_BACKEND == "docker":
-            await _ensure_container(f"tb-{key}")
-        cmd, cwd, full_env = _command(key, argv, env or {})
+            code, out, timed_out = await _docker_exec(f"tb-{key}", argv, env or {}, stdin, timeout)
+            return _format(code, out, timed_out, timeout, raw)
+        cmd, cwd, full_env = _local_command(key, argv, env or {})
         return await _run(cmd, stdin, timeout, cwd=cwd, env=full_env, raw=raw)
 
 
@@ -102,11 +207,9 @@ async def sb_spawn(key: str, argv: list[str], env: dict | None = None) -> None:
     key = _safe_key(key)
     async with _key_lock(key):
         if config.SANDBOX_BACKEND == "docker":
-            await _ensure_container(f"tb-{key}")
-            cmd, _, _ = _command(key, argv, env or {}, detach=True)
-            await _run(cmd, None, 30)
+            await _docker_exec(f"tb-{key}", argv, env or {}, None, 30, detach=True)
             return
-        cmd, cwd, full_env = _command(key, argv, env or {})
+        cmd, cwd, full_env = _local_command(key, argv, env or {})
         await asyncio.create_subprocess_exec(*cmd, cwd=cwd, env=full_env, stdin=asyncio.subprocess.DEVNULL,
                                              stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
                                              start_new_session=True)
@@ -194,12 +297,7 @@ async def sandbox_addr(key: str) -> str:
     key = _safe_key(key)
     if config.SANDBOX_BACKEND != "docker":
         return "127.0.0.1"
-    name = f"tb-{key}"
-    await _ensure_container(name)
-    code, out = await _run([
-        "docker", "inspect", "-f",
-        "{{range .NetworkSettings.Networks}}{{.IPAddress}} {{end}}", name], None, 20)
-    ip = (out or "").split()[0] if code == 0 else ""
+    ip = await _docker_addr(f"tb-{key}")
     if not ip:
         raise RuntimeError(
             "sandbox has no network address; interactive screen needs TB_SANDBOX_NETWORK=bridge (the default)")

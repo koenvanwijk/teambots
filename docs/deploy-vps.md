@@ -21,6 +21,9 @@ Tailscale-adres van de **host**. Er gaat geen publieke tunnel open en poort
   `TB_SANDBOX_NETWORK` niet terug naar `bridge`.
 - Poort 18080 wordt gepubliceerd op `127.0.0.1` en op `TB_TAILSCALE_IP`
   (het IPv4-adres van `tailscale ip -4` op de VPS).
+- Alleen de container **sandboxd** heeft de Docker-socket. Hij heeft geen
+  netwerk en praat met de app via een Unix-socket op het volume
+  `sandboxd-run`. De app zelf kan Docker niet aansturen.
 - De database staat in `./data` (op de VPS: `/opt/teambots/data`), niet in
   een anonieme Docker-volume, zodat een proefrun en de overstap een gewone
   bestandskopie zijn.
@@ -54,6 +57,27 @@ Een schijf van 19 GB is krap voor Docker plus het sandbox-image (Chrome).
 Plan een rootschijf van 80 GB of meer. Een extra Hetzner-volume dat al
 aangekoppeld is hoef je niet te formatteren; gebruik het alleen als je
 bewust Docker-data of backups daarheen verplaatst.
+
+### gVisor voor de sandboxes
+
+gVisor (`runsc`) geeft elke sandbox een eigen kernel in user space. Het werkt
+op een Hetzner Cloud-VM (geen geneste virtualisatie nodig).
+
+```bash
+# Officiële apt-repo van gVisor
+curl -fsSL https://gvisor.dev/archive.key | gpg --dearmor -o /usr/share/keyrings/gvisor-archive-keyring.gpg
+echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/gvisor-archive-keyring.gpg] https://storage.googleapis.com/gvisor/releases release main" \
+  > /etc/apt/sources.list.d/gvisor.list
+apt-get update && apt-get install -y runsc
+runsc install                      # voegt de runtime toe aan /etc/docker/daemon.json
+systemctl restart docker           # herstart ook alle containers
+docker run --rm --runtime=runsc hello-world   # controle
+```
+
+Zet daarna `TB_SANDBOX_RUNTIME=runsc` in `.env`. Bestaande sandboxes worden
+bij het eerstvolgende gebruik onder gVisor opnieuw aangemaakt; de
+werkruimte (het volume) blijft bewaard, lopende processen zoals een open
+browser niet.
 
 ## 2. Compose-stack starten
 

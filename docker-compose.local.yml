@@ -9,17 +9,43 @@ services:
     image: teambots-sandbox:latest
     command: ["true"]
     restart: "no"
+  # Only sandboxd holds the Docker socket; the app talks to it over a Unix socket. See README, "Security".
+  sandboxd:
+    build: .
+    image: teambots-app:latest
+    depends_on:
+      sandbox-image:
+        condition: service_completed_successfully
+    command: ["sh", "-c", "rm -f /run/teambots/sandboxd.sock && exec uvicorn app.sandboxd:app --uds /run/teambots/sandboxd.sock"]
+    environment:
+      TB_SANDBOX: docker
+      TB_SANDBOX_RUNTIME: ${TB_SANDBOX_RUNTIME:-}
+      TB_DATA_DIR: /tmp/sandboxd
+    volumes:
+      - sandboxd-run:/run/teambots
+      - /var/run/docker.sock:/var/run/docker.sock
+    network_mode: none
+    healthcheck:
+      test: ["CMD", "python", "-c", "import httpx; httpx.get('http://s/health', transport=httpx.HTTPTransport(uds='/run/teambots/sandboxd.sock'), timeout=5).raise_for_status()"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    restart: unless-stopped
   app:
     build: .
     image: teambots-app:latest
     depends_on:
       sandbox-image:
         condition: service_completed_successfully
+      sandboxd:
+        condition: service_healthy
     ports: ["${TB_BIND:-127.0.0.1}:8080:8080"]
     environment:
       TB_SECRET_KEY: ${TB_SECRET_KEY:?set TB_SECRET_KEY in .env (long random string)}
       TB_TIMEZONE: ${TB_TIMEZONE:-Europe/Amsterdam}
       TB_SANDBOX: docker
+      TB_SANDBOXD_SOCKET: /run/teambots/sandboxd.sock
       TB_HTTP_ALLOW_PRIVATE: ${TB_HTTP_ALLOW_PRIVATE:-0}
       TB_OPEN_REGISTRATION: ${TB_OPEN_REGISTRATION:-0}
       TB_ENABLE_DOCS: ${TB_ENABLE_DOCS:-0}
@@ -27,8 +53,7 @@ services:
     extra_hosts: ["host.docker.internal:host-gateway"]
     volumes:
       - tb-data:/data
-      # Gives the app control over the host Docker daemon. See README, "Security".
-      - /var/run/docker.sock:/var/run/docker.sock
+      - sandboxd-run:/run/teambots
     restart: unless-stopped
   caddy:
     profiles: ["server"]
@@ -40,3 +65,4 @@ services:
 volumes:
   tb-data:
   caddy-data:
+  sandboxd-run:

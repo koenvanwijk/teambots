@@ -10,6 +10,11 @@
 # Sandboxes join the `teambots` Docker network so the app can reach their
 # interactive screens. See docs/deploy-vps.md.
 #
+# The app has no Docker access. Only `sandboxd` mounts the Docker socket; it
+# has no network and listens on a Unix socket shared with the app alone. It
+# runs sandboxes with TB_SANDBOX_RUNTIME (set `runsc` once gVisor is
+# installed on the host, see README "Security").
+#
 #   cp .env.example .env   # fill TB_SECRET_KEY and TB_TAILSCALE_IP
 #   docker compose up -d --build
 #
@@ -22,12 +27,42 @@ services:
     command: ["true"]
     restart: "no"
 
+  sandboxd:
+    build: .
+    image: teambots-app:latest
+    depends_on:
+      sandbox-image:
+        condition: service_completed_successfully
+    command:
+      - sh
+      - -c
+      - rm -f /run/teambots/sandboxd.sock && exec uvicorn app.sandboxd:app --uds /run/teambots/sandboxd.sock
+    environment:
+      TB_SANDBOX: docker
+      TB_SANDBOX_IMAGE: teambots-sandbox:latest
+      TB_SANDBOX_NETWORK: teambots
+      TB_SANDBOX_RUNTIME: ${TB_SANDBOX_RUNTIME:-}
+      TB_DATA_DIR: /tmp/sandboxd
+    volumes:
+      - sandboxd-run:/run/teambots
+      - /var/run/docker.sock:/var/run/docker.sock
+    network_mode: none
+    healthcheck:
+      test: ["CMD", "python", "-c", "import httpx; httpx.get('http://s/health', transport=httpx.HTTPTransport(uds='/run/teambots/sandboxd.sock'), timeout=5).raise_for_status()"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    restart: unless-stopped
+
   app:
     build: .
     image: teambots-app:latest
     depends_on:
       sandbox-image:
         condition: service_completed_successfully
+      sandboxd:
+        condition: service_healthy
     command:
       - sh
       - -c
@@ -41,6 +76,7 @@ services:
       TB_SANDBOX: docker
       TB_SANDBOX_IMAGE: teambots-sandbox:latest
       TB_SANDBOX_NETWORK: teambots
+      TB_SANDBOXD_SOCKET: /run/teambots/sandboxd.sock
       TB_HTTP_ALLOW_PRIVATE: ${TB_HTTP_ALLOW_PRIVATE:-1}
       TB_PUBLIC_URL: ${TB_PUBLIC_URL:-}
       TB_OPEN_REGISTRATION: ${TB_OPEN_REGISTRATION:-0}
@@ -52,7 +88,7 @@ services:
       HOME: /data/claude-home
     volumes:
       - ${TB_HOST_DATA:-./data}:/data
-      - /var/run/docker.sock:/var/run/docker.sock
+      - sandboxd-run:/run/teambots
     extra_hosts:
       - "host.docker.internal:host-gateway"
     networks: [teambots]
@@ -67,3 +103,6 @@ services:
 networks:
   teambots:
     name: teambots
+
+volumes:
+  sandboxd-run:
