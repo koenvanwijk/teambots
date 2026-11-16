@@ -156,6 +156,8 @@ TeamBots is meant to sit behind a TLS reverse proxy. It honours `X-Forwarded-Pro
 | `TB_SANDBOX` | `local` | `docker` or `local` |
 | `TB_SANDBOX_IMAGE` | `teambots-sandbox:latest` | Image for the bots' computers |
 | `TB_SANDBOX_NETWORK` | `bridge` | Docker network for sandboxes (`none` = offline) |
+| `TB_SANDBOX_RUNTIME` | empty | Container runtime for sandboxes, e.g. `runsc` for gVisor (must be installed on the host). Sandboxes made under another runtime are recreated on first use; the workspace volume is kept |
+| `TB_SANDBOXD_SOCKET` | empty | Unix socket of sandboxd. When set, the app has no Docker access and asks sandboxd to run sandbox commands (both compose files set this) |
 | `TB_BROWSER` | `google-chrome` | Browser binary inside the sandbox (`google-chrome` by default; set `chromium` to use Debian Chromium). Runs as user `bot` with `--no-sandbox` because the container drops capabilities. The profile is stored on the project volume under `.screens/bot<id>` |
 | `TB_HTTP_ALLOW_PRIVATE` | `0` | `1` lets `http_request` reach private addresses and send secrets over http (development) |
 | `TB_BIND`, `TB_DOMAIN` | `127.0.0.1`, `localhost` | Compose: bind address of the app, domain for Caddy |
@@ -181,6 +183,7 @@ app/costs_api.py   Costs API
 app/claude_cli.py  Claude CLI provider (local `claude` binary)
 app/llm_router.py  rule-based model router (Option A)
 app/sandbox.py     the project computer (docker / local)
+app/sandboxd.py    the only process with the Docker socket; narrow API for the app
 app/screen.py      a virtual screen per bot: screenshot, mouse, keyboard
 app/secrets_http.py  secrets filled in outside the sandbox, masking
 app/mcp_client.py  MCP tool discovery and calls
@@ -195,8 +198,15 @@ docs/router.md     model router (Option A implemented; B/C still described)
 
 ## Security
 
-- The app container mounts the Docker socket to start sandboxes. That is root-equivalent on the
-  host. Run it on a dedicated VM, or replace the socket with a restricted proxy or rootless Docker.
+- The app has no Docker access. A separate `sandboxd` container holds the Docker socket (which is
+  root-equivalent on the host). It has no network, listens only on a Unix socket shared with the
+  app, and offers three operations: run a command in a `tb-*` sandbox, look up a sandbox's
+  address, remove a sandbox. Image, limits, network and runtime come from sandboxd's own
+  environment, so a compromised app cannot start a privileged container or mount the host.
+- Run sandboxes under gVisor (`TB_SANDBOX_RUNTIME=runsc`) so a bot that escapes its process
+  still meets gVisor's user-space kernel instead of the host kernel. It works on a cloud VM
+  without nested virtualisation. Install it on the host (see docs/deploy-vps.md), then set the
+  variable in `.env`. Filesystem-heavy work (`npm install`, builds) is somewhat slower.
 - Sandboxes drop all capabilities, are limited to 2 CPU / 2 GB / 512 processes, and have network
   access by default. Set `TB_SANDBOX_NETWORK=none` or a filtered network if bots should not reach
   your LAN.

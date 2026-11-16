@@ -16,6 +16,11 @@ SECRET_KEY = os.environ.get("TB_SECRET_KEY", "dev-insecure-change-me")
 SANDBOX_BACKEND = os.environ.get("TB_SANDBOX", "local")
 SANDBOX_IMAGE = os.environ.get("TB_SANDBOX_IMAGE", "teambots-sandbox:latest")
 SANDBOX_NETWORK = os.environ.get("TB_SANDBOX_NETWORK", "bridge")
+# Container runtime for sandboxes, e.g. "runsc" (gVisor). Empty = Docker's default (runc).
+SANDBOX_RUNTIME = os.environ.get("TB_SANDBOX_RUNTIME", "")
+# Unix socket of sandboxd (app/sandboxd.py). When set, the app has no Docker access itself and asks
+# sandboxd to run commands in sandboxes; only sandboxd holds the Docker socket.
+SANDBOXD_SOCKET = os.environ.get("TB_SANDBOXD_SOCKET", "")
 TIMEZONE = os.environ.get("TB_TIMEZONE", "Europe/Amsterdam")
 SANDBOX_BROWSER = os.environ.get("TB_BROWSER", "google-chrome")
 # http_request may only reach public addresses unless this is set (development, internal APIs).

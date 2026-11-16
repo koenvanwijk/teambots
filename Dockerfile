@@ -1,5 +1,5 @@
 FROM python:3.12-slim
-# The docker CLI (Debian 13: package docker-cli; docker.io no longer ships it) lets the app start one sandbox container per user/channel on the host daemon.
+# The docker CLI (Debian 13: package docker-cli; docker.io no longer ships it) is used by sandboxd (app/sandboxd.py), the only container with the Docker socket, to start one sandbox per project.
 # curl is used to install the official Claude Code CLI; credentials are not baked in.
 # git keeps the history of every project knowledge base (app/knowledge.py).
 RUN apt-get update && apt-get install -y --no-install-recommends \
