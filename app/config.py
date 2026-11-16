@@ -18,6 +18,9 @@ SANDBOX_IMAGE = os.environ.get("TB_SANDBOX_IMAGE", "teambots-sandbox:latest")
 SANDBOX_NETWORK = os.environ.get("TB_SANDBOX_NETWORK", "bridge")
 # Container runtime for sandboxes, e.g. "runsc" (gVisor). Empty = Docker's default (runc).
 SANDBOX_RUNTIME = os.environ.get("TB_SANDBOX_RUNTIME", "")
+# Host path of a resolv.conf mounted into sandboxes. Needed with gVisor on a user-defined Docker network:
+# Docker's embedded DNS (127.0.0.11) relies on iptables inside the container, which gVisor does not apply.
+SANDBOX_RESOLV_CONF = os.environ.get("TB_SANDBOX_RESOLV_CONF", "")
 # Unix socket of sandboxd (app/sandboxd.py). When set, the app has no Docker access itself and asks
 # sandboxd to run commands in sandboxes; only sandboxd holds the Docker socket.
 SANDBOXD_SOCKET = os.environ.get("TB_SANDBOXD_SOCKET", "")

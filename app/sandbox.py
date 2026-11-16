@@ -72,6 +72,8 @@ def _container_args(name: str) -> list[str]:
             "--network", config.SANDBOX_NETWORK, "-v", f"{name}:/workspace", "-w", "/workspace"]
     if config.SANDBOX_RUNTIME:
         args += ["--runtime", config.SANDBOX_RUNTIME]
+    if config.SANDBOX_RESOLV_CONF:
+        args += ["-v", f"{config.SANDBOX_RESOLV_CONF}:/etc/resolv.conf:ro"]
     return args + [config.SANDBOX_IMAGE, "sleep", "infinity"]
 
 

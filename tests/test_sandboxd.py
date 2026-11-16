@@ -61,6 +61,7 @@ def sandboxd(monkeypatch):
     monkeypatch.setattr(sandbox, "_proc", fake)
     monkeypatch.setattr(config, "SANDBOX_BACKEND", "docker")
     monkeypatch.setattr(config, "SANDBOX_RUNTIME", "runsc")
+    monkeypatch.setattr(config, "SANDBOX_RESOLV_CONF", "/etc/teambots/sandbox-resolv.conf")
     sandbox._started.clear()
     sock = os.path.join(tempfile.mkdtemp(prefix="tb-sd-"), "sandboxd.sock")
     from app.sandboxd import app
@@ -86,6 +87,7 @@ def test_exec_goes_through_sandboxd_with_gvisor(sandboxd):
     assert run[run.index("--runtime") + 1] == "runsc"
     assert "--cap-drop" in run and "ALL" in run and "-v" in run
     assert run[run.index("-v") + 1] == "tb-p1:/workspace"
+    assert "/etc/teambots/sandbox-resolv.conf:/etc/resolv.conf:ro" in run
     exec_ = next(c for c in fake.calls if c[:2] == ["docker", "exec"])
     assert exec_ == ["docker", "exec", "-i", "-w", "/workspace", "-e", "DISPLAY=:1", "tb-p1", "cat"]
 
