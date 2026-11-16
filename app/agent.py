@@ -106,6 +106,10 @@ BUILTIN_TOOLS = [
         ["action", "name"]),
     _fn("use_skill", "Load the full instructions of a saved skill before doing that task.",
         {"name": {"type": "string"}}, ["name"]),
+    _fn("search_history", "Search earlier messages in chats the person can read (in a team chat: only that "
+        "chat). Use it when they refer to something said before, or older messages are missing here.",
+        {"query": {"type": "string", "description": "a few words that occur in the message"},
+         "limit": {"type": "integer", "description": "at most this many results, default 8"}}, ["query"]),
     _fn("http_request", "Send an HTTP request from outside the sandbox. This is the only way to use a secret: "
         "write {{secret:NAME}} in a header, the URL or the body and it is filled in after the call leaves you. "
         "A secret is only sent to the hosts it is bound to. Redirects are not followed.",
@@ -375,6 +379,9 @@ async def _execute(ctx: Ctx, name: str, args: dict, mcp_map: dict) -> str:
     if name in {t["function"]["name"] for t in HOME_TOOLS}:
         from . import home as home_mod
         return home_mod.execute_home_tool(ctx.requester_id, name, args)
+    if name == "search_history":
+        from . import learning
+        return learning.search_history(ctx, args.get("query", ""), args.get("limit") or 8)
     if name == "run_command":
         return await sandbox.run_command(ctx.sandbox_key, args["command"], None, float(args.get("timeout") or 60))
     if name == "write_file":
@@ -809,6 +816,8 @@ async def _run_locked(conv_id: int, bot_id: int, requester_id: int, run: Run | N
                     route_reason=reply.get("route_reason") or "", **common)
         if not calls:
             await share_activity(conv, bot, user, ep)
+            from . import learning
+            learning.after_turn(conv_id, bot_id, requester_id)
             return
         paused = False
         for tc in calls:

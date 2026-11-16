@@ -133,6 +133,8 @@ class Conversation(SQLModel, table=True):
     user_id: Optional[int] = Field(default=None, index=True)  # dm only
     bot_id: Optional[int] = Field(default=None, index=True)  # dm/home/handoff; None for channels and project activity
     peer_bot_id: Optional[int] = Field(default=None, index=True)  # handoff: the bot that asked
+    summary: str = ""  # rolling summary of the messages that no longer fit in the history
+    summary_upto: int = 0  # id of the last message the summary covers
 
 
 class ChannelMember(SQLModel, table=True):
@@ -508,14 +510,18 @@ def _ensure_mcp_auth_columns() -> None:
 
 
 def _ensure_handoff_columns() -> None:
-    """Add Conversation.peer_bot_id on databases created before bot-to-bot threads."""
+    """Add Conversation.peer_bot_id (bot-to-bot threads) and the rolling summary columns on older databases."""
     if not config.DB_URL.startswith("sqlite"):
         return
     with engine.connect() as conn:
         cols = [r[1] for r in conn.exec_driver_sql("PRAGMA table_info(conversation)").fetchall()]
         if "peer_bot_id" not in cols:
             conn.exec_driver_sql("ALTER TABLE conversation ADD COLUMN peer_bot_id INTEGER")
-            conn.commit()
+        if "summary" not in cols:
+            conn.exec_driver_sql("ALTER TABLE conversation ADD COLUMN summary VARCHAR NOT NULL DEFAULT ''")
+        if "summary_upto" not in cols:
+            conn.exec_driver_sql("ALTER TABLE conversation ADD COLUMN summary_upto INTEGER NOT NULL DEFAULT 0")
+        conn.commit()
 
 
 def _ensure_memory_team_column() -> None:
