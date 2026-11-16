@@ -373,3 +373,15 @@ dialog.wide { width: min(960px, calc(100vw - 24px)); }
 .route-tag { font-size: 11px; color: var(--muted); border: 1px solid var(--line); border-radius: 99px; padding: 1px 7px; white-space: nowrap; align-self: center; }
 .work > summary .route-tag { flex: 0 0 auto; }
 .msg .acts .route-tag { margin-right: 4px; }
+
+/* ---------- project files */
+.files .ftools { display:flex; gap:10px; align-items:center; margin:18px 0 12px; flex-wrap:wrap; }
+.files .ftools input { flex:1; min-width:180px; }
+.files .drop { border:1.5px dashed var(--s3); border-radius:16px; padding:18px; text-align:center; color:var(--muted); font-size:13.5px; cursor:pointer; margin-bottom:14px; }
+.files .drop:hover, body.dragging .files .drop { border-color:var(--tok); color:var(--ink); background:var(--tok-bg); }
+.frow .lead { width:28px; display:grid; place-items:center; color:var(--muted); flex:none; }
+.frow .tx a { color:var(--ink); } .frow .tx a:hover { color:var(--tok); }
+.frow .ib { opacity:.7; } .frow:hover .ib { opacity:1; }
+.ups { display:flex; flex-wrap:wrap; gap:6px; padding:4px 10px 2px; }
+.ups .up { display:inline-flex; align-items:center; gap:7px; font-size:12.5px; color:var(--ink2); background:var(--s2); border-radius:99px; padding:3px 10px; max-width:100%; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+body.dragging .composer { border-color:var(--tok); box-shadow:0 0 0 3px var(--tok-bg); }

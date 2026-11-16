@@ -27,7 +27,7 @@ const ICONS = {
   users: 'M9 11a3.5 3.5 0 1 0 0-7 3.5 3.5 0 0 0 0 7zM2.5 20a6.5 6.5 0 0 1 13 0M16 4.2a3.5 3.5 0 0 1 0 6.6M18 14.5a6.5 6.5 0 0 1 3.5 5.5',
   out: 'M9 4H5v16h4M15 8l4 4-4 4M19 12H9', sun: 'M12 16a4 4 0 1 0 0-8 4 4 0 0 0 0 8zM12 2v2M12 20v2M2 12h2M20 12h2M5 5l1.5 1.5M17.5 17.5L19 19M5 19l1.5-1.5M17.5 6.5L19 5',
   term: 'M4 5h16v14H4zM8 10l3 2.5L8 15M13 15h3', file: 'M7 3h7l4 4v14H7zM14 3v4h4', key: 'M8 15a4 4 0 1 0 0-8 4 4 0 0 0 0 8zM12 11h9M18 11v3M15 11v2',
-  zap: 'M13 3L5 13h6l-1 8 8-10h-6z', grid: 'M4 4h7v7H4zM13 4h7v7h-7zM4 13h7v7H4zM13 13h7v7h-7z',
+  zap: 'M13 3L5 13h6l-1 8 8-10h-6z', folder: 'M3 6h6l2 2h10v11H3z', clip: 'M20 11.5l-8 8a5 5 0 0 1-7-7l8.5-8.5a3.5 3.5 0 0 1 5 5L10 17.5a2 2 0 0 1-3-3l7.5-7.5', grid: 'M4 4h7v7H4zM13 4h7v7h-7zM4 13h7v7H4zM13 13h7v7h-7z',
   home: 'M4 11l8-7 8 7v9H15v-6h-6v6H4z', trash: 'M5 7h14M10 7V4h4v3M7 7l1 13h8l1-13',
   play: 'M8 5l11 7-11 7z', clock: 'M12 21a9 9 0 1 0 0-18 9 9 0 0 0 0 18zM12 7v5l3 2', coin: 'M12 21a9 9 0 1 0 0-18 9 9 0 0 0 0 18zM8 12h8M12 8v8', screen: 'M3 5h18v11H3zM9 20h6M12 16v4',
   globe: 'M12 21a9 9 0 1 0 0-18 9 9 0 0 0 0 18zM3 12h18M12 3c3 3 3 15 0 18M12 3c-3 3-3 15 0 18', book: 'M5 4h13v16H7a2 2 0 0 1-2-2zM5 18a2 2 0 0 1 2-2h11',
@@ -345,6 +345,7 @@ function renderSide() {
     $('button', { className: 'nav', onclick: openPalette }, icon('search'), $('span', { className: 'grow', textContent: 'Search' }), $('kbd', { textContent: 'Ctrl K' })),
     $('button', { className: 'nav' + (c && c.kind === 'home' ? ' on' : ''), onclick: guard(openOverview) }, icon('home'), $('span', { className: 'grow', textContent: 'Overview' })),
     $('button', { className: 'nav' + (!c && S.page === 'projects' ? ' on' : ''), onclick: guard(showHome) }, icon('grid'), $('span', { className: 'grow', textContent: 'Projects' })),
+    t && $('button', { className: 'nav' + (!c && S.page === 'files' ? ' on' : ''), onclick: guard(showFiles) }, icon('folder'), $('span', { className: 'grow', textContent: 'Files' })),
     $('button', { className: 'nav' + (!c && S.page === 'routines' ? ' on' : ''), onclick: guard(showRoutines) }, icon('clock'), $('span', { className: 'grow', textContent: 'Routines' })),
     S.me && S.me.can_view_costs && $('button', { className: 'nav' + (!c && S.page === 'costs' ? ' on' : ''), onclick: guard(showCosts) }, icon('coin'), $('span', { className: 'grow', textContent: 'Costs' })),
     $('button', { className: 'project', title: 'Switch project', onclick: e => projectMenu(e.currentTarget) }, $('span', { className: 'pname' }, $('small', { textContent: t ? (t.client || 'Project') : 'No project yet' }), $('b', { textContent: t ? t.name : 'Create a project' })), icon('chev', 16)),
@@ -568,6 +569,71 @@ function editRoutine(r, after) {
     { name: 'cron', label: 'Schedule (crontab)', required: true, value: r.cron, mono: true, hint: (r.cron_text ? r.cron_text + '. ' : '') + 'minute hour day month weekday, in Europe/Amsterdam.' },
     { name: 'prompt', label: 'What should the bot do each time?', type: 'textarea', required: true, value: r.prompt }],
     onSubmit: v => api('PATCH', `/routines/${r.id}`, v) }).then(v => { if (v) { toast('Saved'); if (after) after(); } return v; });
+}
+// ---------------------------------------------------------------- project files
+const fmtSize = n => n < 1024 ? n + ' B' : n < 1048576 ? (n / 1024).toFixed(n < 10240 ? 1 : 0) + ' KB' : (n / 1048576).toFixed(1) + ' MB';
+const fileHref = (team, path, download = true) => withToken(`/teams/${team}/files/content?path=${encodeURIComponent(path)}&download=${download ? 1 : 0}`);
+/** Upload files to a project's computer. Returns the stored paths. A file that seems to hold a
+ *  credential is held back by the server; the person decides whether it goes up anyway. */
+async function uploadFiles(team, files, onStep) {
+  const done = [];
+  for (const f of files) {
+    if (onStep) onStep(f, 'start');
+    const send = allow => fetch(`/api/teams/${team}/files?name=${encodeURIComponent(f.name)}${allow ? '&allow_secret=true' : ''}`,
+      { method: 'POST', headers: { Authorization: 'Bearer ' + S.token, 'Content-Type': f.type || 'application/octet-stream' }, body: f });
+    try {
+      let r = await send(false), data = await r.json().catch(() => ({}));
+      if (r.status === 409 && data.detail && data.detail.code === 'secret') {
+        const kinds = [...new Set(data.detail.found.map(x => x.kind))].join(', ');
+        const yes = await confirmBox({ title: `${f.name} seems to contain a secret`, ok: 'Upload anyway', danger: true,
+          text: `It looks like it holds a ${kinds}. Files go to the project computer, where every person and bot of this project can read them. Secrets belong under a bot's Secrets, where bots only get a placeholder.` });
+        if (!yes) { if (onStep) onStep(f, 'skip'); continue; }
+        r = await send(true); data = await r.json().catch(() => ({}));
+      }
+      if (!r.ok) throw new Error(typeof data.detail === 'string' ? data.detail : r.statusText);
+      done.push(data.path); if (onStep) onStep(f, 'done', data.path);
+    } catch (e) { toast(`${f.name}: ${e.message}`, 'bad'); if (onStep) onStep(f, 'fail'); }
+  }
+  S.files.at = 0;  // the '@' menu fetches the list again
+  return done;
+}
+function pickFiles(onPicked) {
+  const input = $('input', { type: 'file', multiple: true, hidden: true, onchange: () => { const fs = [...input.files]; input.remove(); if (fs.length) onPicked(fs); } });
+  document.body.append(input); input.click();
+}
+async function showFiles() {
+  store.set('tb_last_home', null);
+  stopConv(); closeDrawer(); S.conv = null; S.bot = null; S.page = 'files'; if (S.team) store.set('tb_last_' + S.team.id, null);
+  renderSide(); afterNav(); renderTop();
+  const team = S.team, again = () => { if (S.page === 'files' && !S.conv && S.team === team) showFiles(); };
+  const upload = async fs => { if (!fs.length) return; toast(fs.length === 1 ? `Uploading ${fs[0].name}…` : `Uploading ${fs.length} files…`); const ok = await uploadFiles(team.id, fs); if (ok.length) toast(ok.length === 1 ? 'Uploaded to ' + ok[0] : `Uploaded ${ok.length} files`); again(); };
+  const filter = $('input', { type: 'search', placeholder: 'Filter files', ariaLabel: 'Filter files' }), list = $('div', { className: 'flist' });
+  const drop = $('div', { className: 'drop', role: 'button', tabIndex: 0, textContent: 'Drop files here or click to choose them, at most 25 MB each', onclick: () => pickFiles(upload) });
+  const page = $('div', { className: 'home files' }, $('h1', { textContent: 'Files' }),
+    $('p', { className: 'muted', textContent: `${team.name}. Everyone in this project and every bot of the project can read and change these files; they live on the project computer. Uploads go to uploads/. Mention one in a chat with @file.` }),
+    $('div', { className: 'ftools' }, $('button', { className: 'btn primary', onclick: () => pickFiles(upload) }, icon('up', 16), 'Upload files'), filter), drop, list);
+  el('col').replaceChildren(page); el('dock').replaceChildren();
+  S.dropTarget = upload;
+  const rows = await api('GET', `/teams/${team.id}/files?detail=1`);
+  if (S.page !== 'files' || S.conv) return;
+  const draw = () => {
+    const q = filter.value.trim().toLowerCase(), hits = rows.filter(f => !q || f.path.toLowerCase().includes(q));
+    list.replaceChildren();
+    if (!rows.length) return list.append($('div', { className: 'none', textContent: 'No files in this project yet.' }));
+    if (!hits.length) return list.append($('div', { className: 'none', textContent: 'No file matches.' }));
+    for (const f of hits) {
+      const cut = f.path.lastIndexOf('/'), name = f.path.slice(cut + 1), folder = cut > 0 ? f.path.slice(0, cut) : '';
+      list.append($('div', { className: 'li frow' }, $('span', { className: 'lead' }, icon('file', 16)),
+        $('div', { className: 'tx' }, $('a', { href: fileHref(team.id, f.path), download: name, textContent: name }),
+          $('small', { textContent: [folder || 'workspace', fmtSize(f.size), new Date(f.modified * 1000).toLocaleString([], { dateStyle: 'medium', timeStyle: 'short' })].join(' · ') })),
+        ib('at', 'Copy the @file mention', () => copyText('@file:' + quote(f.path), 'Mention copied'), 15),
+        $('a', { className: 'ib', href: fileHref(team.id, f.path), download: name, title: 'Download', ariaLabel: 'Download' }, icon('down', 15)),
+        ib('trash', 'Delete', guard(async () => {
+          if (!await confirmBox({ title: `Delete ${name}?`, text: 'It is removed from the project computer for everyone, people and bots. This cannot be undone.', ok: 'Delete', danger: true })) return;
+          await api('DELETE', `/teams/${team.id}/files?path=${encodeURIComponent(f.path)}`); S.files.at = 0; again(); }), 15)));
+    }
+  };
+  filter.oninput = draw; draw();
 }
 async function showRoutines() {
   store.set('tb_last_home', null);
@@ -823,7 +889,7 @@ async function newChannel() {
 }
 
 // ---------------------------------------------------------------- conversation
-function stopConv() { if (S.es) { S.es.close(); S.es = null; } S.dockSync = null; clearInterval(S.screenTimer); clearInterval(S.previewTimer); }
+function stopConv() { if (S.es) { S.es.close(); S.es = null; } S.dockSync = null; S.dropTarget = null; clearInterval(S.screenTimer); clearInterval(S.previewTimer); }
 const openBot = async b => openConv(await api('POST', `/bots/${b.id}/dm`), b);
 const openProjectFeed = async () => openConv(await api('GET', `/teams/${S.team.id}/feed`), null);
 async function openOverview() {
@@ -869,7 +935,7 @@ async function doRefresh() {
 function renderTop() {
   const top = el('top'); if (!top) return;
   const c = S.conv, lead = topLead();
-  if (!c) return fill(top, ...lead, $('span', { className: 'title', textContent: S.page === 'routines' ? 'Routines' : S.page === 'costs' ? 'Costs' : 'Projects' }), $('span', { className: 'grow' }), $('button', { className: 'btn sm', onclick: openPalette }, icon('search', 15), 'Search'));
+  if (!c) return fill(top, ...lead, $('span', { className: 'title', textContent: S.page === 'routines' ? 'Routines' : S.page === 'costs' ? 'Costs' : S.page === 'files' ? 'Files' : 'Projects' }), $('span', { className: 'grow' }), $('button', { className: 'btn sm', onclick: openPalette }, icon('search', 15), 'Search'));
   if (c.kind === 'feed') return fill(top, ...lead, icon('pulse'), $('span', { className: 'title', textContent: c.name }), $('span', { className: 'sub grow', textContent: 'Short summaries of finished tasks. The private chats stay private.' }));
   if (c.kind === 'handoff') {
     const peer = c.peer_handle ? '@' + c.peer_handle : (c.name || 'another bot');
@@ -1155,8 +1221,24 @@ function renderDock() {
     if (pendingImage) attach.append($('img', { className: 'thumb', src: pendingImage, alt: 'Image to send' }),
       $('button', { className: 'ib', type: 'button', title: 'Remove image', onclick: () => { pendingImage = null; showAttach(); sync(); ta.focus(); } }, icon('x', 15)));
   };
-  const box = $('div', { className: 'composer' }, attach, $('div', { className: 'ta' }, hl, ta),
-    $('div', { className: 'crow' }, $('button', { className: 'cbtn', type: 'button', title: 'Add a bot, skill, file or person', onclick: () => atButton() }, icon('at', 16), 'Add'), hint, modeBtn, stopBtn, send));
+  // Files go to the project computer and the message gets an @file mention, so every bot here can read them.
+  const project = c.kind !== 'home' && c.team_id ? c.team_id : null, ups = $('div', { className: 'ups', hidden: true });
+  const attachFiles = guard(async fs => {
+    if (!project || !fs.length) return;
+    const chips = new Map(); ups.hidden = false;
+    const paths = await uploadFiles(project, fs, (f, step) => {
+      if (step === 'start') { const ch = $('span', { className: 'up' }, $('span', { className: 'spin' }), f.name); chips.set(f, ch); ups.append(ch); }
+      else { const ch = chips.get(f); if (ch) ch.remove(); }
+    });
+    ups.hidden = !ups.children.length;
+    if (!paths.length) return;
+    const before = ta.value.slice(0, ta.selectionStart), lead = before && !/\s$/.test(before) ? ' ' : '';
+    ta.focus(); ta.setRangeText(lead + paths.map(p => '@file:' + quote(p)).join(' ') + ' ', ta.selectionStart, ta.selectionEnd, 'end'); sync();
+  });
+  S.dropTarget = project ? attachFiles : null;
+  const box = $('div', { className: 'composer' }, attach, ups, $('div', { className: 'ta' }, hl, ta),
+    $('div', { className: 'crow' }, project && $('button', { className: 'cbtn', type: 'button', title: 'Attach files: they are stored with this project', ariaLabel: 'Attach files', onclick: () => pickFiles(attachFiles) }, icon('clip', 16)),
+      $('button', { className: 'cbtn', type: 'button', title: 'Add a bot, skill, file or person', onclick: () => atButton() }, icon('at', 16), 'Add'), hint, modeBtn, stopBtn, send));
   S.dockSync = () => {
     const run = S.state.running, names = run.map(r => r.bot).join(' and ');
     if (!run.length) mode = 'auto';
@@ -1211,7 +1293,11 @@ function renderDock() {
   ta.addEventListener('paste', e => {  // a pasted screenshot becomes an attachment on the next message
     const items = e.clipboardData && e.clipboardData.items;
     const it = items && [...items].find(x => x.type && x.type.startsWith('image/'));
-    if (!it) return;
+    if (!it) {  // other pasted files go to the project, like the paperclip
+      const fs = items ? [...items].filter(x => x.kind === 'file').map(x => x.getAsFile()).filter(Boolean) : [];
+      if (fs.length && project) { e.preventDefault(); attachFiles(fs); }
+      return;
+    }
     e.preventDefault();
     const file = it.getAsFile(); if (!file) return;
     if (file.size > 10 * 1024 * 1024) return toast('Image is too large (max 10 MB)', 'bad');
@@ -1445,6 +1531,7 @@ function openPalette() {
     ...(S.team ? [{ g: 'Activity', icon: 'pulse', label: 'Project activity', run: openProjectFeed }] : []),
     ...S.teams.filter(t => !S.team || t.id !== S.team.id).map(t => ({ g: 'Projects', icon: 'grid', label: (t.client ? t.client + ' / ' : '') + t.name, hint: 'Switch', run: () => switchTeam(t.id) })),
     { g: 'Actions', icon: 'grid', label: 'Home', run: showHome },
+    ...(S.team ? [{ g: 'Actions', icon: 'folder', label: 'Files of this project', run: showFiles }] : []),
     { g: 'Actions', icon: 'clock', label: 'Routines', run: showRoutines },
     ...(S.me && S.me.can_view_costs ? [{ g: 'Actions', icon: 'coin', label: 'Costs', run: showCosts }] : []),
     ...(S.team ? [{ g: 'Actions', icon: 'plus', label: 'New bot', run: newBot }, { g: 'Actions', icon: 'plus', label: 'New team chat', run: newChannel }, { g: 'Actions', icon: 'plug', label: 'New endpoint', run: newEndpoint }, { g: 'Actions', icon: 'users', label: 'People and invite code', run: projectDialog }] : []),
@@ -1468,6 +1555,15 @@ document.addEventListener('keydown', e => {
   else if (e.key === 'Escape' && !document.querySelector('dialog[open]')) { if (S.pop) closePop(); else if (el('drawer') && el('drawer').classList.contains('open')) closeDrawer(); }
 });
 matchMedia('(max-width: 860px)').addEventListener('change', () => { if (el('app')) { el('app').classList.remove('sideopen'); renderTop(); } });
+
+// Dropping files on the window: in a chat they are attached, on the Files page they are uploaded.
+addEventListener('dragover', e => { if (S.dropTarget && e.dataTransfer && [...e.dataTransfer.types].includes('Files')) { e.preventDefault(); document.body.classList.add('dragging'); } });
+addEventListener('dragleave', e => { if (!e.relatedTarget) document.body.classList.remove('dragging'); });
+addEventListener('drop', e => {
+  document.body.classList.remove('dragging');
+  if (!S.dropTarget || !e.dataTransfer || !e.dataTransfer.files.length) return;
+  e.preventDefault(); S.dropTarget([...e.dataTransfer.files]);
+});
 
 // Installable app: the browser offers it once the service worker is in place (needs https or localhost).
 addEventListener('beforeinstallprompt', e => { e.preventDefault(); S.install = e; });

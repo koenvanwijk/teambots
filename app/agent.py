@@ -559,7 +559,7 @@ def system_prompt(bot: Bot, conv: Conversation, user: User, ctx: Ctx) -> str:
                  "and `@handle` of another bot means involve that bot with `ask_bot`. Names with spaces are "
                  "written in double quotes.")
     parts.append("Your computer is the project's shared workspace: everyone and every bot in this project "
-                 "works with the same files.")
+                 "works with the same files. Files people upload are in the folder uploads/.")
     if secret_rows:
         parts.append("## Secrets\nYou never see stored secret values. Use them only through `http_request`, by "
                      "writing the placeholder {{secret:NAME}}; each works only for its bound hosts. If the person "

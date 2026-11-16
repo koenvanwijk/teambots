@@ -164,21 +164,95 @@ SKIP_DIRS = {"node_modules", "__pycache__"}
 
 async def list_files(key: str, limit: int = 300) -> list[str]:
     """Workspace files as relative paths, for the '@' menu in the UI. Hidden folders are left out."""
+    return [f["path"] for f in await file_info(key, limit)]
+
+
+# ---------------------------------------------------------------- project files from the web UI
+# The workspace is the project's file store: what people upload lands next to what bots write.
+# The local backend uses Python directly (it also works without a Unix shell); docker goes
+# through the container, so the files live in the project's volume.
+
+def _local_root(key: str) -> str:
+    root = os.path.realpath(os.path.join(config.DATA_DIR, "workspaces", _safe_key(key)))
+    os.makedirs(root, exist_ok=True)
+    return root
+
+
+def _local_path(key: str, path: str) -> str:
+    root = _local_root(key)
+    full = os.path.realpath(os.path.join(root, _check_path(path)))
+    if not full.startswith(root + os.sep):  # a symlink in the workspace must not lead outside it
+        raise ValueError("path must be relative to the workspace")
+    return full
+
+
+async def file_info(key: str, limit: int = 1000) -> list[dict]:
+    """[{path, size, modified}] of every workspace file, hidden folders left out, sorted by path."""
     key = _safe_key(key)
+    found: list[dict] = []
     if config.SANDBOX_BACKEND != "docker":
-        root = os.path.abspath(os.path.join(config.DATA_DIR, "workspaces", key))
-        found: list[str] = []
+        root = _local_root(key)
         for folder, dirs, names in os.walk(root):
             dirs[:] = sorted(d for d in dirs if not d.startswith(".") and d not in SKIP_DIRS)
             for n in sorted(names):
-                if not n.startswith("."):
-                    found.append(os.path.relpath(os.path.join(folder, n), root).replace(os.sep, "/"))
-                    if len(found) >= limit:
-                        return found
+                if n.startswith("."):
+                    continue
+                full = os.path.join(folder, n)
+                try:
+                    st = os.stat(full)
+                except OSError:
+                    continue
+                found.append({"path": os.path.relpath(full, root).replace(os.sep, "/"), "size": st.st_size,
+                              "modified": st.st_mtime})
+                if len(found) >= limit:
+                    return found
         return found
     prune = " -o ".join(f"-name {d}" for d in sorted(SKIP_DIRS))
-    code, out = await sb_exec(key, ["sh", "-c", f"find . \\( -name '.?*' -o {prune} \\) -prune -o -type f -print "
-                                                 f"| head -n {int(limit)}"], timeout=10)
+    code, out = await sb_exec(key, ["sh", "-c", f"find . \\( -name '.?*' -o {prune} \\) -prune -o -type f "
+                                                 f"-printf '%s\\t%T@\\t%P\\n' | head -n {int(limit)}"], timeout=15)
     if code != 0:
         return []
-    return sorted(line[2:] for line in out.splitlines() if line.startswith("./"))
+    for line in out.splitlines():
+        size, _, rest = line.partition("\t")
+        mtime, _, path = rest.partition("\t")
+        if path and size.isdigit():
+            found.append({"path": path, "size": int(size), "modified": float(mtime or 0)})
+    return sorted(found, key=lambda f: f["path"])
+
+
+async def put_bytes(key: str, path: str, data: bytes) -> None:
+    if config.SANDBOX_BACKEND != "docker":
+        full = _local_path(key, path)
+        os.makedirs(os.path.dirname(full), exist_ok=True)
+        with open(full, "wb") as f:
+            f.write(data)
+        return
+    path = _check_path(path)
+    code, out = await sb_exec(key, ["sh", "-c", 'mkdir -p "$(dirname "$1")" && cat > "$1"', "sh", path],
+                              stdin=data, timeout=300)
+    if code != 0:
+        raise RuntimeError(f"could not store the file: {out.strip()[:200]}")
+
+
+async def get_bytes(key: str, path: str) -> bytes | None:
+    """The file's content, or None when there is no such file."""
+    if config.SANDBOX_BACKEND != "docker":
+        full = _local_path(key, path)
+        if not os.path.isfile(full):
+            return None
+        with open(full, "rb") as f:
+            return f.read()
+    code, data = await sb_exec(key, ["sh", "-c", 'test -f "$1" && cat -- "$1"', "sh", _check_path(path)],
+                               timeout=300, raw=True)
+    return data if code == 0 else None
+
+
+async def remove(key: str, path: str) -> bool:
+    if config.SANDBOX_BACKEND != "docker":
+        full = _local_path(key, path)
+        if not os.path.isfile(full):
+            return False
+        os.remove(full)
+        return True
+    code, _ = await sb_exec(key, ["sh", "-c", 'test -f "$1" && rm -f -- "$1"', "sh", _check_path(path)], timeout=30)
+    return code == 0

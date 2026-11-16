@@ -19,6 +19,7 @@ capabilities that every teammate or client talks to in private.
 | Memory | Personal memory per user, shared team memory, learnings from collaborators wait for review |
 | Skills, routines | Saved by owner or manager; cron-scheduled prompts per user and conversation |
 | Computer | One sandbox per project, shared by its people and bots: shell and files. Each person also has an Overview bot with its own private chat and sandbox (`tb-home-u{user id}`), not tied to a project. The image includes git and the official GitHub CLI (`gh`); no credentials are baked in, so sign in per project with `gh auth login` |
+| Files | Per project: people upload files (Files page, the paperclip in a chat, drag and drop, or paste) to `uploads/` on the project computer, where every person and bot of that project can read them; a chat gets an `@file` mention. Download and delete from the Files page. Nothing is overwritten, at most `TB_MAX_UPLOAD_MB` per file, and a text file that seems to hold a credential is held back unless the person uploads it anyway. Downloads are never shown as a page of the app (only png, jpg, gif and webp open inline) |
 | Screen | With "computer use" on, a bot has its own virtual screen with a browser, screenshot / click / type / key / scroll tools, and a live view in the UI. "Open scherm" attaches noVNC to that same Xvfb so you can use mouse and keyboard (e.g. to sign in to Chromium). Needs a model with image input |
 | Secrets | Never in the sandbox or the model's context. The bot writes `{{secret:NAME}}` in an `http_request`; the app fills it in outside the sandbox, only for the hosts the secret is bound to, never follows redirects, and masks secret values in everything returned to the model. A message that seems to contain a credential (a known token format, `password is ...`, or the value of a stored secret) is held back before it is stored: the person saves it as a secret and sends the placeholder, edits the message, or sends it anyway |
 | Approvals | Risky tools pause for an approval card (Allow once / Always allow / Deny); only the requester can answer |
@@ -156,6 +157,7 @@ TeamBots is meant to sit behind a TLS reverse proxy. It honours `X-Forwarded-Pro
 | `TB_BIND`, `TB_DOMAIN` | `127.0.0.1`, `localhost` | Compose: bind address of the app, domain for Caddy |
 | `TB_TIMEZONE` | `Europe/Amsterdam` | Time zone for cron expressions |
 | `TB_MAX_STEPS` | `12` | Tool-call rounds per turn |
+| `TB_MAX_UPLOAD_MB` | `25` | Largest file a person can upload to a project |
 | `TB_MAX_TOKENS` | `8192` | Completion budget sent to the model (thinking models need headroom so `reasoning_content` does not eat the whole reply) |
 | `TB_OPEN_REGISTRATION` | `0` | `1` lets anyone create an account. When off, only the first user or someone with a valid project invite code (`?invite=`) can register |
 | `TB_ENABLE_DOCS` | `0` | `1` serves `/docs`, `/redoc` and `/openapi.json` |

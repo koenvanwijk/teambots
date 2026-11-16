@@ -3,6 +3,7 @@ import asyncio
 import base64
 import hashlib
 import json
+import mimetypes
 import os
 import re
 import secrets
@@ -436,14 +437,108 @@ def team_members(team_id: int, user: User = Depends(current_user)):
 
 
 @router.get("/teams/{team_id}/files")
-async def team_files(team_id: int, user: User = Depends(current_user)):
-    """Files on the project computer, for the '@' menu. Empty when the computer cannot be reached."""
+async def team_files(team_id: int, detail: bool = False, user: User = Depends(current_user)):
+    """Files on the project computer: paths for the '@' menu, or with detail=1 also size and date.
+    Empty when the computer cannot be reached."""
     with session() as s:
         _need(team_role(s, user.id, team_id))
     try:
-        return await sandbox.list_files(f"p{team_id}")
+        return await (sandbox.file_info(f"p{team_id}") if detail else sandbox.list_files(f"p{team_id}"))
     except Exception:  # noqa: BLE001 - the menu simply shows no files
         return []
+
+
+UPLOAD_DIR = "uploads"
+SAFE_INLINE = {"image/png", "image/jpeg", "image/gif", "image/webp"}  # never html or svg: same origin as the app
+
+
+def _file_name(name: str) -> str:
+    """A plain file name from whatever the browser sent: no folders, no control or shell-awkward characters."""
+    name = name.replace("\\", "/").rsplit("/", 1)[-1]
+    name = re.sub(r'[\x00-\x1f<>:"|?*]', "_", name).strip(" .")
+    return (name or "file")[-120:]
+
+
+def _folder(folder: str) -> str:
+    folder = folder.strip().strip("/")
+    if folder:
+        sandbox._check_path(folder)
+        _need(not any(p.startswith(".") for p in folder.split("/")), 400, "hidden folders are not allowed")
+    return folder
+
+
+@router.post("/teams/{team_id}/files")
+async def upload_file(team_id: int, request: Request, name: str, folder: str = UPLOAD_DIR,
+                      allow_secret: bool = False, user: User = Depends(current_user)):
+    """Store a file on the project computer, where every person and bot of the project can use it.
+    The body is the raw file. A file with the same name gets a number, nothing is overwritten."""
+    with session() as s:
+        _need(team_role(s, user.id, team_id))
+    try:
+        folder = _folder(folder)
+    except ValueError as e:
+        raise HTTPException(400, str(e)) from e
+    limit = config.MAX_UPLOAD_MB * 1024 * 1024
+    _need(int(request.headers.get("content-length") or 0) <= limit, 413, f"files can be at most {config.MAX_UPLOAD_MB} MB")
+    chunks, size = [], 0
+    async for chunk in request.stream():
+        size += len(chunk)
+        _need(size <= limit, 413, f"files can be at most {config.MAX_UPLOAD_MB} MB")
+        chunks.append(chunk)
+    data = b"".join(chunks)
+    # Secrets stay out of the project computer too: a text file with a credential in it is held back.
+    if not allow_secret and size <= 2 * 1024 * 1024 and b"\x00" not in data[:8192]:
+        found = secrets_http.find_leaks(data.decode("utf-8", errors="ignore"), [])
+        if found:
+            raise HTTPException(409, {"code": "secret", "found": found,
+                                      "message": "this file seems to contain a secret"})
+    key, base = f"p{team_id}", _file_name(name)
+    try:
+        taken = {f["path"] for f in await sandbox.file_info(key, limit=100000)}
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(503, f"the project computer is not available: {e}") from e
+    stem, dot, ext = base.rpartition(".") if "." in base.lstrip(".") else (base, "", "")
+    path, n = f"{folder}/{base}" if folder else base, 1
+    while path in taken:
+        n += 1
+        path = f"{folder + '/' if folder else ''}{stem} ({n}){dot}{ext}"
+    try:
+        await sandbox.put_bytes(key, path, data)
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(503, f"the project computer is not available: {e}") from e
+    return {"path": path, "size": size}
+
+
+@router.get("/teams/{team_id}/files/content")
+async def download_file(team_id: int, path: str, download: bool = True, user: User = Depends(current_user)):
+    with session() as s:
+        _need(team_role(s, user.id, team_id))
+    try:
+        data = await sandbox.get_bytes(f"p{team_id}", path)
+    except ValueError as e:
+        raise HTTPException(400, str(e)) from e
+    _need(data is not None, 404, "file not found")
+    media = mimetypes.guess_type(path)[0] or "application/octet-stream"
+    inline = not download and media in SAFE_INLINE
+    name = path.rsplit("/", 1)[-1]
+    # Only plain images are shown in the page; everything else is a download, so an uploaded html or
+    # svg file can never run as part of the app.
+    return Response(data, media_type=media if media in SAFE_INLINE else "application/octet-stream",
+                    headers={"Content-Disposition": f"{'inline' if inline else 'attachment'}; filename*=UTF-8''{quote(name)}",
+                             "X-Content-Type-Options": "nosniff", "Content-Security-Policy": "sandbox",
+                             "Cache-Control": "private, no-store"})
+
+
+@router.delete("/teams/{team_id}/files")
+async def delete_file(team_id: int, path: str, user: User = Depends(current_user)):
+    """Every project member can remove a file: the workspace is shared, as it is for the bots."""
+    with session() as s:
+        _need(team_role(s, user.id, team_id))
+    try:
+        _need(await sandbox.remove(f"p{team_id}", path), 404, "file not found")
+    except ValueError as e:
+        raise HTTPException(400, str(e)) from e
+    return {"ok": True}
 
 
 @router.get("/teams/{team_id}/backups")

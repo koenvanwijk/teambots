@@ -510,6 +510,44 @@ def test_secret_in_chat_is_held_back(c):
     wait_for(agent_idle)
 
 
+def test_project_files(c):
+    S["erin"] = c.post("/api/register", json={"username": "erin", "password": "password123"}).json()
+    team, other = S["team"], c.post("/api/teams", json={"name": "Other"}, headers=H("erin")).json()["id"]
+    up = lambda who, t, name, data, **q: c.post(f"/api/teams/{t}/files", params={"name": name, **q},  # noqa: E731
+                                                content=data, headers=H(who))
+    r = up("bob", team, "Report Q3.pdf", b"%PDF-1.4 hello")
+    assert r.status_code == 200 and r.json() == {"path": "uploads/Report Q3.pdf", "size": 14}
+    assert up("alice", team, "Report Q3.pdf", b"v2").json()["path"] == "uploads/Report Q3 (2).pdf"  # never overwritten
+    assert up("bob", team, "../../etc/passwd", b"x").json()["path"] == "uploads/passwd"  # only the name is used
+    assert up("bob", team, "a.txt", b"x", folder="../x").status_code == 400
+    # per project: erin is not in this project, and her own project has its own files
+    assert up("erin", team, "a.txt", b"x").status_code == 403
+    assert c.get(f"/api/teams/{team}/files/content", params={"path": "uploads/passwd"}, headers=H("erin")).status_code == 403
+    assert up("erin", other, "own.txt", b"mine").status_code == 200
+    assert [f["path"] for f in c.get(f"/api/teams/{other}/files?detail=1", headers=H("erin")).json()] == ["uploads/own.txt"]
+    names = [f["path"] for f in c.get(f"/api/teams/{team}/files?detail=1", headers=H("alice")).json()]
+    assert "uploads/Report Q3.pdf" in names and "uploads/own.txt" not in names
+    assert c.get(f"/api/teams/{team}/files", headers=H("alice")).json() == sorted(names)
+    # a bot of the project reads what was uploaded
+    assert "hello" in say(c, "bob", S["dm_bob"], tool("read_file", path="uploads/Report Q3.pdf"))[-1]["content"]
+    # download: the bytes as uploaded, and never rendered as a page of the app
+    r = c.get(f"/api/teams/{team}/files/content", params={"path": "uploads/Report Q3.pdf"}, headers=H("alice"))
+    assert r.content == b"%PDF-1.4 hello" and r.headers["content-disposition"].startswith("attachment")
+    up("bob", team, "page.html", b"<script>alert(1)</script>")
+    r = c.get(f"/api/teams/{team}/files/content", params={"path": "uploads/page.html", "download": "0"}, headers=H("bob"))
+    assert r.headers["content-type"] == "application/octet-stream" and r.headers["content-security-policy"] == "sandbox"
+    assert c.get(f"/api/teams/{team}/files/content", params={"path": "../teambots.db"}, headers=H("bob")).status_code == 400
+    # a file with a credential in it is held back, unless the person sends it anyway
+    leak = b"GITHUB_TOKEN=ghp_" + b"z7Q1" * 9
+    r = up("bob", team, ".env.txt", leak)
+    assert r.status_code == 409 and r.json()["detail"]["found"][0]["kind"] == "GitHub token"
+    assert up("bob", team, "env.txt", leak, allow_secret="true").status_code == 200
+    # size limit, and delete by any project member
+    assert up("bob", team, "big.bin", b"0" * (25 * 1024 * 1024 + 1)).status_code == 413
+    assert c.delete(f"/api/teams/{team}/files", params={"path": "uploads/env.txt"}, headers=H("alice")).json() == {"ok": True}
+    assert c.delete(f"/api/teams/{team}/files", params={"path": "uploads/env.txt"}, headers=H("alice")).status_code == 404
+
+
 def test_renaming(c):
     team, bot = S["team"], S["bot"]
     assert c.patch(f"/api/conversations/{S['ch']}", json={"name": "lobby"}, headers=H("carol")).status_code == 404
