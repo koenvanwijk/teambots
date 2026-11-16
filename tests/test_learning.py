@@ -13,7 +13,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import pytest  # noqa: E402
 
 from app import agent, config, learning, llm, memory, prompt  # noqa: E402
-from app.db import (Bot, ChannelMember, Conversation, Endpoint, Message, Skill, Team, TeamMember, User,  # noqa: E402
+from app import knowledge as kb  # noqa: E402
+from app.db import (Bot, ChannelMember, Conversation, Endpoint, Message, Team, TeamMember, User,  # noqa: E402
                     init_db, select, session)
 
 
@@ -102,10 +103,38 @@ def test_review_saves_memory_and_skill_on_bot_endpoint(world, monkeypatch):
     assert fake.calls[0]["ep"] == "Copilot" and {t["function"]["name"] for t in fake.calls[0]["tools"]} == {
         "memory", "skill_manage"}
     assert "The invoice for ACME is due friday" in fake.calls[0]["messages"][1]["content"]
-    with session() as s:
-        bot = s.get(Bot, world["bot"])
-        assert [m.content for m in memory.entries(s, bot, "user", world["koen"])] == ["Koen handles ACME invoices"]
-        assert s.exec(select(Skill).where(Skill.name == "acme-invoice")).first()
+    key = kb.key_for_team(world["team"])
+    assert "- Koen handles ACME invoices" in kb.read(key, "users/koen.md")["content"]
+    assert memory.find_skill(key, "acme-invoice")["path"] == "skills/acme-invoice.md"
+    # written through the knowledge base, authored by the review
+    assert {h["author"] for h in kb.history(key)[:2]} == {"learning-review (bot)"}
+
+
+def test_review_skips_files_someone_changed_meanwhile(world, monkeypatch):
+    """The review bases its writes on the files as they were when it started; a later change wins."""
+    key = kb.key_for_team(world["team"])
+    kb.write(key, "memory/notes.md", "# Team memory\n\n- ACME pays late\n", None, kb.Author("Koen", "k@x"))
+
+    async def chat(ep, model, messages, tools=None, **kw):
+        if not chat.calls:  # while the model thinks, Ruud edits the team notes in the UI
+            cur = kb.read(key, "memory/notes.md")
+            kb.write(key, "memory/notes.md", cur["content"] + "- ACME moved to Utrecht\n", cur["hash"],
+                     kb.Author("Ruud", "r@x"))
+        chat.calls.append(messages)
+        if len(chat.calls) > 1:
+            return {"content": "nothing", "tool_calls": []}
+        return {"content": "", "tool_calls": [
+            _call("memory", target="team", operations=[{"action": "patch", "old_text": "pays late",
+                                                        "content": "pays within 60 days"}]),
+            _call("memory", target="user", operations=[{"action": "add", "content": "Koen owns ACME"}])]}
+    chat.calls = []
+    monkeypatch.setattr(llm, "chat", chat)
+    assert asyncio.run(learning.review(world["dm"], world["bot"], world["koen"])) == 1
+    notes = kb.read(key, "memory/notes.md")["content"]
+    assert "pays late" in notes and "Utrecht" in notes and "60 days" not in notes  # Ruud's change stands
+    tool_results = [m["content"] for m in chat.calls[1] if m.get("role") == "tool"]
+    assert tool_results[0].startswith("skipped: conflict: memory/notes.md changed") and "by Ruud" in tool_results[0]
+    assert "Koen owns ACME" in kb.read(key, "users/koen.md")["content"]  # the untouched file is saved
 
 
 def test_review_prefers_spark_and_fails_silently(world, monkeypatch):

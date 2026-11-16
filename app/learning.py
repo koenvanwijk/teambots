@@ -3,7 +3,9 @@
 * Learning review (Hermes: agent/background_review.py). After every ``REVIEW_EVERY_TURNS`` turns in
   a conversation, or after a turn with ``REVIEW_TOOL_CALLS`` or more tool calls, a side call reads the
   recent conversation and may update team memory, the person's profile and skills with the same
-  ``memory`` and ``skill_manage`` tools the bot has.
+  ``memory`` and ``skill_manage`` tools the bot has. Its writes go through the knowledge base as
+  "learning-review (bot)", based on the files as they were when the review started: when a person or
+  another bot changed a file since, that write is skipped (it never overwrites their change).
 * Rolling summary. When older messages no longer fit in the history the model gets, they are
   summarized into ``Conversation.summary``; the prompt shows it as "Earlier in this conversation".
 * ``search_history``: find something in earlier chats the person can read.
@@ -148,7 +150,7 @@ def _transcript(rows: list[Message], names: dict, bots: dict, limit: int) -> str
 async def review(conv_id: int, bot_id: int, requester_id: int) -> int:
     """One learning pass. Returns the number of memory/skill changes it made."""
     from . import agent, memory, usage
-    from .db import Skill
+    from . import knowledge as kb
     with session() as s:
         conv, bot, user = s.get(Conversation, conv_id), s.get(Bot, bot_id), s.get(User, requester_id)
         if not (conv and bot and user):
@@ -158,13 +160,13 @@ async def review(conv_id: int, bot_id: int, requester_id: int) -> int:
         names = {u.id: u.display_name for u in s.exec(select(User)).all()}
         bots = {b.id: b.name for b in s.exec(select(Bot).where(Bot.team_id == bot.team_id)).all()}
         channel = conv.kind == "channel"
-        state = "\n\n".join(x for x in (
-            memory.render(memory.entries(s, bot, "team"), "team") or "TEAM MEMORY: (empty)",
-            "" if channel else (memory.render(memory.entries(s, bot, "user", user.id), "user")
-                                or f"USER PROFILE of {user.display_name}: (empty)"),
-            "Skills: " + (", ".join(f"{k.name} ({k.description})" for k in
-                                    s.exec(select(Skill).where(Skill.bot_id == bot.id)).all()) or "none"),
-        ) if x)
+    key = kb.key_for(bot)
+    snap = kb.snapshot(key)  # writes are based on this; later changes by others win
+    state = "\n\n".join(x for x in (
+        memory.render_team(key)[0],
+        "" if channel else memory.render_user(key, user),
+        "Skills: " + (", ".join(f"{k['name']} ({k['description']})" for k in memory.skills(key)) or "none"),
+    ) if x)
     if usage.should_block(bot.team_id):
         return 0
     text = _transcript(rows, names, bots, REVIEW_TRANSCRIPT_CHARS)
@@ -178,6 +180,20 @@ async def review(conv_id: int, bot_id: int, requester_id: int) -> int:
     messages = [{"role": "system", "content": REVIEW_PROMPT.format(bot=bot.name, state=state)},
                 {"role": "user", "content": "Conversation" + (" (a team chat)" if channel else "") + ":\n\n" + text}]
     ctx = agent.Ctx(bot.id, user.id, conv_id, channel, team_id=bot.team_id, is_home=bot.is_home)
+    changes = 0
+    t_author, t_pinned = kb.acting_as.set(kb.LEARNING), kb.pinned.set(snap)
+    try:
+        changes = await _review_rounds(ep, model, messages, specs, allowed, ctx, user, bot, conv_id)
+    finally:
+        kb.acting_as.reset(t_author)
+        kb.pinned.reset(t_pinned)
+    if changes:
+        log.info("learning review in conversation %s made %d change(s)", conv_id, changes)
+    return changes
+
+
+async def _review_rounds(ep, model, messages, specs, allowed, ctx, user, bot, conv_id) -> int:
+    from . import agent, usage
     changes = 0
     for _ in range(2):
         with usage.bind(origin="learning", user_id=user.id, team_id=bot.team_id, bot_id=bot.id,
@@ -193,11 +209,9 @@ async def review(conv_id: int, bot_id: int, requester_id: int) -> int:
                 result = await agent._execute(ctx, c["function"]["name"], args, {})
             except Exception as e:  # noqa: BLE001
                 result = f"error: {e}"
-            if not result.startswith("error"):
+            if not result.startswith(("error", "skipped", "conflict")) and "nothing changed" not in result:
                 changes += 1
             messages.append({"role": "tool", "tool_call_id": c["id"], "content": result})
-    if changes:
-        log.info("learning review in conversation %s made %d change(s)", conv_id, changes)
     return changes
 
 
