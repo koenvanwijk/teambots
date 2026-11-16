@@ -158,24 +158,32 @@ function showAuth() {
   let create = !!invite;  // an invite link means a new person joining
   const u = $('input', { placeholder: 'Username', autocomplete: 'username', autocapitalize: 'none', required: true }), p = $('input', { type: 'password', placeholder: 'Password', autocomplete: 'current-password', required: true });
   const d = $('input', { placeholder: 'Display name', autocomplete: 'name' }), dWrap = $('label', { className: 'field', hidden: true }, d);
+  const inv = $('input', { placeholder: 'Invite code', autocapitalize: 'none', autocomplete: 'off', value: invite });
+  const invHint = $('p', { className: 'hint', hidden: true, textContent: 'You have been invited to a project. Create an account to join.' });
+  const invWrap = $('label', { className: 'field', hidden: true }, inv);
   const err = $('div', { className: 'err', role: 'alert' }), title = $('h1'), sub = $('p'), go = $('button', { className: 'btn primary', type: 'submit' }), swapText = $('span'), swapBtn = $('button', { type: 'button' });
   const paint = () => { title.textContent = create ? 'Create your account' : 'Welcome back'; sub.textContent = create ? 'Bots for your team, on your own model endpoint.' : 'Sign in to TeamBots.';
-    go.textContent = create ? 'Create account' : 'Sign in'; dWrap.hidden = !create; p.placeholder = create ? 'Password (8+ characters)' : 'Password'; p.autocomplete = create ? 'new-password' : 'current-password';
+    go.textContent = create ? 'Create account' : 'Sign in'; dWrap.hidden = !create; invWrap.hidden = !create && !providers.dataset.oauth; invHint.hidden = !(create && invite);
+    inv.placeholder = create ? 'Invite code' : 'Invite code (new? paste it here)';
+    p.placeholder = create ? 'Password (8+ characters)' : 'Password'; p.autocomplete = create ? 'new-password' : 'current-password';
     swapText.textContent = create ? 'Already have an account? ' : 'New here? '; swapBtn.textContent = create ? 'Sign in' : 'Create an account'; err.textContent = ''; };
   swapBtn.onclick = () => { create = !create; paint(); u.focus(); };
   const swap = $('div', { className: 'swap' }, swapText, swapBtn), providers = $('div', { className: 'providers' });
-  const fm = $('form', { className: 'authbox' }, logo(), title, sub, $('label', { className: 'field' }, u), $('label', { className: 'field' }, p), dWrap, err, go, providers, swap);
+  const fm = $('form', { className: 'authbox' }, logo(), title, sub, invHint, $('label', { className: 'field' }, u), $('label', { className: 'field' }, p), dWrap, invWrap, err, go, providers, swap);
   fm.onsubmit = async e => { e.preventDefault(); go.disabled = true;
-    try { const r = await api('POST', create ? '/register' : '/login', { username: u.value.trim().toLowerCase(), password: p.value, display_name: d.value.trim() }); S.token = r.token; store.set('tb_token', r.token); await boot(); }
-    catch (x) { err.textContent = x.message; go.disabled = false; } };
-  // Sign in with GitHub or Google, when configured. A new person pastes the invite code they were given.
+    try {
+      const body = { username: u.value.trim().toLowerCase(), password: p.value, display_name: d.value.trim() };
+      if (create) body.invite_code = inv.value.trim();
+      const r = await api('POST', create ? '/register' : '/login', body);
+      S.token = r.token; store.set('tb_token', r.token); await boot();
+    } catch (x) { err.textContent = x.message; go.disabled = false; } };
+  // Sign in with GitHub or Google, when configured. Reuse the same invite field as password sign-up.
   (async () => { try { const info = await api('GET', '/auth/providers'); if (!info.providers || !info.providers.length) return;
-    const inv = $('input', { placeholder: 'Invite code (new? paste it here)', autocapitalize: 'none', autocomplete: 'off', value: invite });
+    providers.dataset.oauth = '1';
     providers.append($('div', { className: 'authsep' }, $('span', { textContent: 'or' })),
-      invite && $('p', { className: 'hint', textContent: 'You have been invited to a project. Continue with a provider below to join.' }),
       ...info.providers.map(p => $('button', { className: 'btn', type: 'button', textContent: 'Continue with ' + p.name,
-        onclick: () => { const code = inv.value.trim(); location.href = '/api/auth/' + p.id + '/start' + (code ? '?invite=' + encodeURIComponent(code) : ''); } })),
-      $('label', { className: 'field', style: 'margin-top:6px' }, inv));
+        onclick: () => { const code = inv.value.trim(); location.href = '/api/auth/' + p.id + '/start' + (code ? '?invite=' + encodeURIComponent(code) : ''); } })));
+    paint();
   } catch (e) { /* providers not configured: password sign-in only */ } })();
   paint(); if (S.authError) { err.textContent = S.authError; S.authError = null; }
   document.body.replaceChildren($('div', { id: 'auth' }, fm)); u.focus();

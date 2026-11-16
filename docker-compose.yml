@@ -43,6 +43,9 @@ services:
       TB_SANDBOX_NETWORK: teambots
       TB_HTTP_ALLOW_PRIVATE: ${TB_HTTP_ALLOW_PRIVATE:-1}
       TB_PUBLIC_URL: ${TB_PUBLIC_URL:-}
+      TB_OPEN_REGISTRATION: ${TB_OPEN_REGISTRATION:-0}
+      TB_ENABLE_DOCS: ${TB_ENABLE_DOCS:-0}
+      TB_AUTH_RATE_LIMIT: ${TB_AUTH_RATE_LIMIT:-10}
       TB_DATA_DIR: /data
       TB_CLAUDE_CLI: claude
       TB_CLAUDE_CLI_CWD: /data/claude-cli-cwd

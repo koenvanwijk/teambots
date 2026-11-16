@@ -5,12 +5,13 @@ import os
 import re
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, Request
-from fastapi.responses import FileResponse, HTMLResponse
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.openapi.docs import get_redoc_html, get_swagger_ui_html
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from uvicorn.middleware.proxy_headers import ProxyHeadersMiddleware
 
-from . import routines
+from . import config, routines
 from .api import router
 from .costs_api import router as costs_router
 from .home_api import home_router, openai_router, tokens_router
@@ -28,9 +29,21 @@ async def lifespan(_: FastAPI):
     routines.stop()
 
 
-app = FastAPI(title="TeamBots", lifespan=lifespan)
+app = FastAPI(title="TeamBots", lifespan=lifespan,
+              docs_url=None, redoc_url=None, openapi_url=None)
 # Honour X-Forwarded-Proto / X-Forwarded-Host when sitting behind Caddy, Brev, cloudflared, etc.
 app.add_middleware(ProxyHeadersMiddleware, trusted_hosts="*")
+
+
+@app.middleware("http")
+async def remember_connecting_ip(request: Request, call_next):
+    """Record the immediate peer before ProxyHeadersMiddleware rewrites request.client.
+
+    Registered after that middleware so this hook runs first. Auth rate limiting
+    then trusts X-Forwarded-For / CF-Connecting-IP only when this peer is local.
+    """
+    request.state.connecting_ip = request.client.host if request.client else ""
+    return await call_next(request)
 
 
 @app.middleware("http")
@@ -66,6 +79,29 @@ def _asset_version() -> str:
         except OSError:
             pass
     return h.hexdigest()[:10]
+
+
+def _docs_or_404():
+    if not config.ENABLE_DOCS:
+        raise HTTPException(404, "not found")
+
+
+@app.get("/openapi.json", include_in_schema=False)
+def openapi_spec():
+    _docs_or_404()
+    return JSONResponse(app.openapi())
+
+
+@app.get("/docs", include_in_schema=False)
+def swagger_ui():
+    _docs_or_404()
+    return get_swagger_ui_html(openapi_url="/openapi.json", title="TeamBots")
+
+
+@app.get("/redoc", include_in_schema=False)
+def redoc_ui():
+    _docs_or_404()
+    return get_redoc_html(openapi_url="/openapi.json", title="TeamBots")
 
 
 @app.get("/")
