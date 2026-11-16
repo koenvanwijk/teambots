@@ -168,21 +168,42 @@ def test_private_chats(c):
                   headers=H("alice")).status_code == 404
 
 
-def test_memory_personal_and_team_learning_review(c):
-    msgs = say(c, "bob", S["dm_bob"], tool("remember", content="deploys happen on tuesdays", scope="team"))
-    assert "proposed as a team learning" in msgs[-1]["content"]
-    assert say(c, "carol", S["dm_carol"], "RECALL deploys happen on tuesdays")[-1]["content"] == "no"
-    pending = [m for m in c.get(f"/api/bots/{S['bot']}/memories", headers=H("alice")).json() if m["status"] == "pending"]
-    assert len(pending) == 1 and pending[0]["proposed_by"] == "Bob"
-    assert c.post(f"/api/memories/{pending[0]['id']}/review", json={"approve": True}, headers=H("carol")).status_code == 403
-    assert c.post(f"/api/memories/{pending[0]['id']}/review", json={"approve": True}, headers=H("alice")).status_code == 200
+def test_memory_is_project_wide_and_budgeted(c):
+    # Any member may let the bot write team memory: no review step, everyone sees it from the next turn.
+    msgs = say(c, "bob", S["dm_bob"], tool("memory", target="team", operations=[
+        {"action": "add", "content": "deploys happen on tuesdays"}]))
+    assert "team memory updated: 1 added" in msgs[-1]["content"]
     assert say(c, "carol", S["dm_carol"], "RECALL deploys happen on tuesdays")[-1]["content"] == "yes"
+    assert say(c, "carol", S["dm_carol"], "RECALL TEAM MEMORY (shared by everyone in this project) [")[-1]["content"] == "yes"
 
+    # The older tool name still works and writes the person's profile.
     say(c, "bob", S["dm_bob"], tool("remember", content="bob prefers short answers", scope="personal"))
     assert say(c, "bob", S["dm_bob"], "RECALL bob prefers short answers")[-1]["content"] == "yes"
     assert say(c, "alice", S["dm_alice"], "RECALL bob prefers short answers")[-1]["content"] == "no"
     assert all("bob prefers" not in m["content"]
                for m in c.get(f"/api/bots/{S['bot']}/memories", headers=H("alice")).json())
+
+    # patch by old_text, then a batch that would overflow the budget is refused as a whole
+    say(c, "carol", S["dm_carol"], tool("memory", target="team", operations=[
+        {"action": "patch", "old_text": "tuesdays", "content": "wednesdays"}]))
+    assert say(c, "alice", S["dm_alice"], "RECALL deploys happen on wednesdays")[-1]["content"] == "yes"
+    big = say(c, "carol", S["dm_carol"], tool("memory", target="team", operations=[
+        {"action": "add", "content": "x" * 3100}]))[-1]["content"]
+    assert "over its budget" in big and "deploys happen on wednesdays" in big
+
+    # People edit team memory in the UI too: any member, not only managers.
+    mems = c.get(f"/api/bots/{S['bot']}/memories", headers=H("carol")).json()
+    team = next(m for m in mems if m["scope"] == "team")
+    assert team["limit"] == 3000
+    r = c.patch(f"/api/memories/{team['id']}", json={"content": "deploys happen on tuesdays"}, headers=H("carol"))
+    assert r.status_code == 200, r.text
+    assert c.post(f"/api/bots/{S['bot']}/memories", json={"content": "y" * 3500, "scope": "team"},
+                  headers=H("carol")).status_code == 400
+    assert c.post(f"/api/bots/{S['bot']}/memories", json={"content": "temporary note", "scope": "team"},
+                  headers=H("carol")).status_code == 200
+    tmp = next(m for m in c.get(f"/api/bots/{S['bot']}/memories", headers=H("bob")).json()
+               if m["content"] == "temporary note")
+    assert c.delete(f"/api/memories/{tmp['id']}", headers=H("bob")).status_code == 200
 
 
 def test_computer_with_approval_gate(c):
@@ -258,11 +279,47 @@ def test_channel_new_bot_joins_remove_sticks_and_mention_only(c):
 
 
 def test_skills(c):
-    args = dict(name="weekly-report", description="Compile the weekly report", instructions="1. collect 2. write")
-    assert "only the owner or a manager" in say(c, "bob", S["dm_bob"], tool("save_skill", **args))[-1]["content"]
-    assert "saved" in say(c, "alice", S["dm_alice"], tool("save_skill", **args))[-1]["content"]
+    args = dict(action="create", name="weekly-report", description="Compile the weekly report",
+                instructions="1. collect 2. write")
+    # every person who can use the bot may let it save and fix skills
+    assert "saved" in say(c, "bob", S["dm_bob"], tool("skill_manage", **args))[-1]["content"]
     assert say(c, "bob", S["dm_bob"], "RECALL weekly-report: Compile the weekly report")[-1]["content"] == "yes"
-    assert "1. collect" in say(c, "bob", S["dm_bob"], tool("use_skill", name="weekly-report"))[-1]["content"]
+    assert say(c, "bob", S["dm_bob"], "RECALL <available_skills>")[-1]["content"] == "yes"
+    assert "updated" in say(c, "carol", S["dm_carol"], tool("skill_manage", action="patch", name="weekly-report",
+                                                            old_text="2. write", new_text="2. write 3. send"))[-1]["content"]
+    assert "3. send" in say(c, "bob", S["dm_bob"], tool("use_skill", name="weekly-report"))[-1]["content"]
+    # the older tool name still works
+    assert "saved" in say(c, "alice", S["dm_alice"], tool("save_skill", name="standup", description="d",
+                                                          instructions="say hi"))[-1]["content"]
+    k = next(x for x in c.get(f"/api/bots/{S['bot']}/skills", headers=H("carol")).json() if x["name"] == "standup")
+    assert c.patch(f"/api/skills/{k['id']}", json={"instructions": "say hello"}, headers=H("carol")).status_code == 200
+    assert c.delete(f"/api/skills/{k['id']}", headers=H("carol")).status_code == 200
+
+
+def test_project_context_prompt_preview_and_stable_prompt(c):
+    # AGENTS.md lives in the project workspace; every member may edit it and every bot gets it.
+    r = c.put(f"/api/teams/{S['team']}/context", json={"content": "# Project\nWe ship on Fridays."}, headers=H("carol"))
+    assert r.status_code == 200, r.text
+    assert c.get(f"/api/teams/{S['team']}/context", headers=H("bob")).json()["content"].endswith("We ship on Fridays.")
+    assert say(c, "bob", S["dm_bob"], "RECALL We ship on Fridays.")[-1]["content"] == "yes"
+    # a bot that edits AGENTS.md itself is seen on the next turn
+    say(c, "bob", S["dm_bob"], tool("write_file", path="AGENTS.md", content="We ship on Mondays."))
+    if c.get(f"/api/conversations/{S['dm_bob']}/approvals", headers=H("bob")).json():
+        approve(c, "bob", S["dm_bob"])
+    assert say(c, "bob", S["dm_bob"], "RECALL We ship on Mondays.")[-1]["content"] == "yes"
+    # the prompt preview is open to every member and shows the sections with their sizes
+    prev = c.get(f"/api/bots/{S['bot']}/prompt-preview", headers=H("carol"))
+    assert prev.status_code == 200, prev.text
+    names = {x["name"] for x in prev.json()["sections"]}
+    assert {"identity", "project_context", "team_memory", "user_profile", "setup"} <= names
+    assert prev.json()["chars"] <= prev.json()["limit"]
+    # one prompt per turn: the tool step and the answer after it see the same system prompt
+    import mock_llm
+    mock_llm.SEEN["systems"] = []
+    say(c, "bob", S["dm_bob"], tool("use_skill", name="weekly-report"))
+    seen = [x for x in mock_llm.SEEN["systems"] if x.startswith("You are Helper")]
+    assert len(seen) == 2 and seen[0] == seen[1]
+    assert mock_llm.SEEN["stamps"] > 0  # the current time travels with the newest message, not the prompt
 
 
 def test_cron_in_plain_words():

@@ -658,6 +658,7 @@ def delete_team(team_id: int, confirm: str = Query(default=""), user: User = Dep
             wipe(BotAccess, BotAccess.bot_id.in_(bot_ids))
             wipe(Secret, Secret.bot_id.in_(bot_ids))
             wipe(McpServer, McpServer.bot_id.in_(bot_ids))
+        wipe(Memory, Memory.team_id == team_id)
         wipe(Conversation, Conversation.team_id == team_id)
         wipe(Bot, Bot.team_id == team_id)
         wipe(Endpoint, Endpoint.team_id == team_id)
@@ -1042,7 +1043,10 @@ async def delete_bot(bot_id: int, user: User = Depends(current_user)):
             for cred in s.exec(select(McpCredential).where(McpCredential.mcp_server_id == srv.id)).all():
                 s.delete(cred)
         for model in (BotAccess, Memory, Skill, Routine, Secret, McpServer, Approval, ChannelMember):
-            for row in s.exec(select(model).where(model.bot_id == bot_id)).all():
+            q = select(model).where(model.bot_id == bot_id)
+            if model is Memory:  # project memory outlives the bot that wrote it
+                q = q.where(Memory.team_id == 0)
+            for row in s.exec(q).all():
                 s.delete(row)
         s.delete(b)
         s.commit()
@@ -1092,22 +1096,38 @@ def share_bot(bot_id: int, body: ShareIn, user: User = Depends(current_user)):
 
 # ---------------------------------------------------------------- memory, skills, secrets, MCP
 
+def _memory_rows(s, bot: Bot, user: User) -> list[Memory]:
+    """Team memory of the bot's project (any status) and this person's own profile in it."""
+    q = select(Memory).where(Memory.team_id == (bot.team_id or 0))
+    if not bot.team_id:  # the overview bot has no project: its memory is its own
+        q = q.where(Memory.bot_id == bot.id)
+    return [m for m in s.exec(q.order_by(Memory.id)).all()
+            if m.scope == "team" or (m.scope == "personal" and m.user_id == user.id)]
+
+
+def _memory_access(s, m: Memory, user: User) -> None:
+    """Team memory belongs to the project: every member may change it. A profile only to its person."""
+    _need(m, 404, "memory not found")
+    if m.scope == "personal":
+        _need(m.user_id == user.id, 404, "memory not found")
+    elif m.team_id:
+        _need(team_role(s, user.id, m.team_id), 404, "memory not found")
+    else:
+        b = s.get(Bot, m.bot_id)
+        _need(b and bot_role(s, user.id, b), 404, "memory not found")
+
+
 @router.get("/bots/{bot_id}/memories")
 def list_memories(bot_id: int, user: User = Depends(current_user)):
-    """Team memory for everyone; your own personal memory; pending learnings for owner and managers."""
+    """The project's team memory and your own profile, as the bot sees them, with budget usage."""
+    from . import memory as mem
     with session() as s:
         b = _bot(s, bot_id, user)
-        manage = can_manage(s, user.id, b)
-        rows = s.exec(select(Memory).where(Memory.bot_id == bot_id)).all()
+        rows = _memory_rows(s, b, user)
         names = {u.id: u.display_name for u in s.exec(select(User)).all()}
-    out = []
-    for m in rows:
-        mine = m.scope == "personal" and m.user_id == user.id
-        team_ok = m.scope == "team" and (m.status == "active" or manage or m.proposed_by == user.id)
-        if mine or team_ok:
-            out.append({"id": m.id, "scope": m.scope, "content": m.content, "status": m.status,
-                        "proposed_by": names.get(m.proposed_by, "")})
-    return out
+    return [{"id": m.id, "scope": m.scope, "content": m.content, "status": m.status,
+             "proposed_by": names.get(m.proposed_by, ""),
+             "limit": mem.TEAM_LIMIT if m.scope == "team" else mem.USER_LIMIT} for m in rows]
 
 
 class MemoryIn(BaseModel):
@@ -1115,18 +1135,39 @@ class MemoryIn(BaseModel):
     scope: str = "personal"
 
 
+def _memory_result(result: str) -> dict:
+    _need(not result.startswith("error"), 400, result.split("\nCurrent entries:")[0].removeprefix("error: "))
+    return {"ok": True, "result": result}
+
+
 @router.post("/bots/{bot_id}/memories")
 def add_memory(bot_id: int, body: MemoryIn, user: User = Depends(current_user)):
+    from . import memory as mem
     with session() as s:
         b = _bot(s, bot_id, user)
-        if body.scope == "team":
-            m = Memory(bot_id=bot_id, scope="team", content=body.content, proposed_by=user.id,
-                       status="active" if can_manage(s, user.id, b) else "pending")
-        else:
-            m = Memory(bot_id=bot_id, scope="personal", user_id=user.id, content=body.content)
-        s.add(m)
-        s.commit()
-    return {"id": m.id, "status": m.status}
+        target = "team" if body.scope == "team" else "user"
+        return _memory_result(mem.apply(s, b, user.id, target, [{"action": "add", "content": body.content}]))
+
+
+class MemoryPatch(BaseModel):
+    content: str
+
+
+@router.patch("/memories/{memory_id}")
+def edit_memory(memory_id: int, body: MemoryPatch, user: User = Depends(current_user)):
+    from . import memory as mem
+    with session() as s:
+        m = s.get(Memory, memory_id)
+        _memory_access(s, m, user)
+        b = s.get(Bot, m.bot_id)
+        _need(b, 404, "memory not found")
+        if m.status != "active":  # an old pending learning: editing it accepts it
+            m.status = "active"
+            s.add(m)
+            s.commit()
+        target = "team" if m.scope == "team" else "user"
+        return _memory_result(mem.apply(s, b, m.user_id or user.id, target,
+                                        [{"action": "patch", "id": m.id, "content": body.content}]))
 
 
 class ReviewIn(BaseModel):
@@ -1135,11 +1176,11 @@ class ReviewIn(BaseModel):
 
 @router.post("/memories/{memory_id}/review")
 def review_memory(memory_id: int, body: ReviewIn, user: User = Depends(current_user)):
-    """The human gate on shared knowledge: an owner or manager approves or rejects a learning."""
+    """Learnings proposed before memory became project-wide: any project member accepts or drops them."""
     with session() as s:
         m = s.get(Memory, memory_id)
         _need(m and m.status == "pending", 404, "no pending learning with this id")
-        _bot(s, m.bot_id, user, manage=True)
+        _memory_access(s, m, user)
         if body.approve:
             m.status = "active"
             s.add(m)
@@ -1153,9 +1194,7 @@ def review_memory(memory_id: int, body: ReviewIn, user: User = Depends(current_u
 def delete_memory(memory_id: int, user: User = Depends(current_user)):
     with session() as s:
         m = s.get(Memory, memory_id)
-        _need(m, 404, "memory not found")
-        b = _bot(s, m.bot_id, user)
-        _need((m.scope == "personal" and m.user_id == user.id) or (m.scope == "team" and can_manage(s, user.id, b)))
+        _memory_access(s, m, user)
         s.delete(m)
         s.commit()
     return {"ok": True}
@@ -1167,6 +1206,12 @@ class SkillIn(BaseModel):
     instructions: str
 
 
+class SkillPatch(BaseModel):
+    name: Optional[str] = None
+    description: Optional[str] = None
+    instructions: Optional[str] = None
+
+
 @router.get("/bots/{bot_id}/skills")
 def list_skills(bot_id: int, user: User = Depends(current_user)):
     with session() as s:
@@ -1176,9 +1221,31 @@ def list_skills(bot_id: int, user: User = Depends(current_user)):
 
 @router.post("/bots/{bot_id}/skills")
 def add_skill(bot_id: int, body: SkillIn, user: User = Depends(current_user)):
+    """Everyone who can use the bot may add, change and remove its skills."""
+    _need(body.name.strip() and body.instructions.strip(), 400, "a skill needs a name and instructions")
     with session() as s:
-        _bot(s, bot_id, user, manage=True)
-        k = Skill(bot_id=bot_id, created_by=user.id, **body.model_dump())
+        _bot(s, bot_id, user)
+        k = s.exec(select(Skill).where(Skill.bot_id == bot_id, Skill.name == body.name.strip())).first()
+        if k:
+            k.description, k.instructions = body.description, body.instructions
+        else:
+            k = Skill(bot_id=bot_id, created_by=user.id, **{**body.model_dump(), "name": body.name.strip()})
+        s.add(k)
+        s.commit()
+        return k.model_dump()
+
+
+@router.patch("/skills/{skill_id}")
+def edit_skill(skill_id: int, body: SkillPatch, user: User = Depends(current_user)):
+    with session() as s:
+        k = s.get(Skill, skill_id)
+        _need(k, 404, "skill not found")
+        _bot(s, k.bot_id, user)
+        for f in ("name", "description", "instructions"):
+            v = getattr(body, f)
+            if v is not None:
+                _need(f == "description" or v.strip(), 400, f"{f} cannot be empty")
+                setattr(k, f, v.strip() if f == "name" else v)
         s.add(k)
         s.commit()
         return k.model_dump()
@@ -1189,10 +1256,62 @@ def delete_skill(skill_id: int, user: User = Depends(current_user)):
     with session() as s:
         k = s.get(Skill, skill_id)
         _need(k, 404, "skill not found")
-        _bot(s, k.bot_id, user, manage=True)
+        _bot(s, k.bot_id, user)
         s.delete(k)
         s.commit()
     return {"ok": True}
+
+
+# ---------------------------------------------------------------- project context and prompt preview
+
+class ContextIn(BaseModel):
+    content: str
+
+
+@router.get("/teams/{team_id}/context")
+async def get_project_context(team_id: int, user: User = Depends(current_user)):
+    """The project's AGENTS.md: shared notes every bot of the project gets in its prompt."""
+    from . import prompt
+    with session() as s:
+        _need(team_role(s, user.id, team_id))
+    prompt.invalidate_project_context(team_id)
+    text = await prompt.project_context(team_id)
+    return {"path": prompt.CONTEXT_FILE, "content": text, "limit": prompt.PROJECT_CONTEXT_LIMIT}
+
+
+@router.put("/teams/{team_id}/context")
+async def put_project_context(team_id: int, body: ContextIn, user: User = Depends(current_user)):
+    from . import prompt
+    with session() as s:
+        _need(team_role(s, user.id, team_id))
+    found = secrets_http.find_leaks(body.content, [])
+    _need(not found, 409, "this text seems to contain a secret; store secrets with the bot instead")
+    try:
+        await sandbox.put_bytes(f"p{team_id}", prompt.CONTEXT_FILE, body.content.encode())
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(503, f"the project computer is not available: {e}") from e
+    prompt.invalidate_project_context(team_id)
+    return {"ok": True, "chars": len(body.content)}
+
+
+@router.get("/bots/{bot_id}/prompt-preview")
+async def prompt_preview(bot_id: int, user: User = Depends(current_user)):
+    """The system prompt this bot gets in your private chat with it, section by section."""
+    from . import agent
+    with session() as s:
+        b = _bot(s, bot_id, user)
+        conv = s.exec(select(Conversation).where(Conversation.kind.in_(("dm", "home")),
+                                                 Conversation.bot_id == b.id,
+                                                 Conversation.user_id == user.id)).first()
+        if conv is None:  # no chat yet: preview as a fresh private chat
+            conv = Conversation(team_id=b.team_id, kind="home" if b.is_home else "dm", name=b.name,
+                                bot_id=b.id, user_id=user.id)
+    ctx = agent.Ctx(b.id, user.id, conv.id or 0, False, team_id=b.team_id, is_home=b.is_home)
+    parts = await agent.build_prompt(b, conv, user, ctx)
+    out = parts.preview()
+    out["note"] = ("Built for your private chat. The current time and, for some models, a tool-use rule are "
+                   "added per call; the conversation history follows the prompt.")
+    return out
 
 
 class SecretIn(BaseModel):

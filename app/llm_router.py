@@ -241,7 +241,8 @@ def _looks_private(messages: list[dict], bot: Bot | None, ctx: usage.UsageCtx | 
     origin = (ctx.origin if ctx else "") or ""
     if origin in ("overview", "voice") and bot is not None and getattr(bot, "is_home", False):
         return True, "Overview origin stays local"
-    text = _text_of(messages)
+    # The system prompt explains the {{secret:NAME}} syntax to every bot, so only the conversation counts.
+    text = _text_of([m for m in messages or [] if m.get("role") != "system"])
     if "{{secret:" in text:
         return True, "prompt contains a TeamBots secret reference"
     for m in messages or []:

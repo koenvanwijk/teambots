@@ -985,7 +985,7 @@ async function channelMembers() {
 }
 
 // ---------- messages
-const TOOLS = { run_command: ['term', 'Run command'], write_file: ['file', 'Write file'], read_file: ['file', 'Read file'], http_request: ['globe', 'HTTP request'], remember: ['book', 'Remember'], forget: ['book', 'Forget'],
+const TOOLS = { run_command: ['term', 'Run command'], write_file: ['file', 'Write file'], read_file: ['file', 'Read file'], http_request: ['globe', 'HTTP request'], remember: ['book', 'Remember'], forget: ['book', 'Forget'], memory: ['book', 'Update memory'], skill_manage: ['zap', 'Update skill'], search_history: ['search', 'Search history'],
   save_skill: ['zap', 'Save skill'], use_skill: ['zap', 'Use skill'], ask_bot: ['bot', 'Ask another bot'], create_routine: ['clock', 'Create routine'], list_workspace: ['grid', 'List projects'], get_overview: ['home', 'Overview'], read_messages: ['book', 'Read messages'], post_to_channel: ['hash', 'Post to team chat'], list_routines: ['clock', 'List routines'], update_routine: ['edit', 'Update routine'], delete_routine: ['trash', 'Delete routine'], run_routine: ['play', 'Run routine'] };
 function toolInfo(name) {
   if (TOOLS[name]) return TOOLS[name];
@@ -1375,11 +1375,18 @@ function listenBotEvents(bot) {
     S.botEsTimer = setTimeout(() => openDrawer(S.drawerBot, 'connections'), 40);
   };
 }
+async function showPrompt(bot) {
+  const p = await api('GET', `/bots/${bot.id}/prompt-preview`);
+  const tierName = { stable: 'Always the same', context: 'Bot and project', volatile: 'Memory, skills and setup' };
+  const secs = p.sections.map(x => $('details', { className: 'promptsec' }, $('summary', {}, $('b', { textContent: x.name.replace(/_/g, ' ') }), $('small', { className: 'muted', textContent: ` · ${tierName[x.tier] || x.tier} · ${x.chars.toLocaleString()}${x.limit ? ' / ' + x.limit.toLocaleString() : ''} characters` })), $('pre', { textContent: x.text })));
+  const d = openDialog('wide', $('div', { className: 'pad' }, $('h2', { textContent: `What ${bot.name} sees` }), $('p', { className: 'intro', textContent: `${p.chars.toLocaleString()} of at most ${p.limit.toLocaleString()} characters. ${p.note}` }), secs,
+    $('div', { className: 'dfoot' }, $('button', { className: 'btn', type: 'button', textContent: 'Copy all', onclick: () => copyText(p.sections.map(x => x.text).join('\n\n'), 'Prompt copied') }), $('button', { className: 'btn primary', type: 'button', textContent: 'Close', onclick: () => d.close() }))));
+}
 async function openDrawer(bot, tab = 'setup') {
   const p = el('drawer'), manage = bot.role !== 'collaborator', again = t => openDrawer(bot, t || tab);
   clearInterval(S.screenTimer); clearInterval(S.previewTimer);
   S.drawerBot = bot; S.drawerTab = tab; listenBotEvents(bot);
-  const tabs = [['setup', 'Setup'], manage && bot.is_team && ['sharing', 'Sharing'], ['knowledge', 'Memory and skills'], ['routines', 'Routines'], ['connections', manage ? 'Secrets and tools' : 'Tools']].filter(Boolean);
+  const tabs = [['setup', 'Setup'], manage && bot.is_team && ['sharing', 'Sharing'], ['knowledge', 'Knowledge'], ['routines', 'Routines'], ['connections', manage ? 'Secrets and tools' : 'Tools']].filter(Boolean);
   const body = $('div', { className: 'dbody' });
   // A live screen preview above the tabs, refreshed every 5s. Each bot has its own screen on
   // the project computer, so this shows only when the bot has computer use.
@@ -1444,16 +1451,36 @@ async function openDrawer(bot, tab = 'setup') {
         bot.published = pub.checked; bot.access = acc.value; renderSide(); renderTop(); toast(pub.checked ? 'Published' : 'Saved as draft'); again(); }) })));
   }
   if (tab === 'knowledge') {
-    const [mems, skills] = await Promise.all([get('memories'), get('skills')]);
+    const [mems, skills, pctx] = await Promise.all([get('memories'), get('skills'), bot.is_home ? null : api('GET', `/teams/${bot.team_id}/context`).catch(() => null)]);
     const review = (m, approve) => guard(async () => { await api('POST', `/memories/${m.id}/review`, { approve }); again(); });
-    put(body, head('Memory', 'Add', async () => { if (await form({ title: 'Add a memory', ok: 'Remember', fields: [{ name: 'content', label: 'What should the bot remember?', type: 'textarea', required: true }, { name: 'scope', label: 'For whom', type: 'select', value: 'personal', options: [{ value: 'personal', label: 'Only me' }, { value: 'team', label: 'Everyone who uses this bot' + (manage ? '' : ' (needs review)') }] }], onSubmit: v => api('POST', `/bots/${bot.id}/memories`, v) })) again(); }),
-      hint('Team memory is shared. Personal memory is only yours. Team learnings from collaborators wait for review by an owner or manager.'),
-      mems.length ? mems.map(m => li(m.content, m.status === 'pending' ? 'Learning proposed by ' + m.proposed_by : m.scope === 'team' ? 'Team' : 'Only you',
-        m.status === 'pending' && manage && [ib('check', 'Approve', review(m, true), 15), ib('x', 'Reject', review(m, false), 15)], m.status === 'pending' && !manage && $('span', { className: 'tag warn', textContent: 'in review' }),
-        m.status !== 'pending' && (m.scope === 'personal' || manage) && del(`/memories/${m.id}`, 'this memory'))) : none('Nothing remembered yet.'),
-      head('Skills', manage && 'Add', manage && (async () => { if (await form({ title: 'New skill', intro: 'Steps for a task that comes back. Add it to a message with @skill.', ok: 'Save skill', fields: [{ name: 'name', label: 'Name', required: true, placeholder: 'weekly-report' }, { name: 'description', label: 'One-line description' }, { name: 'instructions', label: 'Step-by-step instructions', type: 'textarea', rows: 7, required: true }], onSubmit: v => api('POST', `/bots/${bot.id}/skills`, v) })) { await loadCtx(S.conv); again(); } })),
-      hint('The bot saves a skill itself after a task worked, or you write one here.'),
-      skills.length ? skills.map(k => li(k.name, k.description, ib('copy', 'Copy the @skill mention', () => copyText('@skill:' + quote(k.name), 'Mention copied'), 15), manage && del(`/skills/${k.id}`, 'this skill'))) : none('No skills yet.'));
+    const meterOf = (rows, limit) => { const n = rows.reduce((a, m) => a + m.content.length, 0); return `${n.toLocaleString()} / ${limit.toLocaleString()} characters`; };
+    const editMem = m => guard(async () => { if (await form({ title: 'Edit memory', ok: 'Save', fields: [{ name: 'content', label: 'Memory', type: 'textarea', value: m.content, required: true }], onSubmit: v => api('PATCH', `/memories/${m.id}`, v) })) again(); });
+    const memLi = m => li(m.content, m.status === 'pending' ? 'Proposed by ' + m.proposed_by + ' (from before memory became project-wide)' : null,
+      m.status === 'pending' && [ib('check', 'Accept', review(m, true), 15), ib('x', 'Drop', review(m, false), 15)],
+      m.status !== 'pending' && ib('edit', 'Edit', editMem(m), 15), m.status !== 'pending' && del(`/memories/${m.id}`, 'this memory'));
+    const team = mems.filter(m => m.scope === 'team'), mine = mems.filter(m => m.scope === 'personal');
+    const teamLimit = (team[0] && team[0].limit) || 3000, mineLimit = (mine[0] && mine[0].limit) || 1500;
+    const addMem = scope => async () => { if (await form({ title: scope === 'team' ? 'Add to team memory' : 'Add to your profile', ok: 'Remember', fields: [{ name: 'content', label: scope === 'team' ? 'A fact everyone in this project should know' : 'Something about you the bot should know', type: 'textarea', required: true }], onSubmit: v => api('POST', `/bots/${bot.id}/memories`, { ...v, scope }) })) again(); };
+    let ctxBox = null;
+    if (pctx) {
+      const ta = $('textarea', { rows: 8, value: pctx.content, placeholder: '# What this project is\nWho is involved, conventions, where things are…', className: 'mono' });
+      const count = $('small', { className: 'muted' }); const upd = () => { count.textContent = `${ta.value.length.toLocaleString()} / ${pctx.limit.toLocaleString()} characters`; }; ta.addEventListener('input', upd); upd();
+      ctxBox = [head('Project context'), hint(`${pctx.path} on the project computer. Every bot in this project reads it in every chat, and everyone (people and bots) may edit it.`), ta,
+        $('div', { className: 'rowbtns', style: 'margin:8px 0 16px' }, count, $('button', { className: 'btn primary sm', textContent: 'Save context', onclick: guard(async () => { await api('PUT', `/teams/${bot.team_id}/context`, { content: ta.value }); toast('Saved'); }) }))];
+    }
+    const editSkill = k => guard(async () => { if (await form({ title: 'Edit skill', ok: 'Save', fields: [{ name: 'name', label: 'Name', value: k.name, required: true }, { name: 'description', label: 'One-line description', value: k.description }, { name: 'instructions', label: 'Step-by-step instructions', type: 'textarea', rows: 9, value: k.instructions, required: true }], onSubmit: v => api('PATCH', `/skills/${k.id}`, v) })) { if (S.conv) await loadCtx(S.conv); again(); } });
+    put(body, ctxBox,
+      head(bot.is_home ? 'Memory' : 'Team memory', 'Add', addMem('team')),
+      hint((bot.is_home ? 'Facts this bot keeps for you. ' : 'Shared by every bot and everyone in this project. ') + meterOf(team, teamLimit) + '. The bot keeps it short and up to date itself.'),
+      team.length ? team.map(memLi) : none('Nothing remembered yet.'),
+      head('Your profile', 'Add', addMem('personal')),
+      hint('Only you see this, and bots only use it in your private chats. ' + meterOf(mine, mineLimit) + '.'),
+      mine.length ? mine.map(memLi) : none('Nothing about you yet.'),
+      head('Skills', 'Add', async () => { if (await form({ title: 'New skill', intro: 'Steps for a task that comes back. Add it to a message with @skill.', ok: 'Save skill', fields: [{ name: 'name', label: 'Name', required: true, placeholder: 'weekly-report' }, { name: 'description', label: 'One-line description' }, { name: 'instructions', label: 'Step-by-step instructions', type: 'textarea', rows: 7, required: true }], onSubmit: v => api('POST', `/bots/${bot.id}/skills`, v) })) { await loadCtx(S.conv); again(); } }),
+      hint('The bot saves and fixes skills itself after a task worked, or you write one here.'),
+      skills.length ? skills.map(k => li(k.name, k.description, ib('copy', 'Copy the @skill mention', () => copyText('@skill:' + quote(k.name), 'Mention copied'), 15), ib('edit', 'Edit', editSkill(k), 15), del(`/skills/${k.id}`, 'this skill'))) : none('No skills yet.'),
+      head('What the bot sees'), hint('The full instructions this bot gets in your private chat: its rules, the project context, memory and skills.'),
+      $('div', { className: 'rowbtns' }, $('button', { className: 'btn sm', onclick: guard(() => showPrompt(bot)) }, icon('book', 14), 'Show prompt')));
   }
   if (tab === 'routines') {
     const rs = await get('routines'), here = S.conv && S.conv.kind !== 'feed';
