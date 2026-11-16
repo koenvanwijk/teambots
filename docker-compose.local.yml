@@ -27,7 +27,7 @@ services:
       - /var/run/docker.sock:/var/run/docker.sock
     network_mode: none
     healthcheck:
-      test: ["CMD", "python", "-c", "import httpx; httpx.get('http://s/health', transport=httpx.HTTPTransport(uds='/run/teambots/sandboxd.sock'), timeout=5).raise_for_status()"]
+      test: ["CMD", "python", "-c", "import httpx; httpx.Client(transport=httpx.HTTPTransport(uds='/run/teambots/sandboxd.sock'), timeout=5).get('http://s/health').raise_for_status()"]
       interval: 15s
       timeout: 5s
       retries: 10
