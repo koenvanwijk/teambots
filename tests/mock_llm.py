@@ -17,6 +17,9 @@ from fastapi import FastAPI, Header, HTTPException, Request
 
 app = FastAPI()
 EXPECTED_KEY = "sk-test-key"
+# TeamBots puts the current time in front of the newest user message of an agent turn.
+STAMP = re.compile(r"^\[[A-Z][a-z]{2} \d{2} [A-Z][a-z]{2} \d{4} \d{2}:\d{2}[^\]\n]*\]\n")
+SEEN: dict = {"stamps": 0, "systems": []}
 
 
 @app.post("/v1/chat/completions")
@@ -32,6 +35,10 @@ async def completions(request: Request, authorization: str = Header(default=""))
     if isinstance(text, list):  # a screenshot arrives as a user message with an image part
         image = next((p["image_url"]["url"] for p in text if p["type"] == "image_url"), None)
         text = " ".join(p.get("text", "") for p in text if p["type"] == "text")
+    if STAMP.match(text):
+        SEEN["stamps"] += 1
+        text = STAMP.sub("", text, count=1)
+    SEEN["systems"] = (SEEN["systems"] + [system])[-20:]
     if system.startswith("An AI teammate is busy"):  # routing of a message sent while the bot works
         new = text.split("New message: ", 1)[1]
         msg = {"role": "assistant", "content": "QUEUE" if "later" in new else "STEER"}

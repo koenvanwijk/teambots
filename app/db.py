@@ -133,6 +133,8 @@ class Conversation(SQLModel, table=True):
     user_id: Optional[int] = Field(default=None, index=True)  # dm only
     bot_id: Optional[int] = Field(default=None, index=True)  # dm/home/handoff; None for channels and project activity
     peer_bot_id: Optional[int] = Field(default=None, index=True)  # handoff: the bot that asked
+    summary: str = ""  # rolling summary of the messages that no longer fit in the history
+    summary_upto: int = 0  # id of the last message the summary covers
 
 
 class ChannelMember(SQLModel, table=True):
@@ -217,8 +219,17 @@ class Message(SQLModel, table=True):
 
 
 class Memory(SQLModel, table=True):
+    """LEGACY, read-only: memory now lives in the knowledge base (app/knowledge.py, memory/ and users/).
+    The rows are imported into it once and no longer written.
+
+    Team memory is per project (team_id); a personal memory is the person's profile in that project.
+
+    bot_id is the bot that wrote it. The overview bot has no project (team_id 0), so its memory stays
+    tied to that bot.
+    """
     id: Optional[int] = Field(default=None, primary_key=True)
     bot_id: int = Field(index=True)
+    team_id: int = Field(default=0, index=True)
     scope: str  # team | personal
     user_id: Optional[int] = None  # owner of a personal memory
     content: str
@@ -228,6 +239,7 @@ class Memory(SQLModel, table=True):
 
 
 class Skill(SQLModel, table=True):
+    """LEGACY, read-only: skills are files in skills/ of the project's knowledge base now."""
     id: Optional[int] = Field(default=None, primary_key=True)
     bot_id: int = Field(index=True)
     name: str
@@ -340,6 +352,7 @@ def init_db() -> None:
     _ensure_costs_columns()
     _ensure_router_columns()
     _ensure_mcp_auth_columns()
+    _ensure_memory_team_column()
     from .usage import seed_prices
     seed_prices()
     migrate_channel_bots()
@@ -501,13 +514,31 @@ def _ensure_mcp_auth_columns() -> None:
 
 
 def _ensure_handoff_columns() -> None:
-    """Add Conversation.peer_bot_id on databases created before bot-to-bot threads."""
+    """Add Conversation.peer_bot_id (bot-to-bot threads) and the rolling summary columns on older databases."""
     if not config.DB_URL.startswith("sqlite"):
         return
     with engine.connect() as conn:
         cols = [r[1] for r in conn.exec_driver_sql("PRAGMA table_info(conversation)").fetchall()]
         if "peer_bot_id" not in cols:
             conn.exec_driver_sql("ALTER TABLE conversation ADD COLUMN peer_bot_id INTEGER")
+        if "summary" not in cols:
+            conn.exec_driver_sql("ALTER TABLE conversation ADD COLUMN summary VARCHAR NOT NULL DEFAULT ''")
+        if "summary_upto" not in cols:
+            conn.exec_driver_sql("ALTER TABLE conversation ADD COLUMN summary_upto INTEGER NOT NULL DEFAULT 0")
+        conn.commit()
+
+
+def _ensure_memory_team_column() -> None:
+    """Memory moved from per bot to per project: add Memory.team_id and fill it from the bot."""
+    if not config.DB_URL.startswith("sqlite"):
+        return
+    with engine.connect() as conn:
+        cols = [r[1] for r in conn.exec_driver_sql("PRAGMA table_info(memory)").fetchall()]
+        if "team_id" not in cols:
+            conn.exec_driver_sql("ALTER TABLE memory ADD COLUMN team_id INTEGER NOT NULL DEFAULT 0")
+            conn.exec_driver_sql("CREATE INDEX IF NOT EXISTS ix_memory_team_id ON memory (team_id)")
+            conn.exec_driver_sql(
+                "UPDATE memory SET team_id = COALESCE((SELECT bot.team_id FROM bot WHERE bot.id = memory.bot_id), 0)")
             conn.commit()
 
 

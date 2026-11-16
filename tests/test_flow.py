@@ -152,9 +152,16 @@ def test_team_bot_draft_then_publish(c):
     assert c.get(f"/api/teams/{S['team']}/bots", headers=H("carol")).json() == []  # not selected
     c.put(f"/api/bots/{bot['id']}/share", headers=H("alice"), json={"published": True, "access": "team"})
     assert c.get(f"/api/teams/{S['team']}/bots", headers=H("carol")).json()[0]["role"] == "collaborator"
-    # collaborators cannot change the bot or see its secrets
-    assert c.patch(f"/api/bots/{bot['id']}", json={"instructions": "x"}, headers=H("bob")).status_code == 403
-    assert c.get(f"/api/bots/{bot['id']}/secrets", headers=H("bob")).status_code == 403
+    # within a project every member may change the bot (instructions, setup, secrets) ...
+    r = c.patch(f"/api/bots/{bot['id']}", json={"instructions": "x"}, headers=H("bob"))
+    assert r.status_code == 200 and r.json()["instructions"] == "x"
+    assert c.patch(f"/api/bots/{bot['id']}", json={"instructions": bot["instructions"]},
+                   headers=H("carol")).status_code == 200
+    assert c.get(f"/api/bots/{bot['id']}/secrets", headers=H("bob")).status_code == 200
+    # ... but who may use the bot stays with its owner and managers
+    assert c.get(f"/api/bots/{bot['id']}/share", headers=H("bob")).status_code == 403
+    assert c.put(f"/api/bots/{bot['id']}/share", headers=H("bob"), json={
+        "published": True, "access": "selected", "members": []}).status_code == 403
 
 
 def test_private_chats(c):
@@ -168,21 +175,121 @@ def test_private_chats(c):
                   headers=H("alice")).status_code == 404
 
 
-def test_memory_personal_and_team_learning_review(c):
-    msgs = say(c, "bob", S["dm_bob"], tool("remember", content="deploys happen on tuesdays", scope="team"))
-    assert "proposed as a team learning" in msgs[-1]["content"]
-    assert say(c, "carol", S["dm_carol"], "RECALL deploys happen on tuesdays")[-1]["content"] == "no"
-    pending = [m for m in c.get(f"/api/bots/{S['bot']}/memories", headers=H("alice")).json() if m["status"] == "pending"]
-    assert len(pending) == 1 and pending[0]["proposed_by"] == "Bob"
-    assert c.post(f"/api/memories/{pending[0]['id']}/review", json={"approve": True}, headers=H("carol")).status_code == 403
-    assert c.post(f"/api/memories/{pending[0]['id']}/review", json={"approve": True}, headers=H("alice")).status_code == 200
-    assert say(c, "carol", S["dm_carol"], "RECALL deploys happen on tuesdays")[-1]["content"] == "yes"
+def kb_read(c, who, path):
+    r = c.get(f"/api/bots/{S['bot']}/knowledge/file", params={"path": path}, headers=H(who))
+    assert r.status_code == 200, r.text
+    return r.json()
 
+
+def kb_write(c, who, path, content, base_hash=None):
+    return c.put(f"/api/bots/{S['bot']}/knowledge/file", headers=H(who),
+                 json={"path": path, "content": content, "base_hash": base_hash})
+
+
+def test_memory_is_project_wide_and_budgeted(c):
+    # Any member may let the bot write team memory: no review step, everyone sees it from the next turn.
+    msgs = say(c, "bob", S["dm_bob"], tool("memory", target="team", operations=[
+        {"action": "add", "content": "deploys happen on tuesdays"}]))
+    assert "memory/notes.md updated: 1 added" in msgs[-1]["content"]
+    assert say(c, "carol", S["dm_carol"], "RECALL deploys happen on tuesdays")[-1]["content"] == "yes"
+    assert say(c, "carol", S["dm_carol"], "RECALL TEAM MEMORY (knowledge base memory/")[-1]["content"] == "yes"
+
+    # The older tool name still works and writes the person's profile (users/bob.md), shown only to Bob.
     say(c, "bob", S["dm_bob"], tool("remember", content="bob prefers short answers", scope="personal"))
     assert say(c, "bob", S["dm_bob"], "RECALL bob prefers short answers")[-1]["content"] == "yes"
     assert say(c, "alice", S["dm_alice"], "RECALL bob prefers short answers")[-1]["content"] == "no"
-    assert all("bob prefers" not in m["content"]
-               for m in c.get(f"/api/bots/{S['bot']}/memories", headers=H("alice")).json())
+    assert "bob prefers short answers" in kb_read(c, "bob", "users/bob.md")["content"]
+
+    # patch by old_text, then a batch that would overflow the budget is refused as a whole
+    say(c, "carol", S["dm_carol"], tool("memory", target="team", operations=[
+        {"action": "patch", "old_text": "tuesdays", "content": "wednesdays"}]))
+    assert say(c, "alice", S["dm_alice"], "RECALL deploys happen on wednesdays")[-1]["content"] == "yes"
+    big = say(c, "carol", S["dm_carol"], tool("memory", target="team", operations=[
+        {"action": "add", "content": "x" * 3100}]))[-1]["content"]
+    assert "over its budget" in big and "deploys happen on wednesdays" in big
+
+    # People edit the same file in the UI: any member, with the hash they loaded.
+    f = kb_read(c, "carol", "memory/notes.md")
+    r = kb_write(c, "carol", "memory/notes.md", f["content"].replace("wednesdays", "tuesdays"), f["hash"])
+    assert r.status_code == 200, r.text
+    assert r.json()["hash"] == kb_read(c, "bob", "memory/notes.md")["hash"] != f["hash"]
+    # git knows who wrote what: the bot (on behalf of a person) and the people themselves
+    hist = c.get(f"/api/bots/{S['bot']}/knowledge/history", params={"path": "memory/notes.md"},
+                 headers=H("bob")).json()
+    assert hist[0]["author"] == "Carol" and hist[0]["email"] == "carol@users.teambots.local"
+    assert any(h["author"] == "Helper (bot)" and "(for Bob)" in h["message"] for h in hist)
+    assert any(h["author"] == "Helper (bot)" and "(for Carol)" in h["message"] for h in hist)
+    # files may hold more than the prompt budget; the prompt then points at what it left out
+    assert kb_write(c, "carol", "memory/clients.md", "# Clients\n" + "acme details. " * 300).status_code == 200
+    assert say(c, "bob", S["dm_bob"], "RECALL - memory/clients.md (")[-1]["content"] == "yes"
+    cur = kb_read(c, "carol", "memory/clients.md")
+    assert c.delete(f"/api/bots/{S['bot']}/knowledge/file", params={"path": "memory/clients.md",
+                    "base_hash": cur["hash"]}, headers=H("bob")).status_code == 200
+
+
+def test_knowledge_base_hashes_conflicts_and_history(c):
+    bot_url = f"/api/bots/{S['bot']}/knowledge"
+    # a bot creates a file (and its directories) without a base hash
+    out = say(c, "bob", S["dm_bob"], tool("knowledge_write", path="clients/acme/notes.md",
+                                         content="# ACME\n- contact: Dana\n"))[-1]["content"]
+    assert out.startswith("RESULT: created clients/acme/notes.md, new hash ")
+    seen = out.rsplit(" ", 1)[1]
+    tree = c.get(bot_url, headers=H("carol")).json()
+    assert "clients/acme" in tree["dirs"] and any(f["path"] == "clients/acme/notes.md" for f in tree["files"])
+    read = say(c, "bob", S["dm_bob"], tool("knowledge_read", path="clients/acme/notes.md"))[-1]["content"]
+    assert f"hash: {seen}" in read and "contact: Dana" in read
+    # creating it again is refused: it exists already
+    again = say(c, "bob", S["dm_bob"], tool("knowledge_write", path="clients/acme/notes.md",
+                                           content="# ACME\n"))[-1]["content"]
+    assert "conflict: clients/acme/notes.md already exists" in again
+
+    # Alice edits it in the UI; the bot still holds the old hash, so its write is refused with who and a diff
+    r = kb_write(c, "alice", "clients/acme/notes.md", "# ACME\n- contact: Dana (CFO)\n", seen)
+    assert r.status_code == 200, r.text
+    stale = say(c, "bob", S["dm_bob"], tool("knowledge_write", path="clients/acme/notes.md",
+                                           content="# ACME\n- contact: Dan\n", base_hash=seen))[-1]["content"]
+    assert "conflict: clients/acme/notes.md changed since you read it by Alice" in stale
+    assert "+- contact: Dana (CFO)" in stale and "Nothing was written" in stale
+    assert "Dana (CFO)" in kb_read(c, "bob", "clients/acme/notes.md")["content"]
+    patch = say(c, "bob", S["dm_bob"], tool("knowledge_patch", path="clients/acme/notes.md", old_text="Dana",
+                                           new_text="Dan", base_hash=seen))[-1]["content"]
+    assert patch.startswith("RESULT: conflict:")
+    gone = say(c, "bob", S["dm_bob"], tool("knowledge_delete", path="clients/acme/notes.md",
+                                          base_hash=seen))[-1]["content"]
+    assert gone.startswith("RESULT: conflict:")
+    # the same rule for people: a stale save in the UI gets 409 with the last change and a diff
+    r = kb_write(c, "carol", "clients/acme/notes.md", "# ACME\n", seen)
+    assert r.status_code == 409
+    d = r.json()["detail"]
+    assert d["error"] == "conflict" and d["last_change"]["author"] == "Alice" and "Dana (CFO)" in d["diff"]
+    # with the current hash the bot's patch goes through
+    cur = kb_read(c, "bob", "clients/acme/notes.md")
+    ok = say(c, "bob", S["dm_bob"], tool("knowledge_patch", path="clients/acme/notes.md", old_text="(CFO)",
+                                        new_text="(CFO, prefers mail)", base_hash=cur["hash"]))[-1]["content"]
+    assert ok.startswith("RESULT: saved clients/acme/notes.md")
+
+    # history per file (who and when), view a version and put it back
+    hist = c.get(f"{bot_url}/history", params={"path": "clients/acme/notes.md"}, headers=H("carol")).json()
+    assert [h["author"] for h in hist] == ["Helper (bot)", "Alice", "Helper (bot)"]
+    first = hist[-1]["commit"]
+    v = c.get(f"{bot_url}/version", params={"path": "clients/acme/notes.md", "commit": first}, headers=H("carol"))
+    assert v.json()["content"] == "# ACME\n- contact: Dana\n"
+    cur = kb_read(c, "carol", "clients/acme/notes.md")
+    r = c.post(f"{bot_url}/revert", json={"path": "clients/acme/notes.md", "commit": first, "base_hash": cur["hash"]},
+               headers=H("carol"))
+    assert r.status_code == 200, r.text
+    assert kb_read(c, "bob", "clients/acme/notes.md")["content"] == "# ACME\n- contact: Dana\n"
+    hist = c.get(f"{bot_url}/history", params={"path": "clients/acme/notes.md"}, headers=H("bob")).json()
+    assert hist[0]["author"] == "Carol" and hist[0]["message"].startswith("Revert clients/acme/notes.md")
+    assert "Alice" in say(c, "bob", S["dm_bob"], tool("knowledge_history", path="clients/acme/notes.md"))[-1]["content"]
+
+    # folders, bad paths and people outside the project
+    assert c.post(f"{bot_url}/dir", json={"path": "drafts"}, headers=H("bob")).status_code == 200
+    assert "drafts" in c.get(bot_url, headers=H("bob")).json()["dirs"]
+    assert c.delete(f"{bot_url}/file", params={"path": "drafts"}, headers=H("bob")).status_code == 200
+    assert kb_write(c, "bob", "../escape.md", "x").status_code == 400
+    assert kb_write(c, "bob", ".git/config", "x").status_code == 400
+    assert "error" in say(c, "bob", S["dm_bob"], tool("knowledge_read", path="../../etc/passwd"))[-1]["content"]
 
 
 def test_computer_with_approval_gate(c):
@@ -258,11 +365,58 @@ def test_channel_new_bot_joins_remove_sticks_and_mention_only(c):
 
 
 def test_skills(c):
-    args = dict(name="weekly-report", description="Compile the weekly report", instructions="1. collect 2. write")
-    assert "only the owner or a manager" in say(c, "bob", S["dm_bob"], tool("save_skill", **args))[-1]["content"]
-    assert "saved" in say(c, "alice", S["dm_alice"], tool("save_skill", **args))[-1]["content"]
+    args = dict(action="create", name="weekly-report", description="Compile the weekly report",
+                instructions="1. collect 2. write")
+    # every person who can use the bot may let it save and fix skills
+    assert "saved in skills/weekly-report.md" in say(c, "bob", S["dm_bob"], tool("skill_manage", **args))[-1]["content"]
     assert say(c, "bob", S["dm_bob"], "RECALL weekly-report: Compile the weekly report")[-1]["content"] == "yes"
-    assert "1. collect" in say(c, "bob", S["dm_bob"], tool("use_skill", name="weekly-report"))[-1]["content"]
+    assert say(c, "bob", S["dm_bob"], "RECALL <available_skills>")[-1]["content"] == "yes"
+    assert "updated" in say(c, "carol", S["dm_carol"], tool("skill_manage", action="patch", name="weekly-report",
+                                                            old_text="2. write", new_text="2. write 3. send"))[-1]["content"]
+    assert "3. send" in say(c, "bob", S["dm_bob"], tool("use_skill", name="weekly-report"))[-1]["content"]
+    # the older tool name still works
+    assert "saved" in say(c, "alice", S["dm_alice"], tool("save_skill", name="standup", description="d",
+                                                          instructions="say hi"))[-1]["content"]
+    k = next(x for x in c.get(f"/api/bots/{S['bot']}/skills", headers=H("carol")).json() if x["name"] == "standup")
+    assert k["path"] == "skills/standup.md"
+    f = kb_read(c, "carol", k["path"])
+    assert kb_write(c, "carol", k["path"], f["content"].replace("say hi", "say hello"), f["hash"]).status_code == 200
+    assert "say hello" in say(c, "bob", S["dm_bob"], tool("use_skill", name="standup"))[-1]["content"]
+    f = kb_read(c, "carol", k["path"])
+    assert c.delete(f"/api/bots/{S['bot']}/knowledge/file", params={"path": k["path"], "base_hash": f["hash"]},
+                    headers=H("carol")).status_code == 200
+    assert "no such skill" in say(c, "bob", S["dm_bob"], tool("use_skill", name="standup"))[-1]["content"]
+
+
+def test_project_context_prompt_preview_and_stable_prompt(c):
+    # AGENTS.md lives in the knowledge base; every member may edit it and every bot gets it.
+    r = kb_write(c, "carol", "AGENTS.md", "# Project\nWe ship on Fridays.")
+    assert r.status_code == 200, r.text
+    assert kb_read(c, "bob", "AGENTS.md")["content"].endswith("We ship on Fridays.")
+    assert say(c, "bob", S["dm_bob"], "RECALL We ship on Fridays.")[-1]["content"] == "yes"
+    assert say(c, "bob", S["dm_bob"], f"RECALL AGENTS.md (hash {r.json()['hash']})")[-1]["content"] == "yes"
+    # a bot that fixes AGENTS.md with the hash from its prompt is seen on the next turn
+    out = say(c, "bob", S["dm_bob"], tool("knowledge_patch", path="AGENTS.md", old_text="Fridays",
+                                         new_text="Mondays", base_hash=r.json()["hash"]))[-1]["content"]
+    assert out.startswith("RESULT: saved AGENTS.md")
+    assert say(c, "bob", S["dm_bob"], "RECALL We ship on Mondays.")[-1]["content"] == "yes"
+    # a secret pasted into a knowledge file is held back
+    leak = kb_write(c, "carol", "notes/keys.md", "token ghp_" + "a" * 36)
+    assert leak.status_code == 409 and leak.json()["detail"]["code"] == "secret"
+    # the prompt preview is open to every member and shows the sections with their sizes
+    prev = c.get(f"/api/bots/{S['bot']}/prompt-preview", headers=H("carol"))
+    assert prev.status_code == 200, prev.text
+    names = {x["name"] for x in prev.json()["sections"]}
+    assert {"identity", "project_context", "team_memory", "user_profile", "knowledge_index", "setup"} <= names
+    assert prev.json()["chars"] <= prev.json()["limit"]
+    # one prompt per turn: the tool step and the answer after it see the same system prompt
+    import mock_llm
+    mock_llm.SEEN["systems"] = []
+    say(c, "bob", S["dm_bob"], tool("use_skill", name="weekly-report"))
+    seen = [x for x in mock_llm.SEEN["systems"] if x.startswith("You are Helper")]
+    assert len(seen) == 2 and seen[0] == seen[1]
+    assert mock_llm.SEEN["stamps"] > 0  # the current time travels with the newest message, not the prompt
+
 
 
 def test_cron_in_plain_words():
@@ -350,7 +504,10 @@ def test_secrets_stay_outside_sandbox_and_model(c):
     assert "s3cret" not in c.get(f"/api/bots/{S['bot']}/secrets", headers=H("alice")).text
     # the model knows the name and the bound host, never the value
     assert say(c, "bob", S["dm_bob"], "RECALL API_TOKEN (hosts: 127.0.0.1)")[-1]["content"] == "yes"
-    assert say(c, "bob", S["dm_bob"], "RECALL s3cret-value")[-1]["content"] == "no"
+    assert "s3cret-value" not in c.get(f"/api/bots/{S['bot']}/prompt-preview", headers=H("bob")).text
+    # every member may change the bot, so typing a stored value is caught as a leak for Bob too
+    r = c.post(f"/api/conversations/{S['dm_bob']}/messages", json={"content": "it is s3cret-value"}, headers=H("bob"))
+    assert r.status_code == 409 and r.json()["detail"]["found"][0]["name"] == "API_TOKEN"
     # not in the sandbox
     out = say(c, "alice", S["dm_alice"], tool("run_command", command="echo token=[$API_TOKEN]"))[-1]["content"]
     assert "token=[]" in out
@@ -500,10 +657,10 @@ def test_secret_in_chat_is_held_back(c):
     # ordinary text, placeholders and commit hashes pass
     for ok in ("the token is required for this", "use {{secret:API_TOKEN}} here", "see commit 4ceeefdedfb5e28842f2987bc0fe13105904c72b"):
         assert send("bob", dm, ok).status_code == 200, ok
-    # a stored secret's value is recognised by name, but only for someone who manages the bot
+    # a stored secret's value is recognised by name for everyone who may change the bot (any member using it)
     c.post(f"/api/bots/{S['bot']}/secrets", headers=H("alice"), json={"name": "DOOR_CODE", "value": "open-sesame", "hosts": "x.test"})
     assert send("alice", S["dm_alice"], "it is open-sesame").json()["detail"]["found"][0]["name"] == "DOOR_CODE"
-    assert send("bob", dm, "it is open-sesame").status_code == 200
+    assert send("bob", dm, "it is open-sesame").json()["detail"]["found"][0]["name"] == "DOOR_CODE"
     # the person can still decide to send it
     assert send("bob", dm, f"dummy {token}", allow_secret=True).status_code == 200
     agent_idle = lambda: not c.get(f"/api/conversations/{dm}/state", headers=H("bob")).json()["running"]  # noqa: E731
