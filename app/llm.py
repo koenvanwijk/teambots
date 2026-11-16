@@ -336,6 +336,9 @@ async def chat(ep: Endpoint, model: str, messages: list[dict], tools: list[dict]
     if (getattr(ep, "provider", "openai") == "router") and not _routed:
         from . import llm_router
         return await llm_router.chat(ep, model, messages, tools, max_tokens=max_tokens)
+    from . import prompt
+    # The current time and model-specific guidance (agent turns only), now that the model is known.
+    messages = prompt.apply_call_extras(messages, model or ep.default_model or "", bool(tools))
     if getattr(ep, "provider", "openai") == "github_copilot":
         from . import copilot
         return await copilot.chat(ep, model, messages, tools, max_tokens=max_tokens)

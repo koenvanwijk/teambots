@@ -10,6 +10,7 @@ browser profile, its `gh` login). This gathers both.
 It produces  teambots-project-p<id>-<stamp>.tgz  containing:
     project.json     every database row scoped to the project, plus the users it references
     workspace.tgz    the project's workspace volume (tb-p<id>), if present
+    knowledge.tgz    the project's knowledge base with its git history (data/knowledge/p<id>), if present
     MANIFEST.json    project id/name, export time, and a fingerprint of the secret key
 
 Secrets (bot secrets, endpoint API keys, MCP headers) stay ENCRYPTED in the export. They
@@ -161,6 +162,10 @@ def main():
         with open(os.path.join(tmp, "project.json"), "w") as f:
             json.dump(data, f, indent=2, default=str)
         vol_kind = export_volume(team_id, os.path.join(tmp, "workspace.tgz"))
+        kb_dir = os.path.join(os.environ.get("TB_DATA_DIR", os.path.join(HERE, "data")), "knowledge", f"p{team_id}")
+        if os.path.isdir(kb_dir):  # AGENTS.md, memory, profiles and skills, with who changed what
+            with tarfile.open(os.path.join(tmp, "knowledge.tgz"), "w:gz") as t:
+                t.add(kb_dir, arcname=".")
         manifest = {
             "teambots_export": 1,
             "project_id": team_id,
@@ -168,6 +173,7 @@ def main():
             "exported_at": stamp,
             "row_counts": {k: len(v) for k, v in data.items()},
             "workspace": vol_kind,
+            "knowledge": os.path.isdir(kb_dir),
             "secret_key_fp": secret_key_fingerprint(),
             "note": "secrets are encrypted with the source TB_SECRET_KEY; the target must share it to decrypt.",
         }
@@ -176,7 +182,7 @@ def main():
 
         out_tgz = os.path.join(args.out, f"teambots-project-p{team_id}-{stamp}.tgz")
         with tarfile.open(out_tgz, "w:gz") as t:
-            for fn in ("MANIFEST.json", "project.json", "workspace.tgz"):
+            for fn in ("MANIFEST.json", "project.json", "workspace.tgz", "knowledge.tgz"):
                 p = os.path.join(tmp, fn)
                 if os.path.exists(p):
                     t.add(p, arcname=fn)
