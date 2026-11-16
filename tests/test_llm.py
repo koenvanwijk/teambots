@@ -135,3 +135,50 @@ def test_local_5xx_is_retried_once(monkeypatch):
     assert out["content"] == "ok after retry"
     assert hits["n"] == 2
     server.should_exit = True
+
+
+def test_trim_messages_drops_leading_tool_call_group():
+    """Copilot returns HTTP 400 if the history starts with assistant tool_calls."""
+    from app.llm import trim_messages
+
+    tc = [{"id": "1", "type": "function", "function": {"name": "read_file", "arguments": "{}"}}]
+    msgs = [
+        {"role": "assistant", "content": "", "tool_calls": tc},
+        {"role": "tool", "tool_call_id": "1", "content": "hello"},
+        {"role": "user", "content": "kun je de screenshot zien?"},
+    ]
+    # Under budget: still drop the leading tool-call group.
+    out = trim_messages(msgs, budget=50_000)
+    assert out[0]["role"] == "user"
+    assert out[0]["content"] == "kun je de screenshot zien?"
+    assert len(out) == 1
+
+    # Over budget: keep the latest user and do not start on a tool-call group.
+    prefix = []
+    for i in range(20):
+        prefix += [
+            {"role": "assistant", "content": "", "tool_calls": [
+                {"id": str(i), "type": "function", "function": {"name": "x", "arguments": "{}"}}]},
+            {"role": "tool", "tool_call_id": str(i), "content": "T" * 500},
+        ]
+    msgs = prefix + [{"role": "user", "content": "latest"}]
+    out = trim_messages(msgs, budget=2_000)
+    assert out[-1]["content"] == "latest"
+    assert out[0]["role"] == "user"
+    assert not (out[0].get("role") == "assistant" and out[0].get("tool_calls"))
+
+
+def test_format_http_error_reads_json_in_text_plain():
+    import httpx
+    from app.llm import format_http_error
+
+    req = httpx.Request("POST", "http://example/chat/completions")
+    r = httpx.Response(
+        400,
+        text='{"error":{"message":"type has to be either \'image_url\' or \'text\'","code":"invalid_request_body"}}',
+        request=req,
+        headers={"content-type": "text/plain; charset=utf-8"},
+    )
+    msg = format_http_error(r, "ICT Copilot")
+    assert "type has to be either 'image_url' or 'text'" in msg
+    assert "HTTP 400" in msg

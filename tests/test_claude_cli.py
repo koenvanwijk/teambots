@@ -30,6 +30,7 @@ def opt(name):
     return argv[argv.index(name) + 1] if name in argv else ""
 model = opt("--model")
 system = opt("--system-prompt")
+fmt = opt("--input-format")
 prompt = sys.stdin.read()
 usage = {{"input_tokens": 11, "output_tokens": 5, "cache_read_input_tokens": 2,
           "cache_creation_input_tokens": 0}}
@@ -65,7 +66,8 @@ if model == "nocost":
 print(json.dumps({{"is_error": False, "subtype": "success",
                    "total_cost_usd": 0.004,
                    "usage": usage,
-                   "result": "  echo model={{}} system={{}} prompt={{}}  ".format(model, system, prompt)}}))
+                   "result": "  echo model={{}} system={{}} prompt={{}}{{}}  ".format(
+                       model, system, prompt, (" input_format=" + fmt if fmt else ""))}}))
 '''
 
 
@@ -255,3 +257,50 @@ def test_compute_cost_uses_cli_amount_or_subscription_unknown():
     assert priced["billing_mode"] == "subscription" and priced["cost_usd"] == 0.0123 and not priced["cost_unknown"]
     unknown = usage.compute_cost(provider="claude_cli", model="sonnet", endpoint=None)
     assert unknown["billing_mode"] == "subscription" and unknown["cost_unknown"] and unknown["cost_usd"] is None
+
+
+TINY_PNG_B64 = (
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8"
+    "z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="
+)
+
+
+def test_image_blocks_from_messages():
+    from app import claude_cli
+    blocks = claude_cli.image_blocks_from_messages([
+        {"role": "user", "content": [
+            {"type": "text", "text": "[screenshot]"},
+            {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{TINY_PNG_B64}"}},
+        ]}
+    ])
+    assert len(blocks) == 1
+    assert blocks[0]["type"] == "image"
+    assert blocks[0]["source"]["media_type"] == "image/png"
+    assert blocks[0]["source"]["data"] == TINY_PNG_B64
+    assert claude_cli.image_blocks_from_messages([{"role": "user", "content": "hi"}]) == []
+
+
+def test_build_stdin_text_path_unchanged():
+    from app import claude_cli
+    system, stdin, fmt = claude_cli.build_stdin([
+        {"role": "system", "content": "You are Bob."},
+        {"role": "user", "content": "Hi"},
+    ])
+    assert system == "You are Bob."
+    assert fmt is None
+    assert stdin.decode() == "User: Hi\n\nAssistant:"
+
+
+def test_chat_sends_images_via_stream_json(mod):
+    out = asyncio.run(mod.chat(_ep(), "sonnet", [
+        {"role": "user", "content": [
+            {"type": "text", "text": "kun je de screenshot zien?"},
+            {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{TINY_PNG_B64}"}},
+        ]}
+    ]))
+    assert "input_format=stream-json" in out["content"]
+    assert TINY_PNG_B64 in out["content"]
+    assert "kun je de screenshot zien?" in out["content"]
+    assert '"type": "image"' in out["content"] or '"type":"image"' in out["content"]
+    # Flattened placeholder is not the only signal: pixels travelled in the image block.
+    assert out["content"].count(TINY_PNG_B64) >= 1

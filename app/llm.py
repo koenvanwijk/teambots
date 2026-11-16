@@ -1,5 +1,6 @@
 """Client for any OpenAI-compatible /chat/completions endpoint (vLLM, Ollama, LiteLLM, ...)."""
 import asyncio
+import json
 import logging
 import re
 
@@ -35,9 +36,28 @@ def redact_error(text: str, limit: int = 800) -> str:
     return text[:limit]
 
 
+def _http_error_detail(text: str) -> str:
+    """Prefer a JSON error message, even when the gateway sent it as text/plain."""
+    body = (text or "").strip()
+    if body.startswith("{") or body.startswith("["):
+        try:
+            data = json.loads(body)
+        except ValueError:
+            return body
+        if isinstance(data, dict):
+            err = data.get("error")
+            if isinstance(err, dict) and err.get("message"):
+                return str(err["message"])
+            if isinstance(err, str) and err.strip():
+                return err
+            if data.get("message"):
+                return str(data["message"])
+    return body
+
+
 def format_http_error(r: httpx.Response, ep_name: str, limit: int = 800) -> str:
     """HTTP status plus the response body (or reason phrase if the body is empty)."""
-    body = redact_error((r.text or "").strip(), limit)
+    body = redact_error(_http_error_detail(r.text or ""), limit)
     reason = (r.reason_phrase or "").strip()
     detail = body or reason or "no body"
     return f"endpoint '{ep_name}' returned HTTP {r.status_code}: {detail}"
@@ -132,12 +152,37 @@ def _msg_chars(m: dict) -> int:
     return len(str(c or "")) + len(m.get("tool_calls") and str(m.get("tool_calls")) or "")
 
 
+def _has_tool_calls(m: dict) -> bool:
+    return bool(m.get("role") == "assistant" and m.get("tool_calls"))
+
+
+def _drop_leading_tool_groups(kept: list[dict]) -> list[dict]:
+    """Drop a leading assistant tool-call group (and orphan tool results).
+
+    GitHub Copilot returns an opaque HTTP 400 "Bad Request" when the messages
+    array starts with an assistant message that has tool_calls, even if a user
+    message follows later. Orphan tool results at the cut are already invalid.
+    """
+    while kept:
+        if kept[0].get("role") == "tool":
+            kept.pop(0)
+            continue
+        if _has_tool_calls(kept[0]):
+            kept.pop(0)
+            while kept and kept[0].get("role") == "tool":
+                kept.pop(0)
+            continue
+        break
+    return kept
+
+
 def trim_messages(messages: list[dict], budget: int = HISTORY_TEXT_BUDGET,
                   tool_max: int = TOOL_RESULT_MAX_CHARS) -> list[dict]:
     """Cap tool results and drop the oldest messages when the history is too long.
 
     The latest user message is always kept. A tool-call group is not split: leading
-    orphan tool messages after a cut are dropped.
+    orphan tool messages after a cut are dropped, and a leading assistant tool-call
+    group is dropped so the request does not start with tool_calls (Copilot 400).
     """
     trimmed = []
     for m in messages or []:
@@ -146,22 +191,23 @@ def trim_messages(messages: list[dict], budget: int = HISTORY_TEXT_BUDGET,
         else:
             trimmed.append(m)
     if sum(_msg_chars(m) for m in trimmed) <= budget:
-        return trimmed
-    kept, total = [], 0
-    for m in reversed(trimmed):
-        n = _msg_chars(m)
-        if kept and total + n > budget:
-            break
-        kept.append(m)
-        total += n
-    kept.reverse()
-    while kept and kept[0].get("role") == "tool":
-        kept.pop(0)
+        kept = list(trimmed)
+    else:
+        kept, total = [], 0
+        for m in reversed(trimmed):
+            n = _msg_chars(m)
+            if kept and total + n > budget:
+                break
+            kept.append(m)
+            total += n
+        kept.reverse()
+    kept = _drop_leading_tool_groups(kept)
     if not any(m.get("role") == "user" for m in kept):
         for m in reversed(trimmed):
             if m.get("role") == "user":
                 kept.insert(0, m)
                 break
+        kept = _drop_leading_tool_groups(kept)
     return kept or trimmed[-1:]
 
 

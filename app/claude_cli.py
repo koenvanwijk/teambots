@@ -65,6 +65,44 @@ def _content_text(content) -> str:
     return content or ""
 
 
+def _data_url_to_image_block(url: str | None) -> dict | None:
+    """Turn a data:image/...;base64,... URL into an Anthropic image content block."""
+    if not url or not isinstance(url, str) or not url.startswith("data:"):
+        return None
+    header, _, data = url.partition(",")
+    if not data or ";base64" not in header:
+        return None
+    mime = header[5:].split(";")[0].strip().lower() or "image/png"
+    if mime not in ("image/png", "image/jpeg", "image/jpg", "image/gif", "image/webp"):
+        return None
+    if mime == "image/jpg":
+        mime = "image/jpeg"
+    return {"type": "image", "source": {"type": "base64", "media_type": mime, "data": data}}
+
+
+def image_blocks_from_messages(messages: list[dict] | None) -> list[dict]:
+    """Collect Anthropic image blocks from OpenAI-style image_url (or image) parts."""
+    blocks = []
+    for m in messages or []:
+        content = m.get("content")
+        if not isinstance(content, list):
+            continue
+        for p in content:
+            if not isinstance(p, dict):
+                continue
+            if p.get("type") == "image" and isinstance(p.get("source"), dict):
+                blocks.append({"type": "image", "source": p["source"]})
+                continue
+            url = None
+            if p.get("type") in ("image_url", "image") or "image_url" in p:
+                img = p.get("image_url")
+                url = img.get("url") if isinstance(img, dict) else img
+            block = _data_url_to_image_block(url if isinstance(url, str) else None)
+            if block:
+                blocks.append(block)
+    return blocks
+
+
 def _tool_schema_text(tools: list[dict] | None) -> str:
     if not tools:
         return ""
@@ -261,7 +299,7 @@ async def list_models(ep: Endpoint) -> list[dict]:  # noqa: ARG001 - signature p
     return [dict(m) for m in _MODELS]
 
 
-def _cli_argv(chosen: str, system_prompt: str) -> list[str]:
+def _cli_argv(chosen: str, system_prompt: str, *, input_format: str | None = None) -> list[str]:
     argv = [config.CLAUDE_CLI_BIN, "-p",
             "--output-format", "json",
             "--max-turns", "1",
@@ -271,6 +309,8 @@ def _cli_argv(chosen: str, system_prompt: str) -> list[str]:
                             # tool turn that --max-turns 1 would cut off (error_max_turns).
                             # TeamBots tools are offered via the JSON protocol in the prompt.
             "--permission-mode", "dontAsk"]
+    if input_format:
+        argv += ["--input-format", input_format]
     if chosen:
         argv += ["--model", chosen]
     if system_prompt:
@@ -278,19 +318,43 @@ def _cli_argv(chosen: str, system_prompt: str) -> list[str]:
     return argv
 
 
+def build_stdin(messages: list[dict], tools: list[dict] | None = None) -> tuple[str, bytes, str | None]:
+    """Return (system prompt, stdin bytes, input format or None).
+
+    Text-only turns keep the existing flattened transcript on stdin. When the
+    history has image content parts, the CLI is driven with ``--input-format
+    stream-json`` and Anthropic image blocks, because print-mode stdin text
+    would drop the pixels and leave only a placeholder such as ``[screenshot]``.
+    """
+    system_prompt, prompt = build_prompt(messages, tools)
+    images = image_blocks_from_messages(messages)
+    if not images:
+        return system_prompt, prompt.encode(), None
+    text = prompt
+    if text.endswith("\n\nAssistant:"):
+        text = text[: -len("\n\nAssistant:")]
+    if not text.strip():
+        text = "The user attached an image."
+    event = {
+        "type": "user",
+        "message": {"role": "user", "content": [{"type": "text", "text": text}] + images},
+    }
+    return system_prompt, (json.dumps(event) + "\n").encode(), "stream-json"
+
+
 async def chat(ep: Endpoint, model: str, messages: list[dict], tools: list[dict] | None = None,
                max_tokens: int | None = None) -> dict:  # noqa: ARG001 - max_tokens unused by the CLI
     """Run one headless completion through the Claude CLI. Returns {content, tool_calls} and logs usage."""
     from . import usage
-    system_prompt, prompt = build_prompt(messages, tools)
+    system_prompt, stdin, input_format = build_stdin(messages, tools)
     chosen = (model or ep.default_model or "").strip()
     timer = usage.Timer()
     tokens: dict = {}
-    if not prompt.strip():
+    if not stdin.strip() and not input_format:
         usage.log_call(endpoint=ep, model=chosen, tokens=tokens, latency_ms=timer.ms(),
                        success=True, notes="empty prompt; CLI not invoked")
         return {"content": "", "tool_calls": []}
-    argv = _cli_argv(chosen, system_prompt)
+    argv = _cli_argv(chosen, system_prompt, input_format=input_format)
     try:
         proc = await asyncio.create_subprocess_exec(
             *argv, cwd=_cwd(),
@@ -307,7 +371,7 @@ async def chat(ep: Endpoint, model: str, messages: list[dict], tools: list[dict]
         raise LLMError(f"cannot start the claude CLI: {e.__class__.__name__}") from e
     try:
         out, err = await asyncio.wait_for(
-            proc.communicate(prompt.encode()), timeout=config.LLM_TIMEOUT)
+            proc.communicate(stdin), timeout=config.LLM_TIMEOUT)
     except asyncio.TimeoutError as e:
         try:
             proc.kill()
