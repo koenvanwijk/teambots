@@ -132,10 +132,57 @@ async def write_file(key: str, path: str, content: str) -> str:
     return f"wrote {len(content)} characters to {path}" if code == 0 else f"error: {out}"
 
 
+_PNG = b"\x89PNG\r\n\x1a\n"
+_JPEG = b"\xff\xd8\xff"
+_GIF87, _GIF89 = b"GIF87a", b"GIF89a"
+_WEBP = b"WEBP"
+
+
+def describe_non_text_file(data: bytes, path: str) -> str | None:
+    """If `data` is an image or other binary, return a short note instead of the bytes."""
+    kind = ""
+    extra = ""
+    if data.startswith(_PNG):
+        kind = "PNG image"
+        if len(data) >= 24:
+            import struct
+            width, height = struct.unpack(">II", data[16:24])
+            extra = f", {width}x{height}"
+    elif data.startswith(_JPEG):
+        kind = "JPEG image"
+    elif data.startswith(_GIF87) or data.startswith(_GIF89):
+        kind = "GIF image"
+    elif data.startswith(b"RIFF") and len(data) >= 12 and data[8:12] == _WEBP:
+        kind = "WEBP image"
+    if kind:
+        return (f"{path} is a {kind} ({len(data)} bytes{extra}). "
+                "read_file only returns text; the image bytes were not included. "
+                "If the user attached this image in the chat, it is sent separately.")
+    head = data[:8192]
+    if b"\x00" in head:
+        return (f"{path} is a binary file ({len(data)} bytes), not text. "
+                "The contents were not included.")
+    try:
+        data.decode("utf-8")
+    except UnicodeDecodeError:
+        return (f"{path} is not valid UTF-8 text ({len(data)} bytes). "
+                "The contents were not included.")
+    return None
+
+
 async def read_file(key: str, path: str) -> str:
     path = _check_path(path)
-    code, out = await sb_exec(key, ["cat", "--", path])
-    return out if code == 0 else f"error: {out}"
+    code, out = await sb_exec(key, ["cat", "--", path], raw=True)
+    if code != 0:
+        text = out.decode(errors="replace") if isinstance(out, (bytes, bytearray)) else str(out)
+        return f"error: {text}"
+    note = describe_non_text_file(out, path)
+    if note:
+        return note
+    text = out.decode()
+    if len(text) > MAX_OUTPUT:
+        text = text[:MAX_OUTPUT // 2] + "\n[... output truncated ...]\n" + text[-MAX_OUTPUT // 2:]
+    return text
 
 
 async def sandbox_addr(key: str) -> str:
