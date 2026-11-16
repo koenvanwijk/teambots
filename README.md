@@ -157,6 +157,7 @@ TeamBots is meant to sit behind a TLS reverse proxy. It honours `X-Forwarded-Pro
 | `TB_SANDBOX_IMAGE` | `teambots-sandbox:latest` | Image for the bots' computers |
 | `TB_SANDBOX_NETWORK` | `bridge` | Docker network for sandboxes (`none` = offline) |
 | `TB_SANDBOX_RUNTIME` | empty | Container runtime for sandboxes, e.g. `runsc` for gVisor (must be installed on the host). Sandboxes made under another runtime are recreated on first use; the workspace volume is kept |
+| `TB_SANDBOX_RESOLV_CONF` | empty | Host path of a `resolv.conf` mounted read-only into sandboxes. Required with gVisor on a user-defined network (such as `teambots`): Docker's embedded DNS needs iptables inside the container, which gVisor ignores. Set it before the sandboxes are (re)created |
 | `TB_SANDBOXD_SOCKET` | empty | Unix socket of sandboxd. When set, the app has no Docker access and asks sandboxd to run sandbox commands (both compose files set this) |
 | `TB_BROWSER` | `google-chrome` | Browser binary inside the sandbox (`google-chrome` by default; set `chromium` to use Debian Chromium). Runs as user `bot` with `--no-sandbox` because the container drops capabilities. The profile is stored on the project volume under `.screens/bot<id>` |
 | `TB_HTTP_ALLOW_PRIVATE` | `0` | `1` lets `http_request` reach private addresses and send secrets over http (development) |

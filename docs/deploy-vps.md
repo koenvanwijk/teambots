@@ -70,11 +70,31 @@ echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/gviso
   > /etc/apt/sources.list.d/gvisor.list
 apt-get update && apt-get install -y runsc
 runsc install                      # voegt de runtime toe aan /etc/docker/daemon.json
-systemctl restart docker           # herstart ook alle containers
+systemctl reload docker            # laadt de runtime zonder containers te herstarten
 docker run --rm --runtime=runsc hello-world   # controle
 ```
 
-Zet daarna `TB_SANDBOX_RUNTIME=runsc` in `.env`. Bestaande sandboxes worden
+`systemctl reload docker` is genoeg om de runtime te laden; een herstart
+(en dus downtime) is niet nodig.
+
+Onder gVisor werkt de ingebouwde DNS van Docker (`127.0.0.11`) niet op het
+netwerk `teambots`: die leunt op iptables in de container, en gVisor negeert
+die. Geef de sandboxes daarom een eigen `resolv.conf` met de resolvers van
+Hetzner (dezelfde waar Docker tot nu toe naar doorstuurde):
+
+```bash
+mkdir -p /etc/teambots
+printf "nameserver 185.12.64.1\nnameserver 185.12.64.2\n" > /etc/teambots/sandbox-resolv.conf
+```
+
+Zet daarna in `.env`:
+
+```
+TB_SANDBOX_RUNTIME=runsc
+TB_SANDBOX_RESOLV_CONF=/etc/teambots/sandbox-resolv.conf
+```
+
+Bestaande sandboxes worden
 bij het eerstvolgende gebruik onder gVisor opnieuw aangemaakt; de
 werkruimte (het volume) blijft bewaard, lopende processen zoals een open
 browser niet.

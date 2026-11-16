@@ -42,6 +42,7 @@ services:
       TB_SANDBOX_IMAGE: teambots-sandbox:latest
       TB_SANDBOX_NETWORK: teambots
       TB_SANDBOX_RUNTIME: ${TB_SANDBOX_RUNTIME:-}
+      TB_SANDBOX_RESOLV_CONF: ${TB_SANDBOX_RESOLV_CONF:-}
       TB_DATA_DIR: /tmp/sandboxd
     volumes:
       - sandboxd-run:/run/teambots

@@ -20,6 +20,7 @@ services:
     environment:
       TB_SANDBOX: docker
       TB_SANDBOX_RUNTIME: ${TB_SANDBOX_RUNTIME:-}
+      TB_SANDBOX_RESOLV_CONF: ${TB_SANDBOX_RESOLV_CONF:-}
       TB_DATA_DIR: /tmp/sandboxd
     volumes:
       - sandboxd-run:/run/teambots
