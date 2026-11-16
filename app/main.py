@@ -24,6 +24,11 @@ STATIC = os.path.join(os.path.dirname(__file__), "static")
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     init_db()
+    from . import memory
+    try:  # memory and skills moved from the database to a git-backed knowledge base per project
+        memory.migrate_all()
+    except Exception:  # noqa: BLE001 - e.g. git missing: knowledge bases are then created on first use
+        logging.getLogger("teambots").exception("knowledge base migration failed")
     routines.start()
     yield
     routines.stop()

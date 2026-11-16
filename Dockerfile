@@ -1,8 +1,9 @@
 FROM python:3.12-slim
 # The docker CLI lets the app start one sandbox container per user/channel on the host daemon.
 # curl is used to install the official Claude Code CLI; credentials are not baked in.
+# git keeps the history of every project knowledge base (app/knowledge.py).
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        docker.io curl ca-certificates sqlite3 \
+        docker.io curl ca-certificates sqlite3 git \
     && curl -fsSL https://claude.ai/install.sh | bash \
     && ln -sf /root/.local/bin/claude /usr/local/bin/claude \
     && command -v claude \

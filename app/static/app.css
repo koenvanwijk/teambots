@@ -389,3 +389,8 @@ dialog.dlg.wide { width:min(820px, calc(100vw - 28px)); }
 .promptsec { border-bottom:1px solid var(--line); padding:8px 0; }
 .promptsec summary { cursor:pointer; font-size:14px; }
 .promptsec pre { margin:8px 0 4px; font:12.5px/1.5 var(--mono); white-space:pre-wrap; overflow-wrap:anywhere; max-height:320px; overflow:auto; background:var(--s1); border-radius:9px; padding:8px 10px; }
+.kbfile { cursor:pointer; }
+.kbfile:hover { background:var(--s1); }
+.kbdir .tx { font-weight:600; }
+.kbconflict:not(:empty) { border:1px solid var(--bad, #c0392b); border-radius:9px; padding:8px 10px; margin:0 0 10px; }
+.kbconflict pre, pre.kbview { font:12.5px/1.5 var(--mono); white-space:pre-wrap; overflow-wrap:anywhere; max-height:280px; overflow:auto; background:var(--s1); border-radius:9px; padding:8px 10px; }

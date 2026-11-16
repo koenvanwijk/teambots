@@ -18,8 +18,8 @@ from sqlalchemy.exc import IntegrityError
 from . import config, llm, mcp_client, sandbox, screen, secrets_http
 from . import prompt as prompt_mod
 from .access import bot_role
-from .db import (Approval, ApprovalRule, Bot, ChannelMember, Conversation, Endpoint, McpServer, Memory,
-                 Message, Routine, Secret, Skill, User, select, session)
+from .db import (Approval, ApprovalRule, Bot, ChannelMember, Conversation, Endpoint, McpServer,
+                 Message, Routine, Secret, User, select, session)
 from .events import publish, publish_bot
 
 log = logging.getLogger("teambots.agent")
@@ -84,26 +84,45 @@ def _fn(name: str, description: str, props: dict, required: list[str]) -> dict:
 
 BUILTIN_TOOLS = [
     _fn("memory", "Change your persistent memory, which is loaded into every conversation. target 'team' is "
-        "shared by everyone in this project; target 'user' is the profile of the person you are talking to. "
-        "Make ALL changes to one target in ONE call as a list of operations: add (content), patch (id or "
-        "old_text, plus content: replaces that text, or the whole entry when only id is given) and remove (id "
-        "or old_text). The batch is applied as a whole and the character budget is checked on the result, so "
-        "one call can remove stale entries and add a new one. Only facts that hold in every conversation; "
-        "steps for a task belong in a skill. If the memory is full the call fails and shows the entries: then "
-        "merge or remove some in the same batch as the add.",
+        "the team notes (knowledge base memory/notes.md, shared by everyone in this project); target 'user' is the "
+        "profile of the person you are talking to (users/<name>.md). Make ALL changes to one target in ONE call "
+        "as a list of operations: add (content), patch (old_text plus content: replaces that text in the entry "
+        "that contains it) and remove (old_text). The batch is applied as a whole and the character budget is "
+        "checked on the result, so one call can remove stale entries and add a new one. Only facts that hold in "
+        "every conversation; steps for a task belong in a skill. If the memory is full the call fails and shows "
+        "the entries: then merge or remove some in the same batch as the add.",
         {"target": {"type": "string", "enum": ["team", "user"]},
          "operations": {"type": "array", "items": {"type": "object", "properties": {
              "action": {"type": "string", "enum": ["add", "patch", "remove"]},
-             "content": {"type": "string"}, "id": {"type": "integer"}, "old_text": {"type": "string"}},
+             "content": {"type": "string"}, "old_text": {"type": "string"},
+             "id": {"type": "integer", "description": "entry number instead of old_text (1 = first entry)"}},
              "required": ["action"]}}},
         ["target", "operations"]),
-    _fn("skill_manage", "Create, fix or delete a skill: reusable steps for a task that comes back. create needs "
-        "name, description (one line) and instructions. patch needs name plus either old_text and new_text (to "
-        "change one part) or a new description / instructions. delete needs name.",
+    _fn("skill_manage", "Create, fix or delete a skill (a file in skills/ of the knowledge base): reusable steps "
+        "for a task that comes back. create needs name, description (one line) and instructions. patch needs "
+        "name plus either old_text and new_text (to change one part) or a new description / instructions. "
+        "delete needs name.",
         {"action": {"type": "string", "enum": ["create", "patch", "delete"]}, "name": {"type": "string"},
          "description": {"type": "string"}, "instructions": {"type": "string"},
          "old_text": {"type": "string"}, "new_text": {"type": "string"}},
         ["action", "name"]),
+    _fn("knowledge_list", "List the directories and files of the project's knowledge base (with sizes and hashes).",
+        {"path": {"type": "string", "description": "a directory, or empty for everything"}}, []),
+    _fn("knowledge_read", "Read a file from the knowledge base. Returns its content and its hash; pass that hash "
+        "as base_hash when you change the file.", {"path": {"type": "string"}}, ["path"]),
+    _fn("knowledge_write", "Create or replace a file in the knowledge base (directories are created as needed). "
+        "To create a new file leave base_hash out; to replace one pass the hash you got from knowledge_read. If "
+        "the file changed since, nothing is written and you get who changed it and a diff.",
+        {"path": {"type": "string"}, "content": {"type": "string"},
+         "base_hash": {"type": "string", "description": "hash of the version you read; omit for a new file"}},
+        ["path", "content"]),
+    _fn("knowledge_patch", "Replace one exact piece of text in a knowledge base file. Needs the hash you read.",
+        {"path": {"type": "string"}, "old_text": {"type": "string"}, "new_text": {"type": "string"},
+         "base_hash": {"type": "string"}}, ["path", "old_text", "new_text", "base_hash"]),
+    _fn("knowledge_delete", "Delete a file (needs the hash you read) or an empty directory from the knowledge base.",
+        {"path": {"type": "string"}, "base_hash": {"type": "string"}}, ["path"]),
+    _fn("knowledge_history", "Who changed a knowledge base file when (git history), newest first.",
+        {"path": {"type": "string", "description": "a file, or empty for the whole knowledge base"}}, []),
     _fn("use_skill", "Load the full instructions of a saved skill before doing that task.",
         {"name": {"type": "string"}}, ["name"]),
     _fn("http_request", "Send an HTTP request from outside the sandbox. This is the only way to use a secret: "
@@ -130,7 +149,7 @@ BUILTIN_TOOLS = [
                                                   "prompt": {"type": "string"}}, ["name", "cron", "prompt"]),
     _fn("set_secret", "Store a secret the person gave you (e.g. an API token) so you can use it later via "
         "http_request as {{secret:NAME}}. Bind it to the hosts it may be sent to. You can never read a stored "
-        "secret back. Owner or manager only.",
+        "secret back.",
         {"name": {"type": "string", "description": "AN_ENV_VAR style: capitals, digits, underscore"},
          "value": {"type": "string"},
          "hosts": {"type": "string", "description": "comma-separated host names it may be sent to"}},
@@ -138,8 +157,7 @@ BUILTIN_TOOLS = [
     _fn("add_mcp_server", "Attach a streamable-HTTP MCP server to yourself; its tools become your tools. "
         "trusted=false (default) makes its tools ask for approval each time. For OAuth, pass client_id "
         "(a pre-registered client — dynamic registration is not used), optional client_secret, scopes, "
-        "and the provider's authorize_url and token_url; each member then signs in themselves. "
-        "Owner or manager only.",
+        "and the provider's authorize_url and token_url; each member then signs in themselves.",
         {"name": {"type": "string", "description": "1-24 chars of a-z, 0-9, _ or -"},
          "url": {"type": "string"}, "trusted": {"type": "boolean"},
          "headers": {"type": "object", "additionalProperties": {"type": "string"},
@@ -312,55 +330,66 @@ async def _screen(ctx: Ctx, name: str, args: dict) -> str:
     return f"error: unknown tool {name}"
 
 
-def _find_skill(s, bot: Bot, name: str) -> Skill | None:
-    name = (name or "").strip()
-    rows = s.exec(select(Skill).where(Skill.bot_id == bot.id)).all()
-    return next((k for k in rows if k.name == name), None) or next(
-        (k for k in rows if k.name.lower() == name.lower()), None)
+def _knowledge_tool(ctx: Ctx, name: str, args: dict) -> str:
+    """The knowledge_* tools, the memory tool and skills: all go through the git-backed store."""
+    from . import knowledge as kb
+    from . import memory as mem
+    with session() as s:
+        bot, user = s.get(Bot, ctx.bot_id), s.get(User, ctx.requester_id)
+    key = kb.key_for(bot)
+    author = kb.acting_as.get() or kb.bot_author(bot)
+    note = f" (for {user.display_name})" if user and author.name.endswith("(bot)") else ""
+    path = args.get("path") or ""
+    try:
+        if name in ("memory", "remember", "forget"):
+            if name == "remember":  # older tool name: one add
+                target = "team" if args.get("scope") == "team" else "user"
+                ops = [{"action": "add", "content": args.get("content", "")}]
+            elif name == "forget":
+                target = "user" if args.get("scope") in ("user", "personal") else "team"
+                ops = [{"action": "remove", "id": args.get("memory_id"), "old_text": args.get("old_text") or ""}]
+            else:
+                target, ops = args.get("target", ""), args.get("operations")
+            if target == "user" and ctx.is_channel:
+                return "error: the user profile cannot be changed from a team chat; use the person's private chat"
+            return mem.apply(key, user, target, ops, author, note)
+        if name in ("skill_manage", "save_skill"):
+            return mem.skill_manage(key, args if name == "skill_manage" else {**args, "action": "create"}, author, note)
+        if name == "use_skill":
+            sk = mem.find_skill(key, args.get("name", ""))
+            return sk["instructions"] if sk else "error: no such skill"
+        if name == "knowledge_list":
+            return kb.listing(key, path)
+        if name == "knowledge_read":
+            r = kb.read(key, path)
+            if not r["exists"]:
+                return f"{r['path']} does not exist (create it with knowledge_write without base_hash)"
+            return f"path: {r['path']}\nhash: {r['hash']}\n---\n{r['content']}"
+        if name == "knowledge_history":
+            rows = kb.history(key, path, 20)
+            return "\n".join(f"{h['short']} {h['date']} {h['author']}: {h['message']}" for h in rows) or "no history"
+        if name == "knowledge_write":
+            r = kb.write(key, path, args.get("content", ""), args.get("base_hash") or None, author,
+                         f"{'Update' if args.get('base_hash') else 'Create'} {kb.clean(path)}{note}")
+            return f"{'created' if r['created'] else 'saved'} {r['path']}, new hash {r['hash']}"
+        if name == "knowledge_patch":
+            r = kb.patch(key, path, args.get("old_text", ""), args.get("new_text", ""), args.get("base_hash"),
+                         author, f"Edit {kb.clean(path)}{note}")
+            return f"saved {r['path']}, new hash {r['hash']}"
+        if name == "knowledge_delete":
+            r = kb.delete(key, path, args.get("base_hash"), author, f"Delete {kb.clean(path)}{note}")
+            return f"deleted {r['path']}"
+    except kb.Conflict as c:
+        if kb.pinned.get() is not None:
+            return "skipped: " + c.info["message"]
+        return kb.describe(c)
+    except kb.KnowledgeError as e:
+        return f"error: {e}"
+    return f"error: unknown tool {name}"
 
 
-def _skill_manage(s, bot: Bot, ctx: Ctx, args: dict) -> str:
-    """Any person who can use the bot may let it create, fix or delete its skills."""
-    action, name = (args.get("action") or "").lower(), (args.get("name") or "").strip()
-    if not name:
-        return "error: name is required"
-    sk = _find_skill(s, bot, name)
-    if action == "create":
-        if not (args.get("instructions") or "").strip():
-            return "error: create needs instructions"
-        if sk:
-            sk.description, sk.instructions = args.get("description") or sk.description, args["instructions"]
-        else:
-            sk = Skill(bot_id=bot.id, name=name, description=args.get("description") or "",
-                       instructions=args["instructions"], created_by=ctx.requester_id)
-        s.add(sk)
-        s.commit()
-        return f"skill '{sk.name}' saved"
-    if not sk:
-        return f"error: no skill named {name!r}"
-    if action == "delete":
-        s.delete(sk)
-        s.commit()
-        return f"skill '{name}' deleted"
-    if action != "patch":
-        return "error: action must be create, patch or delete"
-    old, new = args.get("old_text"), args.get("new_text")
-    if old:
-        if new is None:
-            return "error: patch with old_text needs new_text"
-        n = sk.instructions.count(old)
-        if n != 1:
-            return f"error: old_text must occur exactly once in the instructions (found {n} times)"
-        sk.instructions = sk.instructions.replace(old, new, 1)
-    if args.get("instructions"):
-        sk.instructions = args["instructions"]
-    if args.get("description"):
-        sk.description = args["description"]
-    if not (old or args.get("instructions") or args.get("description")):
-        return "error: patch needs old_text and new_text, or a new description or instructions"
-    s.add(sk)
-    s.commit()
-    return f"skill '{sk.name}' updated"
+KNOWLEDGE_TOOLS = {"memory", "remember", "forget", "skill_manage", "save_skill", "use_skill", "knowledge_list",
+                   "knowledge_read", "knowledge_write", "knowledge_patch", "knowledge_delete", "knowledge_history"}
 
 
 async def _execute(ctx: Ctx, name: str, args: dict, mcp_map: dict) -> str:
@@ -377,40 +406,15 @@ async def _execute(ctx: Ctx, name: str, args: dict, mcp_map: dict) -> str:
         return home_mod.execute_home_tool(ctx.requester_id, name, args)
     if name == "run_command":
         return await sandbox.run_command(ctx.sandbox_key, args["command"], None, float(args.get("timeout") or 60))
+    if name in KNOWLEDGE_TOOLS:
+        return await asyncio.to_thread(_knowledge_tool, ctx, name, args)
     if name == "write_file":
-        out = await sandbox.write_file(ctx.sandbox_key, args["path"], args["content"])
-        if not ctx.is_home and args["path"].strip().lstrip("./") == "AGENTS.md":
-            from . import prompt
-            prompt.invalidate_project_context(ctx.team_id)
-        return out
+        return await sandbox.write_file(ctx.sandbox_key, args["path"], args["content"])
     if name == "read_file":
         return await sandbox.read_file(ctx.sandbox_key, args["path"])
 
     with session() as s:
         bot = s.get(Bot, ctx.bot_id)
-        role = bot_role(s, ctx.requester_id, bot)
-        manages = role in ("owner", "manager")
-        if name in ("memory", "remember", "forget"):
-            from . import memory as mem
-            if name == "remember":  # older tool name: one add
-                target = "team" if args.get("scope") == "team" else "user"
-                ops = [{"action": "add", "content": args.get("content", "")}]
-            elif name == "forget":
-                m = s.get(Memory, int(args.get("memory_id") or 0))
-                if not m:
-                    return "error: no such memory"
-                target = "team" if m.scope == "team" else "user"
-                ops = [{"action": "remove", "id": m.id}]
-            else:
-                target, ops = args.get("target", ""), args.get("operations")
-            if target == "user" and ctx.is_channel:
-                return "error: the user profile cannot be changed from a team chat; use the person's private chat"
-            return mem.apply(s, bot, ctx.requester_id, target, ops)
-        if name in ("skill_manage", "save_skill"):
-            return _skill_manage(s, bot, ctx, args if name == "skill_manage" else {**args, "action": "create"})
-        if name == "use_skill":
-            sk = _find_skill(s, bot, args.get("name", ""))
-            return sk.instructions if sk else "error: no such skill"
         if name == "create_routine":
             from . import routines
             routines.cron_trigger(args["cron"])  # raises ValueError on a bad expression
@@ -421,8 +425,6 @@ async def _execute(ctx: Ctx, name: str, args: dict, mcp_map: dict) -> str:
             routines.sync(r)
             return f"routine '{r.name}' scheduled ({r.cron})"
         if name == "set_secret":
-            if not manages:
-                return "error: only the owner or a manager of this bot can set secrets"
             sname = (args.get("name") or "").strip()
             if not re.fullmatch(r"[A-Z_][A-Z0-9_]{0,63}", sname):
                 return "error: name must look like AN_ENV_VAR (capitals, digits, underscore)"
@@ -435,8 +437,6 @@ async def _execute(ctx: Ctx, name: str, args: dict, mcp_map: dict) -> str:
             s.commit()
             return f"secret {sname} stored (only sent to: {hosts}). You cannot read its value back."
         if name == "add_mcp_server":
-            if not manages:
-                return "error: only the owner or a manager of this bot can add MCP servers"
             mname = (args.get("name") or "").strip()
             if not re.fullmatch(r"[a-z0-9_-]{1,24}", mname):
                 return "error: name must be 1-24 chars of a-z, 0-9, _ or -"
