@@ -69,7 +69,7 @@ async function api(method, path, body) {
 const withToken = path => '/api' + path + (path.includes('?') ? '&' : '?') + 'token=' + encodeURIComponent(S.token);
 function toast(text, kind = '') {
   let box = el('toasts'); if (!box) document.body.append(box = $('div', { id: 'toasts' }));
-  const t = $('div', { className: 'toast ' + kind, textContent: text, role: 'status' }); box.append(t);
+  const t = $('div', { className: 'toast ' + kind, role: 'status' }, ...[].concat(text)); box.append(t);
   setTimeout(() => t.remove(), kind === 'bad' ? 6000 : 3200);
 }
 const guard = fn => async (...a) => { try { return await fn(...a); } catch (e) { toast(e.message, 'bad'); } };
@@ -85,7 +85,7 @@ function openDialog(cls, ...kids) {
   return d;
 }
 /** A form in a dialog. Resolves with the values (or what onSubmit returns), or null when cancelled. */
-function form({ title, intro, fields, ok = 'Save', onSubmit }) {
+function form({ title, intro, fields, ok = 'Save', onSubmit, extra }) {
   return new Promise(resolve => {
     let result = null; const inputs = {}, err = $('div', { className: 'err', role: 'alert' });
     const values = () => { const v = {}; for (const f of fields) v[f.name] = f.type === 'checkbox' ? inputs[f.name].checked : inputs[f.name].value.trim(); return v; };
@@ -123,7 +123,7 @@ function form({ title, intro, fields, ok = 'Save', onSubmit }) {
     applyWhen();
     const submit = $('button', { className: 'btn primary', type: 'submit', textContent: ok });
     const fm = $('form', { className: 'pad' }, $('h2', { textContent: title }), intro && $('p', { className: 'intro', textContent: intro }), rows, err,
-      $('div', { className: 'dfoot' }, $('button', { className: 'btn', type: 'button', textContent: 'Cancel', onclick: () => d.close() }), submit));
+      $('div', { className: 'dfoot' }, extra && extra(() => d.close()), $('button', { className: 'btn', type: 'button', textContent: 'Cancel', onclick: () => d.close() }), submit));
     fm.onsubmit = async e => {
       e.preventDefault();
       const v = values();
@@ -158,7 +158,7 @@ function popmenu(anchor, items, host) {
 }
 
 // ---------------------------------------------------------------- sign in
-function signOut() { stopConv(); store.set('tb_token', null); S.token = null; S.me = null; closePop(); showAuth(); }
+function signOut() { stopConv(); store.set('tb_token', null); S.token = null; S.me = null; S.codingBots = []; closePop(); showAuth(); }
 function showAuth() {
   const invite = (new URLSearchParams(location.search).get('invite') || '').trim();
   let create = !!invite;  // an invite link means a new person joining
@@ -388,17 +388,27 @@ async function newCodingBot() {
   await openConv(r.conversation, (S.codingBots || []).find(x => x.id === r.id) || r);
 }
 async function editCodingBot(b) {
-  const r = await form({ title: 'Coding bot settings', fields: codingFields(b), onSubmit: v => api('PATCH', `/coding-bots/${b.id}`, v) });
+  const r = await form({ title: 'Coding bot settings', fields: codingFields(b), onSubmit: v => api('PATCH', `/coding-bots/${b.id}`, v),
+    extra: close => $('button', { className: 'btn danger', type: 'button', textContent: 'Delete bot', onclick: guard(async () => { if (await deleteCodingBot(b)) close(); }) }) });
   if (!r) return;
   Object.assign(b, r); if (S.bot && S.bot.id === b.id) Object.assign(S.bot, r);
   if (S.conv && S.conv.id === r.conversation.id) S.conv.name = r.name;
   await loadCodingBots(); renderTop();
 }
+async function deleteCodingBot(b) {
+  if (!await confirmBox({ title: `Delete ${b.name}?`, text: 'The bot is removed with its chat, and a running Claude Code is stopped. This cannot be undone.', ok: 'Delete bot', danger: true })) return false;
+  await api('DELETE', `/bots/${b.id}`);
+  await boot();
+  return true;
+}
 /** Opens Claude on the bot's screen in a new tab, so the person can sign in, then shows the login status. */
 async function claudeLogin(b) {
-  const r = await api('POST', `/coding-bots/${b.id}/login`);
-  window.open(withToken(r.screen.replace(/^\/api/, '') + '/'), '_blank', 'noopener');
-  toast('Sign in to Claude in the new tab. The status is checked here.');
+  const w = window.open('about:blank', '_blank');  // opened in the click itself: Safari blocks a window opened after an await
+  let r;
+  try { r = await api('POST', `/coding-bots/${b.id}/login`); } catch (e) { if (w) w.close(); throw e; }
+  const url = withToken(r.screen.replace(/^\/api/, '') + '/');
+  if (w) { w.opener = null; w.location.href = url; toast('Sign in to Claude in the new tab. The status is checked here.'); }
+  else toast(['Your browser blocked the new tab. Open the sign-in screen here: ', $('a', { href: url, target: '_blank', rel: 'noopener', textContent: 'open sign-in screen' })], 'bad');
   for (let i = 0; i < 20; i++) {
     await new Promise(res => setTimeout(res, 3000));
     if (!S.bot || S.bot.id !== b.id) return;

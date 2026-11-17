@@ -1119,7 +1119,10 @@ def _coding_on() -> None:
     _need(config.CODING_BOTS, 404, "not found")
 
 
-def _coding_settings(name: Optional[str], model: Optional[str], workdir: Optional[str]) -> None:
+def _coding_settings(name: Optional[str], model: Optional[str], workdir: Optional[str],
+                     instructions: Optional[str] = None) -> None:
+    _need(instructions is None or len(instructions) <= coding.INSTRUCTIONS_MAX, 400,
+          f"instructions: at most {coding.INSTRUCTIONS_MAX} characters")
     _need(name is None or name.strip(), 400, "the bot needs a name")
     _need(model is None or coding.MODEL_RE.fullmatch(model), 400, "model: letters, digits and . _ : - only")
     if workdir is not None:
@@ -1140,7 +1143,7 @@ def list_coding_bots(user: User = Depends(current_user)):
 @router.post("/coding-bots")
 def create_coding_bot(body: CodingBotIn, user: User = Depends(current_user)):
     _coding_on()
-    _coding_settings(body.name, body.model, body.workdir)
+    _coding_settings(body.name, body.model, body.workdir, body.instructions)
     with session() as s:
         bot, conv = coding.create_bot(s, user, body.name, body.model, body.workdir, body.instructions)
         s.commit()
@@ -1150,7 +1153,7 @@ def create_coding_bot(body: CodingBotIn, user: User = Depends(current_user)):
 @router.patch("/coding-bots/{bot_id}")
 def patch_coding_bot(bot_id: int, body: CodingBotPatch, user: User = Depends(current_user)):
     _coding_on()
-    _coding_settings(body.name, body.model, body.workdir)
+    _coding_settings(body.name, body.model, body.workdir, body.instructions)
     with session() as s:
         b = s.get(Bot, bot_id)
         _need(b and b.runner == "claude_code" and b.owner_id == user.id, 404, "bot not found")
@@ -1202,6 +1205,17 @@ async def delete_bot(bot_id: int, user: User = Depends(current_user)):
         b = s.get(Bot, bot_id)
         _need(b and b.owner_id == user.id, 404, "bot not found")
         _need(not b.is_home, 400, "the Overview bot cannot be deleted")
+        coding_bot = bool(b.runner)
+        convs = [c.id for c in s.exec(select(Conversation).where(Conversation.bot_id == bot_id)).all()]
+    if coding_bot:  # a coding bot's Claude must not keep running without its bot
+        for conv_id in convs:
+            agent._held.pop((conv_id, bot_id), None)
+            agent.interrupt(conv_id, bot_id, kill=False)
+        await coding.kill_bot_runs(b)
+    with session() as s:
+        b = s.get(Bot, bot_id)
+        if b is None:
+            return {"ok": True}
         for r in s.exec(select(Routine).where(Routine.bot_id == bot_id)).all():
             routines.remove(r.id)
         for conv in s.exec(select(Conversation).where(Conversation.bot_id == bot_id)).all():

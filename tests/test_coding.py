@@ -529,3 +529,113 @@ def test_me_reports_coding_bots_on(client):
 
 def test_me_reports_coding_bots_off(client_off):
     assert client_off.get("/api/me", headers=_register(client_off, "coding_me_off")).json()["coding_bots"] is False
+
+
+# ---------------------------------------------------------------- final review fixes
+
+def test_model_with_leading_dash_is_rejected(client):
+    h = _register(client, _uniq("cdash"))
+    assert client.post("/api/coding-bots", headers=h, json={"name": "x", "model": "-p"}).status_code == 400
+    bid = client.post("/api/coding-bots", headers=h, json={"name": "ok"}).json()["id"]
+    assert client.patch(f"/api/coding-bots/{bid}", headers=h, json={"model": "--resume"}).status_code == 400
+    assert client.patch(f"/api/coding-bots/{bid}", headers=h, json={"model": "claude-opus-4.1"}).status_code == 200
+
+
+def test_instructions_are_capped(client):
+    from app import coding
+    h = _register(client, _uniq("ccap"))
+    too_long = "x" * (coding.INSTRUCTIONS_MAX + 1)
+    assert client.post("/api/coding-bots", headers=h, json={"name": "x", "instructions": too_long}).status_code == 400
+    bid = client.post("/api/coding-bots", headers=h, json={"name": "ok", "instructions": "x" * coding.INSTRUCTIONS_MAX}).json()["id"]
+    assert client.patch(f"/api/coding-bots/{bid}", headers=h, json={"instructions": too_long}).status_code == 400
+
+
+def test_flag_off_does_not_start_existing_coding_bot(client, logged_in_bot):
+    from app import config
+    from app.db import CodingRun, session, select
+    bid, conv, h = logged_in_bot
+    config.CODING_BOTS = False  # the client fixture restores it
+    _say(client, h, conv, "hallo")
+    wait_for(lambda: "Coding bots staan uit op deze server." in _assistant_texts(conv))
+    with session() as s:
+        assert not s.exec(select(CodingRun).where(CodingRun.bot_id == bid)).all()
+
+
+def test_stop_drops_queued_messages(client, logged_in_bot):
+    from app import agent
+    bid, conv, h = logged_in_bot
+    try:
+        _say(client, h, conv, "sleep lang")
+        wait_for(lambda: (r := _last_run(bid)) and r.pid)
+        _say(client, h, conv, "daarna")
+        _stop(client, h, conv)
+        wait_for(lambda: _last_run(bid).status == "stopped")
+        wait_for(lambda: (conv, bid) not in agent._runs)
+        _say(client, h, conv, "nieuw")
+        run = wait_for(lambda: (r := _last_run(bid)) and r.status == "done" and r)
+        last = _assistant_texts(conv)[-1]
+        assert last.startswith("echo:nieuw|") and "daarna" not in last
+    finally:
+        _stop(client, h, conv)
+
+
+def test_delete_coding_bot_kills_running_claude(client, logged_in_bot):
+    from app import agent, coding
+    from app.db import Bot, CodingRun, session, select
+    bid, conv, h = logged_in_bot
+    _say(client, h, conv, "sleep lang")
+    run = wait_for(lambda: (r := _last_run(bid)) and r.pid and r)
+    assert client.delete(f"/api/bots/{bid}", headers=h).status_code == 200
+    wait_for(lambda: not _pid_alive(run.pid))
+    with session() as s:
+        assert s.get(Bot, bid) is None
+        assert s.get(CodingRun, run.id).status == "stopped"
+    wait_for(lambda: (conv, bid) not in agent._runs)
+
+
+def test_resume_all_ignores_runs_of_deleted_bots(client):
+    from app import coding
+    from app.db import CodingRun, session
+    from app.db import select
+    with session() as s:  # other tests may have left rows behind: only this run may be running
+        for old in s.exec(select(CodingRun).where(CodingRun.status == "running")).all():
+            old.status = "failed"
+            s.add(old)
+        s.commit()
+        r = CodingRun(bot_id=999999, conversation_id=999999, requester_id=1, after_message_id=0, base=".coding/run-gone")
+        s.add(r)
+        s.commit()
+        s.refresh(r)
+        rid = r.id
+
+    async def go():
+        return coding.resume_all()
+
+    client.portal.call(go)
+    with session() as s:
+        assert s.get(CodingRun, rid).status == "stopped"
+
+
+def _sh(script, *args):
+    import subprocess
+    return subprocess.run(["sh", "-c", script, "sh", *map(str, args)], timeout=10).returncode
+
+
+def test_pid_of_unrelated_process_counts_as_dead_and_is_not_killed(tmp_path):
+    import subprocess
+    from app import coding
+    base = str(tmp_path / "run-1")  # no .exit file
+    mine = os.getpid()  # alive, but not a claude process
+    assert _sh(coding.DEAD_CHECK, base, mine, "claude") == 0
+    assert _sh(coding.KILL_SCRIPT, mine, "claude") != 0
+    assert _pid_alive(mine)
+    # a process whose command line names the binary is alive and is killed
+    p = subprocess.Popen(["sleep", "30"])
+    try:
+        assert _sh(coding.DEAD_CHECK, base, p.pid, "sleep") == 1
+        assert _sh(coding.KILL_SCRIPT, p.pid, "sleep") == 0
+        p.wait(timeout=10)
+    finally:
+        p.kill()
+    assert _sh(coding.DEAD_CHECK, base, p.pid, "sleep") == 0
+    assert _sh(coding.DEAD_CHECK, base, 0, "sleep") == 0

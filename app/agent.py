@@ -719,7 +719,10 @@ async def _run_task(key: Key, run: Run) -> None:
             with session() as s:
                 bot = s.get(Bot, key[1])
                 runner = bot.runner if bot else ""
-            if runner == coding.RUNNER:
+            if runner == coding.RUNNER and not config.CODING_BOTS:
+                _post(key[0], role="assistant", content="Coding bots staan uit op deze server.",
+                      author_bot_id=key[1], requester_id=run.requester_id)
+            elif runner == coding.RUNNER:
                 await coding.run_turn(key[0], key[1], run.requester_id)
             else:
                 await _run_locked(key[0], key[1], run.requester_id, run)
@@ -751,15 +754,16 @@ def _start_with(key: Key, user_id: int) -> None:
     _runs[key].steers.update(dict.fromkeys(ids))
 
 
-def interrupt(conv_id: int, bot_id: int) -> bool:
-    """Stop the turn in flight, if any. The queue behind it is left to the caller."""
+def interrupt(conv_id: int, bot_id: int, kill: bool = True) -> bool:
+    """Stop the turn in flight, if any. The queue behind it is left to the caller. A coding bot's
+    process is killed too, unless the caller (deleting the bot) takes care of that."""
     key = (conv_id, bot_id)
     run = _runs.pop(key, None)
     if run and run.task:
         with session() as s:
             bot = s.get(Bot, bot_id)
             is_coding = bool(bot and bot.runner)
-        if is_coding:
+        if is_coding and kill:
             coding.request_stop(conv_id, bot_id)
         run.task.cancel()
     publish(conv_id, "run")

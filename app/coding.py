@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import re
 import time
 from datetime import datetime, timezone
@@ -16,7 +17,8 @@ from .db import Bot, CodingRun, Conversation, Message, Session, User, select, se
 
 RUNNER = "claude_code"
 DEFAULT_MODEL = "opus"
-MODEL_RE = re.compile(r"^[A-Za-z0-9._:-]{1,100}$")
+MODEL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,99}$")
+INSTRUCTIONS_MAX = 20000
 TOOL_RESULT_MAX = 6000
 CHUNK_MAX = 262144
 NOT_LOGGED_IN = "Je bent nog niet ingelogd bij Claude. Gebruik Log in bij Claude bij de instellingen van deze bot."
@@ -169,16 +171,31 @@ def _post_msg(conv_id: int, **fields):
     return agent._post(conv_id, **fields)
 
 
-_stop_requested: set[tuple[int, int]] = set()
+_stop_requested: dict[tuple[int, int], int] = {}  # (conversation, bot) -> newest user message id at the stop
 TAIL_FAILURES_MAX = 30
-# exit 0: the run is over (exit file written, or no live process); 1: the process is alive
-DEAD_CHECK = 'test -e "$1.exit" || ! { [ "$2" -gt 0 ] && kill -0 "$2"; } 2>/dev/null'
+# True when `$1` is a live process whose command line names the Claude binary `$2`. A stored pid can
+# have been reused by another process (a recreated container), which must not count as ours.
+# /proc where it exists; `ps` on systems without it (macOS, the local test backend).
+ALIVE = ('{ [ "$1" -gt 0 ] 2>/dev/null && if [ -d /proc/self ]; '
+         'then tr "\\0" " " < "/proc/$1/cmdline" 2>/dev/null | grep -qF -- "$2"; '
+         'else ps -p "$1" -o command= 2>/dev/null | grep -qF -- "$2"; fi; }')
+# exit 0: the run is over (exit file written, or no live Claude process); 1: the process is alive
+DEAD_CHECK = 'test -e "$1.exit" || ! { set -- "$2" "$3"; ' + ALIVE + '; }'
+# kills pid `$1` only when it is the Claude process (name `$2`)
+KILL_SCRIPT = ALIVE + ' && kill "$1"'
 STOP_PID_WAIT_S = 3.0
+
+
+def _claude_name() -> str:
+    return os.path.basename(config.CODING_CLAUDE_BIN) or config.CODING_CLAUDE_BIN
 
 
 def request_stop(conv_id: int, bot_id: int) -> None:
     """Mark that the next cancellation of this bot's turn is the person's stop, not an app shutdown."""
-    _stop_requested.add((conv_id, bot_id))
+    with session() as s:
+        newest = s.exec(select(Message.id).where(Message.conversation_id == conv_id, Message.role == "user")
+                        .order_by(Message.id.desc())).first()
+    _stop_requested[(conv_id, bot_id)] = newest or 0
 
 
 async def run_turn(conv_id: int, bot_id: int, requester_id: int) -> None:
@@ -186,13 +203,12 @@ async def run_turn(conv_id: int, bot_id: int, requester_id: int) -> None:
 
     A cancellation after request_stop kills the process and ends the run as stopped; any other
     cancellation (the app shuts down) leaves process and run alone so resume_all can pick it up."""
-    _stop_requested.discard((conv_id, bot_id))
+    _stop_requested.pop((conv_id, bot_id), None)
     try:
         await _run_turn(conv_id, bot_id, requester_id)
     except asyncio.CancelledError:
         if (conv_id, bot_id) in _stop_requested:
-            _stop_requested.discard((conv_id, bot_id))
-            await _stop_run(conv_id, bot_id, requester_id)
+            await _stop_run(conv_id, bot_id, requester_id, _stop_requested.pop((conv_id, bot_id)))
         raise
 
 
@@ -201,16 +217,8 @@ async def _read_pid(key: str, base: str) -> int:
     return int(out.strip()) if code == 0 and out.strip().isdigit() else 0
 
 
-async def _stop_run(conv_id: int, bot_id: int, requester_id: int) -> None:
-    from .home import sandbox_key
-    with session() as s:
-        bot = s.get(Bot, bot_id)
-        run = s.exec(select(CodingRun).where(CodingRun.bot_id == bot_id, CodingRun.conversation_id == conv_id,
-                                             CodingRun.status == "running").order_by(CodingRun.id.desc())).first()
-        run_id, pid, base = (run.id, run.pid, run.base) if run else (None, 0, "")
-    if run_id is None or bot is None:
-        return
-    key = sandbox_key(bot)
+async def _kill(key: str, base: str, pid: int) -> None:
+    """Kill the run's Claude process (never another process that got its pid). Errors mean it is gone."""
     try:
         if pid <= 0:
             # the start was cut short before the pid was stored: keep a script that has not
@@ -222,10 +230,37 @@ async def _stop_run(conv_id: int, bot_id: int, requester_id: int) -> None:
                 if pid <= 0:
                     await asyncio.sleep(min(0.1, config.CODING_POLL_S))
         if pid > 0:
-            await sandbox.sb_exec(key, ["kill", str(pid)])
+            await sandbox.sb_exec(key, ["sh", "-c", KILL_SCRIPT, "sh", str(pid), _claude_name()])
     except Exception:  # noqa: BLE001 - the sandbox is gone, so is the process
         pass
+
+
+async def kill_bot_runs(bot: Bot) -> None:
+    """End every running run of this bot as stopped, killing its process. For deleting the bot."""
+    from .home import sandbox_key
+    with session() as s:
+        runs = [(r.id, r.pid, r.base) for r in s.exec(select(CodingRun).where(
+            CodingRun.bot_id == bot.id, CodingRun.status == "running")).all()]
+    key = sandbox_key(bot)
+    for run_id, pid, base in runs:
+        await _kill(key, base, pid)
+        _end(run_id, "stopped")
+
+
+async def _stop_run(conv_id: int, bot_id: int, requester_id: int, drop_through: int = 0) -> None:
+    from .home import sandbox_key
+    with session() as s:
+        bot = s.get(Bot, bot_id)
+        run = s.exec(select(CodingRun).where(CodingRun.bot_id == bot_id, CodingRun.conversation_id == conv_id,
+                                             CodingRun.status == "running").order_by(CodingRun.id.desc())).first()
+        run_id, pid, base = (run.id, run.pid, run.base) if run else (None, 0, "")
+    if run_id is None or bot is None:
+        return
+    key = sandbox_key(bot)
+    await _kill(key, base, pid)
     _end(run_id, "stopped")
+    if drop_through:  # what was queued behind the stopped run is dropped: the next run starts after it
+        _update(run_id, after_message_id=drop_through)
     _post_msg(conv_id, role="assistant", content="Gestopt.", author_bot_id=bot_id, requester_id=requester_id)
 
 
@@ -234,7 +269,14 @@ def resume_all() -> int:
     from . import agent
     with session() as s:
         runs = s.exec(select(CodingRun).where(CodingRun.status == "running")).all()
-        found = [(r.conversation_id, r.bot_id, r.requester_id) for r in runs]
+        found = []
+        for r in runs:
+            if s.get(Bot, r.bot_id) is None:  # the bot was deleted: nothing to follow
+                r.status, r.ended_at = "stopped", datetime.now(timezone.utc)
+                s.add(r)
+            else:
+                found.append((r.conversation_id, r.bot_id, r.requester_id))
+        s.commit()
     for conv_id, bot_id, requester_id in found:
         agent.start_run(conv_id, bot_id, requester_id)
     return len(found)
@@ -362,7 +404,7 @@ async def _follow(run_id: int) -> None:
                 pid = await _read_pid(key, base)
                 if pid > 0:
                     _update(run_id, pid=pid)
-            code, _ = await sandbox.sb_exec(key, ["sh", "-c", DEAD_CHECK, "sh", base, str(pid)])
+            code, _ = await sandbox.sb_exec(key, ["sh", "-c", DEAD_CHECK, "sh", base, str(pid), _claude_name()])
             dead = code == 0
             code, chunk = await sandbox.sb_exec(key, ["sh", "-c", 'tail -c +"$1" "$2" 2>/dev/null | head -c 262144',
                                                    "sh", str(offset + 1), base + ".jsonl"], raw=True)
@@ -400,7 +442,7 @@ async def _follow(run_id: int) -> None:
 async def _gone(key: str, base: str, pid: int) -> bool:
     """The dead check again, for when the log cannot be read: True when the process is gone or the check fails."""
     try:
-        code, _ = await sandbox.sb_exec(key, ["sh", "-c", DEAD_CHECK, "sh", base, str(pid)])
+        code, _ = await sandbox.sb_exec(key, ["sh", "-c", DEAD_CHECK, "sh", base, str(pid), _claude_name()])
     except Exception:  # noqa: BLE001 - the sandbox is gone
         return True
     return code != 1  # 1 means the process is alive
