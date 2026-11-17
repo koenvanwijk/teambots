@@ -1153,15 +1153,26 @@ function splitMentions(text) {
   return out;
 }
 function plain(text, into) { for (const p of splitMentions(text)) into.append(p.tok ? $('span', { className: 'tok', textContent: p.s }) : p.s); return into; }
-const INLINE = /(`[^`\n]+`)|(\*\*[^\n]+?\*\*)|(\*[^\s*][^*\n]*\*)|\[([^\]\n]+)\]\((https?:\/\/[^\s)]+)\)|(https?:\/\/[^\s<>"')\]]*[^\s<>"')\].,;:!?])/g;
+const INLINE = /!\[([^\]\n]*)\]\(([^)\s]+)\)|(`[^`\n]+`)|(\*\*[^\n]+?\*\*)|(\*[^\s*][^*\n]*\*)|\[([^\]\n]+)\]\((https?:\/\/[^\s)]+)\)|(https?:\/\/[^\s<>"')\]]*[^\s<>"')\].,;:!?])/g;
+function workspaceImageUrl(path) {
+  if (!S.conv || S.conv.kind === 'feed' || !/\.(?:png|jpe?g|gif|webp)$/i.test(path) || path.startsWith('/') || path.includes('\\') ||
+      path.split('/').some(part => !part || part === '.' || part === '..' || part.startsWith('.'))) return null;
+  const route = S.conv.kind === 'home' ? '/home/files/content' : `/teams/${S.conv.team_id}/files/content`;
+  return withToken(`${route}?path=${encodeURIComponent(path)}&download=0`);
+}
 function inline(text, into) {
   let last = 0; const link = (href, label) => $('a', { href, target: '_blank', rel: 'noopener noreferrer', textContent: label });
   for (const m of text.matchAll(INLINE)) {
     plain(text.slice(last, m.index), into); last = m.index + m[0].length;
-    if (m[1]) into.append($('code', { textContent: m[1].slice(1, -1) }));
-    else if (m[2]) into.append(inline(m[2].slice(2, -2), $('strong')));
-    else if (m[3]) into.append(inline(m[3].slice(1, -1), $('em')));
-    else into.append(m[4] ? link(m[5], m[4]) : link(m[6], m[6]));
+    if (m[2]) {
+      const src = workspaceImageUrl(m[2]);
+      if (src) into.append($('img', { className: 'chat-image', src, alt: m[1], loading: 'lazy',
+        onclick: () => window.open(src, '_blank', 'noopener') }));
+      else plain(m[0], into);
+    } else if (m[3]) into.append($('code', { textContent: m[3].slice(1, -1) }));
+    else if (m[4]) into.append(inline(m[4].slice(2, -2), $('strong')));
+    else if (m[5]) into.append(inline(m[5].slice(1, -1), $('em')));
+    else into.append(m[6] ? link(m[7], m[6]) : link(m[8], m[8]));
   }
   return plain(text.slice(last), into);
 }

@@ -690,6 +690,12 @@ def test_project_files(c):
     # download: the bytes as uploaded, and never rendered as a page of the app
     r = c.get(f"/api/teams/{team}/files/content", params={"path": "uploads/Report Q3.pdf"}, headers=H("alice"))
     assert r.content == b"%PDF-1.4 hello" and r.headers["content-disposition"].startswith("attachment")
+    png = b"\x89PNG\r\n\x1a\nimage-bytes"
+    up("bob", team, "generated.png", png)
+    r = c.get(f"/api/teams/{team}/files/content", params={"path": "uploads/generated.png", "download": "0"},
+              headers=H("alice"))
+    assert r.content == png and r.headers["content-type"] == "image/png"
+    assert r.headers["content-disposition"].startswith("inline")
     up("bob", team, "page.html", b"<script>alert(1)</script>")
     r = c.get(f"/api/teams/{team}/files/content", params={"path": "uploads/page.html", "download": "0"}, headers=H("bob"))
     assert r.headers["content-type"] == "application/octet-stream" and r.headers["content-security-policy"] == "sandbox"
@@ -769,6 +775,9 @@ def test_home_overview_bot(c):
     proj_file = os.path.join(TMP, "workspaces", f"p{S['team']}", "marker-home.txt")
     assert open(home_file).read().strip() == "home-only"
     assert not os.path.exists(proj_file)
+    r = c.get("/api/home/files/content", params={"path": "marker-home.txt", "download": "0"}, headers=H("alice"))
+    assert r.content == b"home-only\n" and r.headers["content-disposition"].startswith("attachment")
+    assert c.get("/api/home/files/content", params={"path": "marker-home.txt"}, headers=H("bob")).status_code == 404
     S["home_bob"] = bob_home["conversation"]["id"]
 
 

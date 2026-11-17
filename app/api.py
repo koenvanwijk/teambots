@@ -356,6 +356,21 @@ async def home_files(user: User = Depends(current_user)):
     return await sandbox.list_files(key)
 
 
+@router.get("/home/files/content")
+async def home_file_content(path: str, download: bool = True, user: User = Depends(current_user)):
+    with session() as s:
+        try:
+            bot, _ = home.ensure_home(s, user)
+        except ValueError as e:
+            raise HTTPException(400, str(e)) from e
+        key = home.sandbox_key(bot)
+    try:
+        data = await sandbox.get_bytes(key, path)
+    except ValueError as e:
+        raise HTTPException(400, str(e)) from e
+    return _workspace_file_response(data, path, download)
+
+
 
 
 class TeamIn(BaseModel):
@@ -453,6 +468,17 @@ UPLOAD_DIR = "uploads"
 SAFE_INLINE = {"image/png", "image/jpeg", "image/gif", "image/webp"}  # never html or svg: same origin as the app
 
 
+def _workspace_file_response(data: bytes | None, path: str, download: bool) -> Response:
+    _need(data is not None, 404, "file not found")
+    media = mimetypes.guess_type(path)[0] or "application/octet-stream"
+    inline = not download and media in SAFE_INLINE
+    name = path.rsplit("/", 1)[-1]
+    return Response(data, media_type=media if media in SAFE_INLINE else "application/octet-stream",
+                    headers={"Content-Disposition": f"{'inline' if inline else 'attachment'}; filename*=UTF-8''{quote(name)}",
+                             "X-Content-Type-Options": "nosniff", "Content-Security-Policy": "sandbox",
+                             "Cache-Control": "private, no-store"})
+
+
 def _file_name(name: str) -> str:
     """A plain file name from whatever the browser sent: no folders, no control or shell-awkward characters."""
     name = name.replace("\\", "/").rsplit("/", 1)[-1]
@@ -518,16 +544,7 @@ async def download_file(team_id: int, path: str, download: bool = True, user: Us
         data = await sandbox.get_bytes(f"p{team_id}", path)
     except ValueError as e:
         raise HTTPException(400, str(e)) from e
-    _need(data is not None, 404, "file not found")
-    media = mimetypes.guess_type(path)[0] or "application/octet-stream"
-    inline = not download and media in SAFE_INLINE
-    name = path.rsplit("/", 1)[-1]
-    # Only plain images are shown in the page; everything else is a download, so an uploaded html or
-    # svg file can never run as part of the app.
-    return Response(data, media_type=media if media in SAFE_INLINE else "application/octet-stream",
-                    headers={"Content-Disposition": f"{'inline' if inline else 'attachment'}; filename*=UTF-8''{quote(name)}",
-                             "X-Content-Type-Options": "nosniff", "Content-Security-Policy": "sandbox",
-                             "Cache-Control": "private, no-store"})
+    return _workspace_file_response(data, path, download)
 
 
 @router.delete("/teams/{team_id}/files")
