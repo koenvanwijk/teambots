@@ -985,7 +985,7 @@ async function channelMembers() {
 }
 
 // ---------- messages
-const TOOLS = { run_command: ['term', 'Run command'], write_file: ['file', 'Write file'], read_file: ['file', 'Read file'], http_request: ['globe', 'HTTP request'], remember: ['book', 'Remember'], forget: ['book', 'Forget'], memory: ['book', 'Update memory'], skill_manage: ['zap', 'Update skill'], knowledge_list: ['book', 'List knowledge'], knowledge_read: ['book', 'Read knowledge'], knowledge_write: ['book', 'Write knowledge'], knowledge_patch: ['book', 'Edit knowledge'], knowledge_delete: ['book', 'Delete knowledge'], knowledge_history: ['book', 'Knowledge history'], search_history: ['search', 'Search history'],
+const TOOLS = { run_command: ['term', 'Run command'], write_file: ['file', 'Write file'], read_file: ['file', 'Read file'], http_request: ['globe', 'HTTP request'], git_push: ['up', 'Git push'], remember: ['book', 'Remember'], forget: ['book', 'Forget'], memory: ['book', 'Update memory'], skill_manage: ['zap', 'Update skill'], knowledge_list: ['book', 'List knowledge'], knowledge_read: ['book', 'Read knowledge'], knowledge_write: ['book', 'Write knowledge'], knowledge_patch: ['book', 'Edit knowledge'], knowledge_delete: ['book', 'Delete knowledge'], knowledge_history: ['book', 'Knowledge history'], search_history: ['search', 'Search history'],
   save_skill: ['zap', 'Save skill'], use_skill: ['zap', 'Use skill'], ask_bot: ['bot', 'Ask another bot'], create_routine: ['clock', 'Create routine'], list_workspace: ['grid', 'List projects'], get_overview: ['home', 'Overview'], read_messages: ['book', 'Read messages'], post_to_channel: ['hash', 'Post to team chat'], list_routines: ['clock', 'List routines'], update_routine: ['edit', 'Update routine'], delete_routine: ['trash', 'Delete routine'], run_routine: ['play', 'Run routine'] };
 function toolInfo(name) {
   if (TOOLS[name]) return TOOLS[name];
@@ -994,7 +994,7 @@ function toolInfo(name) {
   return ['zap', name];
 }
 function parseArgs(tc) { try { const a = JSON.parse(tc.function.arguments || '{}'); return a && typeof a === 'object' ? a : {}; } catch { return {}; } }
-const argLine = a => String(a.command ?? a.path ?? a.url ?? (a.handle ? '@' + a.handle : null) ?? a.name ?? a.content ?? a.text ?? a.keys ?? (a.x != null ? `${a.x}, ${a.y}` : null) ?? a.amount ?? '').split('\n')[0];
+const argLine = a => String(a.command ?? a.remote_url ?? a.path ?? a.url ?? (a.handle ? '@' + a.handle : null) ?? a.name ?? a.content ?? a.text ?? a.keys ?? (a.x != null ? `${a.x}, ${a.y}` : null) ?? a.amount ?? '').split('\n')[0];
 const isBusy = () => S.state.running.length > 0;
 /** How a message sent while the bot was busy was handled, as a line under the message. */
 function deliveryNote(m) {
@@ -1098,7 +1098,7 @@ function stepNode({ tc, r, a }, busy) {
   if (a) {
     const act = (allow, always) => guard(async e => { for (const b of e.currentTarget.parentElement.querySelectorAll('button')) b.disabled = true; await api('POST', `/approvals/${a.id}`, { allow, always }); refresh(); });
     inn.append($('div', { className: 'askbox' }, $('div', { className: 't', textContent: a.mine ? `${a.bot} wants to do this. Check it before you allow it.` : `Waiting for ${a.requester} to decide.` }),
-      a.mine && [$('button', { className: 'btn sm primary', textContent: 'Allow once', onclick: act(true, false) }), $('button', { className: 'btn sm', textContent: 'Always allow', title: 'Do not ask again for this tool and this bot', onclick: act(true, true) }), $('button', { className: 'btn sm danger', textContent: 'Deny', onclick: act(false, false) })]));
+      a.mine && [$('button', { className: 'btn sm primary', textContent: 'Allow once', onclick: act(true, false) }), a.tool_name !== 'git_push' && $('button', { className: 'btn sm', textContent: 'Always allow', title: 'Do not ask again for this tool and this bot', onclick: act(true, true) }), $('button', { className: 'btn sm danger', textContent: 'Deny', onclick: act(false, false) })]));
   }
   const keys = Object.keys(args), single = keys.length === 1 && typeof args[keys[0]] === 'string';
   if (keys.length) inn.append($('div', { className: 'lbl', textContent: single ? keys[0] : 'Arguments' }), $('pre', { textContent: single ? args[keys[0]] : JSON.stringify(args, null, 2) }));
@@ -1469,7 +1469,7 @@ async function openDrawer(bot, tab = 'setup') {
     combo.reload();
     const mode = $('select', {}, $('option', { value: 'ask', textContent: 'Ask before risky actions', selected: bot.approval_mode === 'ask' }), $('option', { value: 'auto', textContent: 'Run everything without asking', selected: bot.approval_mode === 'auto' }));
     const cu = $('input', { type: 'checkbox', checked: bot.computer_use }), loc = $('input', { type: 'checkbox', checked: bot.local_only }), fld = (label, input, small) => $('label', { className: 'field' }, $('span', { textContent: label }), input, small && $('small', { textContent: small }));
-    put(body, fld('Name', name), fld('Instructions', ins), fld('Model endpoint', ep), $('label', { className: 'field' }, $('span', { textContent: 'Model override' }), combo.box, combo.status), fld('Approvals', mode, 'Risky: shell commands, writing files, HTTP requests, routines, untrusted MCP tools and acting on the screen.'),
+    put(body, fld('Name', name), fld('Instructions', ins), fld('Model endpoint', ep), $('label', { className: 'field' }, $('span', { textContent: 'Model override' }), combo.box, combo.status), fld('Approvals', mode, 'Risky: shell commands, writing files, HTTP requests, Git pushes, routines, untrusted MCP tools and acting on the screen. Git pushes always ask once.'),
       $('label', { className: 'check' }, loc, $('span', {}, 'Local-only', $('small', { textContent: 'If this bot uses a Router, private work stays on Spark. Existing bots stay as they are until you turn this on.' }))),
       $('label', { className: 'check' }, cu, $('span', {}, 'Own screen and computer use', $('small', { textContent: 'A virtual screen with a browser. Needs a model with image input and the Docker sandbox.' }))),
       $('div', { className: 'rowbtns' }, $('button', { className: 'btn primary', textContent: 'Save', onclick: guard(async () => {
@@ -1537,7 +1537,7 @@ async function openDrawer(bot, tab = 'setup') {
     const parts = [];
     if (manage) {
       const secrets = await get('secrets');
-      parts.push(head('Secrets', 'Add', async () => { if (await form({ title: 'New secret', intro: 'The value never enters the sandbox or the model. The bot uses it by name in an HTTP request and it is filled in outside the sandbox.', ok: 'Save secret', fields: [{ name: 'name', label: 'Name', required: true, mono: true, placeholder: 'API_TOKEN', hint: 'Capitals, digits and underscores.' }, { name: 'value', label: 'Value', type: 'password', required: true, hint: 'Stored encrypted. It is never shown again.' }, { name: 'hosts', label: 'Hosts it may be sent to', mono: true, placeholder: 'api.github.com', hint: 'Comma-separated. Without a host the secret cannot be used.' }], onSubmit: v => api('POST', `/bots/${bot.id}/secrets`, { ...v, name: v.name.toUpperCase() }) })) { await loadCtx(S.conv); again(); } }),
+      parts.push(head('Secrets', 'Add', async () => { if (await form({ title: 'New secret', intro: 'The value never enters the shared sandbox or the model. The bot uses it by name in an HTTP request or a protected Git push, and it is filled in outside the sandbox.', ok: 'Save secret', fields: [{ name: 'name', label: 'Name', required: true, mono: true, placeholder: 'API_TOKEN', hint: 'Capitals, digits and underscores.' }, { name: 'value', label: 'Value', type: 'password', required: true, hint: 'Stored encrypted. It is never shown again.' }, { name: 'hosts', label: 'Hosts it may be sent to', mono: true, placeholder: 'github.com,api.github.com', hint: 'Comma-separated. Without a host the secret cannot be used.' }], onSubmit: v => api('POST', `/bots/${bot.id}/secrets`, { ...v, name: v.name.toUpperCase() }) })) { await loadCtx(S.conv); again(); } }),
         hint('Everyone who can use the bot can make requests with its secrets to the bound hosts.'),
         secrets.length ? secrets.map(s => li(s.name, s.hosts ? 'Only sent to ' + s.hosts : 'No host bound yet', del(`/secrets/${s.id}`, 'this secret'))) : none('No secrets.'));
     }

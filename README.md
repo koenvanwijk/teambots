@@ -24,9 +24,9 @@ capabilities that every teammate or client talks to in private.
 | Skills, routines | Skills are files in `skills/` of the project knowledge base; any member (or a bot, `skill_manage`) can create, fix and delete them. Cron-scheduled prompts per user and conversation |
 | Computer | One sandbox per project, shared by its people and bots: shell and files. Each person also has an Overview bot with its own private chat and sandbox (`tb-home-u{user id}`), not tied to a project. The image includes git and the official GitHub CLI (`gh`); no credentials are baked in, so sign in per project with `gh auth login` |
 | Files | Per project: people upload files (Files page, the paperclip in a chat, drag and drop, or paste) to `uploads/` on the project computer, where every person and bot of that project can read them; a chat gets an `@file` mention. Download and delete from the Files page. Nothing is overwritten, at most `TB_MAX_UPLOAD_MB` per file, and a text file that seems to hold a credential is held back unless the person uploads it anyway. Downloads are never shown as a page of the app (only png, jpg, gif and webp open inline) |
-| Screen | With "computer use" on, a bot has its own lightweight XFCE desktop with a browser, terminal, file manager and text editor, plus screenshot / click / type / key / scroll tools. "Open scherm" attaches noVNC to that same desktop so you can use mouse and keyboard. Needs a model with image input |
-| Secrets | Never in the sandbox or the model's context. The bot writes `{{secret:NAME}}` in an `http_request`; the app fills it in outside the sandbox, only for the hosts the secret is bound to, never follows redirects, and masks secret values in everything returned to the model. A message that seems to contain a credential (a known token format, `password is ...`, or the value of a stored secret) is held back before it is stored: the person saves it as a secret and sends the placeholder, edits the message, or sends it anyway |
-| Approvals | Risky tools pause for an approval card (Allow once / Always allow / Deny); only the requester can answer |
+| Screen | With "computer use" on, a bot has its own virtual screen with a browser, screenshot / click / type / key / scroll tools, and a live view in the UI. "Open scherm" attaches noVNC to that same Xvfb so you can use mouse and keyboard (e.g. to sign in to Chromium). Needs a model with image input |
+| Secrets | Never in the shared sandbox or the model's context. The bot writes `{{secret:NAME}}` in an `http_request`, or uses that exact placeholder as the token for `git_push`; the app fills it in only for the hosts the secret is bound to and masks secret values in everything returned to the model. HTTP never follows redirects. Git push uses a fresh, read-only-source worker instead of the shared sandbox, accepts only an explicit HTTPS remote and a normal branch push, and needs an exact host binding. A message that seems to contain a credential (a known token format, `password is ...`, or the value of a stored secret) is held back before it is stored: the person saves it as a secret and sends the placeholder, edits the message, or sends it anyway |
+| Approvals | Risky tools pause for an approval card (Allow once / Always allow / Deny); only the requester can answer. A Git push always requires an Allow once confirmation, including for auto-approval bots |
 | Channels | Several people and bots; every project bot is added when a channel or a bot is created and replies to every message by default (or only on `@handle` if set to mention-only). Removing a bot sticks. No personal memory in channels |
 | Handoff, MCP | `ask_bot` delegates to another bot; streamable-HTTP MCP servers per bot |
 | While a bot works | You can keep typing. A new message steers the running turn (the bot reads it at its next step), waits in the queue behind it, or interrupts it. "Auto" decides: a short stop word interrupts, otherwise the bot's model classifies the message, and steering is the fallback. A Stop button ends the turn. Only the person the bot works for can steer or interrupt; messages from others queue |
@@ -102,7 +102,7 @@ A laptop or Docker Desktop should keep using `./start.sh` / `docker-compose.loca
    (`{TB_PUBLIC_URL}/api/mcp/oauth/callback`). The bot tool `add_mcp_server` accepts the same
    fields (`client_id`, `client_secret`, `scopes`, `authorize_url`, `token_url`). Dynamic
    client registration is not used.
-4. Chat. Create a channel and all project bots join it automatically and reply to every message; remove a bot or set it to mention-only if you do not want that. On a bot with computer use, **Open scherm** opens the interactive screen (sign in to Chromium there; the profile is kept in the project's Docker volume). To use `gh` in the sandbox, run `gh auth login` there (config is stored on the project volume); TeamBots secrets never enter the sandbox, so a `GH_TOKEN` secret cannot be used as an environment variable inside it.
+4. Chat. Create a channel and all project bots join it automatically and reply to every message; remove a bot or set it to mention-only if you do not want that. On a bot with computer use, **Open scherm** opens the interactive screen (sign in to Chromium there; the profile is kept in the project's Docker volume). To use `gh` in the sandbox, run `gh auth login` there (config is stored on the project volume); TeamBots secrets never enter the shared sandbox, so a `GH_TOKEN` secret cannot be used as an environment variable inside it. For a protected one-off push, give a bot `git_push` with the explicit `https://github.com/OWNER/REPO.git` remote, target branch, and `{{secret:GITHUB_TOKEN}}`; bind that secret to `github.com` (and also `api.github.com` if it is used for GitHub API calls).
 
 5. **Overview** at the top of the sidebar is your personal bot: it sees every project, bot and channel you can access, can ask a project bot a question and relay the answer, and has its own computer (**Open scherm**). It uses the first model endpoint it finds in your projects; change that under the Overview bot's settings.
 6. **Routines** in the sidebar lists every routine you own, across projects: name, bot, project, conversation, the schedule in words and as cron, the next and last run in Europe/Amsterdam, and whether it is enabled. Pause, resume, edit (name, cron, prompt), delete, or run one now. A bot's settings still have a Routines tab to create one in the conversation you have open. The Overview bot can list and manage the same routines.
@@ -161,6 +161,7 @@ TeamBots is meant to sit behind a TLS reverse proxy. It honours `X-Forwarded-Pro
 | `TB_SANDBOXD_SOCKET` | empty | Unix socket of sandboxd. When set, the app has no Docker access and asks sandboxd to run sandbox commands (both compose files set this) |
 | `TB_BROWSER` | `google-chrome` | Browser binary inside the sandbox (`google-chrome` by default; set `chromium` to use Debian Chromium). Runs as user `bot` with `--no-sandbox` because the container drops capabilities. The profile is stored on the project volume under `.screens/bot<id>` |
 | `TB_HTTP_ALLOW_PRIVATE` | `0` | `1` lets `http_request` reach private addresses and send secrets over http (development) |
+| `TB_GIT_PUSH_ALLOW_PRIVATE` | `0` | `1` lets `git_push` use a private HTTPS Git host. Leave this off unless the self-hosted Git service is intentionally trusted; it is independent of `TB_HTTP_ALLOW_PRIVATE` |
 | `TB_BIND`, `TB_DOMAIN` | `127.0.0.1`, `localhost` | Compose: bind address of the app, domain for Caddy |
 | `TB_TIMEZONE` | `Europe/Amsterdam` | Time zone for cron expressions |
 | `TB_MAX_STEPS` | `12` | Tool-call rounds per turn |
@@ -201,8 +202,8 @@ docs/router.md     model router (Option A implemented; B/C still described)
 
 - The app has no Docker access. A separate `sandboxd` container holds the Docker socket (which is
   root-equivalent on the host). It has no network, listens only on a Unix socket shared with the
-  app, and offers three operations: run a command in a `tb-*` sandbox, look up a sandbox's
-  address, remove a sandbox. Image, limits, network and runtime come from sandboxd's own
+  app, and offers narrow operations: run a command in a `tb-*` sandbox, look up a sandbox's
+  address, remove a sandbox, or run the fixed one-shot Git-push worker. Image, limits, network and runtime come from sandboxd's own
   environment, so a compromised app cannot start a privileged container or mount the host.
 - Run sandboxes under gVisor (`TB_SANDBOX_RUNTIME=runsc`) so a bot that escapes its process
   still meets gVisor's user-space kernel instead of the host kernel. It works on a cloud VM
@@ -215,7 +216,10 @@ docs/router.md     model router (Option A implemented; B/C still described)
   back transformed (encoded, split) is not masked, so bind secrets only to hosts you trust; and
   whoever can use the bot can make requests with its secrets to the bound hosts.
 - `http_request` runs in the app, outside the sandbox. It refuses private and link-local addresses
-  unless `TB_HTTP_ALLOW_PRIVATE=1`.
+  unless `TB_HTTP_ALLOW_PRIVATE=1`. `git_push` runs a fixed short-lived worker: the project volume
+  is read-only, Git first makes a clean temporary bare clone, and the token is supplied over stdin
+  only after that. It accepts HTTPS remotes only, disables hooks/credential helpers/redirects, and
+  refuses private hosts unless `TB_GIT_PUSH_ALLOW_PRIVATE=1`.
 - Registration is closed once the first account exists, unless `TB_OPEN_REGISTRATION=1` or the
   request includes a valid project invite code. `/docs` and `/openapi.json` are off unless
   `TB_ENABLE_DOCS=1`. Login and register are rate-limited per IP.

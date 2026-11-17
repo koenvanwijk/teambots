@@ -23,7 +23,11 @@ from .db import (Approval, ApprovalRule, Bot, ChannelMember, Conversation, Endpo
 from .events import publish, publish_bot
 
 log = logging.getLogger("teambots.agent")
-RISKY_TOOLS = {"run_command", "write_file", "create_routine", "http_request", "add_mcp_server"}
+RISKY_TOOLS = {"run_command", "write_file", "create_routine", "http_request", "git_push", "add_mcp_server"}
+# A Git write deserves a fresh confirmation even for bots that otherwise run
+# automatically.  It prevents a broad "Always allow" rule from becoming an
+# unattended source-code publishing capability.
+ALWAYS_CONFIRM_TOOLS = {"git_push"}
 IMAGE_MARK = "\x00image:"  # prefix of a tool result that carries a screenshot file
 _locks: dict[tuple[int, int], asyncio.Lock] = defaultdict(asyncio.Lock)
 _tasks: set[asyncio.Task] = set()
@@ -135,6 +139,17 @@ BUILTIN_TOOLS = [
         {"method": {"type": "string"}, "url": {"type": "string"},
          "headers": {"type": "object", "additionalProperties": {"type": "string"}},
          "body": {"type": "string"}}, ["method", "url"]),
+    _fn("git_push", "Push the current committed HEAD of a repository in the project workspace to an explicit "
+        "HTTPS remote. This always asks the person once. Give remote_url (not a remote name), a target branch "
+        "without refs/heads/, and token as exactly {{secret:NAME}}. The token must be bound exactly to the remote "
+        "host; it is handled by a short-lived worker, never by the shared sandbox. It cannot force-push, delete, "
+        "push tags, or use an SSH URL. Uncommitted work is not included.",
+        {"remote_url": {"type": "string", "description": "https repository URL, without credentials"},
+         "branch": {"type": "string", "description": "target branch name, e.g. main"},
+         "token": {"type": "string", "description": "exactly {{secret:NAME}}"},
+         "path": {"type": "string", "description": "repository directory relative to the workspace; default ."},
+         "username": {"type": "string", "description": "HTTP Git username; default x-access-token"}},
+        ["remote_url", "branch", "token"]),
     _fn("run_command", "Run a shell command on the project computer. The working directory is the persistent, "
         "shared project workspace. Secrets are not available here.",
         {"command": {"type": "string"}, "timeout": {"type": "integer", "description": "seconds, default 60"}},
@@ -151,9 +166,9 @@ BUILTIN_TOOLS = [
     _fn("create_routine", "Schedule a recurring task in this conversation. cron is a 5-field crontab "
         "expression in the server's time zone.", {"name": {"type": "string"}, "cron": {"type": "string"},
                                                   "prompt": {"type": "string"}}, ["name", "cron", "prompt"]),
-    _fn("set_secret", "Store a secret the person gave you (e.g. an API token) so you can use it later via "
-        "http_request as {{secret:NAME}}. Bind it to the hosts it may be sent to. You can never read a stored "
-        "secret back.",
+    _fn("set_secret", "Store a secret the person gave you (e.g. an API or Git token) so you can use it later via "
+        "http_request or git_push as {{secret:NAME}}. Bind it to the hosts it may be sent to. You can never read "
+        "a stored secret back.",
         {"name": {"type": "string", "description": "AN_ENV_VAR style: capitals, digits, underscore"},
          "value": {"type": "string"},
          "hosts": {"type": "string", "description": "comma-separated host names it may be sent to"}},
@@ -286,6 +301,8 @@ def is_ha_lock_action(server, name: str, args: dict | None) -> bool:
 def needs_approval(bot: Bot, ctx: Ctx, name: str, mcp_map: dict, args: dict | None = None) -> bool:
     if name in mcp_map and is_ha_lock_action(mcp_map[name][0], name, args):
         return True
+    if name in ALWAYS_CONFIRM_TOOLS:
+        return True
     if bot.approval_mode == "auto":
         return False
     risky = (name in RISKY_TOOLS or (name in mcp_map and not mcp_map[name][0].trusted)
@@ -405,6 +422,9 @@ async def _execute(ctx: Ctx, name: str, args: dict, mcp_map: dict) -> str:
     if name == "http_request":
         return await secrets_http.http_request(ctx.bot_id, args["method"], args["url"], args.get("headers"),
                                                args.get("body") or "")
+    if name == "git_push":
+        return await secrets_http.git_push(ctx.bot_id, ctx.sandbox_key, args["remote_url"], args["branch"],
+                                           args["token"], args.get("path") or ".", args.get("username"))
     if name in {t["function"]["name"] for t in HOME_TOOLS}:
         from . import home as home_mod
         return home_mod.execute_home_tool(ctx.requester_id, name, args)
@@ -995,7 +1015,7 @@ async def resolve_approval(approval_id: int, user_id: int, allow: bool, always: 
                 raise LookupError("approval already answered")
             a.status = "allowed" if allow else "denied"
             s.add(a)
-            if allow and always:
+            if allow and always and a.tool_name not in ALWAYS_CONFIRM_TOOLS:
                 s.add(ApprovalRule(bot_id=a.bot_id, user_id=user_id, tool_name=rule_key(a.tool_name)))
             s.commit()
             bot, conv = s.get(Bot, a.bot_id), s.get(Conversation, a.conversation_id)

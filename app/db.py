@@ -283,7 +283,8 @@ class ApprovalRule(SQLModel, table=True):
 
 class Secret(SQLModel, table=True):
     """Owner-provided secrets. The value never enters the sandbox or the model's context: the
-    app fills it into outgoing http_request calls, and only for the hosts it is bound to."""
+    app fills it into outgoing http_request calls or the isolated git_push worker, and only for
+    the hosts it is bound to."""
     id: Optional[int] = Field(default=None, primary_key=True)
     bot_id: int = Field(index=True)
     name: str

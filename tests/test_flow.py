@@ -651,7 +651,7 @@ def test_secret_in_chat_is_held_back(c):
     r = send("bob", dm, f"push with {token} please")
     assert r.status_code == 409 and r.json()["detail"]["code"] == "secret"
     hit = r.json()["detail"]["found"][0]
-    assert (hit["kind"], hit["value"], hit["suggest"], hit["hosts"]) == ("GitHub token", token, "GITHUB_TOKEN", "api.github.com")
+    assert (hit["kind"], hit["value"], hit["suggest"], hit["hosts"]) == ("GitHub token", token, "GITHUB_TOKEN", "github.com,api.github.com")
     assert send("bob", dm, "my password is Hunter22!").json()["detail"]["found"][0]["value"] == "Hunter22!"
     assert len(c.get(f"/api/conversations/{dm}/messages", headers=H("bob")).json()) == before  # nothing was stored
     # ordinary text, placeholders and commit hashes pass

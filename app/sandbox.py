@@ -11,6 +11,7 @@ Backends:
 import asyncio
 import os
 import re
+from urllib.parse import urlsplit, urlunsplit
 
 from . import config
 
@@ -18,6 +19,84 @@ MAX_OUTPUT = 8000
 _started: set[str] = set()
 _lock = asyncio.Lock()
 _key_locks: dict[str, asyncio.Lock] = {}
+
+
+# `git_push` deliberately has a smaller input surface than `git push`.  It is a
+# credential-bearing operation, so callers cannot provide a refspec, a remote
+# name, a force flag, or a shell command.
+_GIT_BRANCH_CHARS = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,239}")
+_GIT_USERNAME_CHARS = re.compile(r"[A-Za-z0-9._@+-]{1,128}")
+
+
+def git_push_remote(remote_url: str) -> tuple[str, str]:
+    """Return a canonical HTTPS remote and its hostname, or reject it.
+
+    The remote is explicit rather than read from a repository config.  Apart
+    from making the approval card meaningful, this keeps a hostile project
+    config from choosing where a credential is sent.
+    """
+    if not isinstance(remote_url, str) or not remote_url or remote_url != remote_url.strip():
+        raise ValueError("remote_url must be an https URL")
+    if len(remote_url) > 2048 or any(ord(c) < 33 or ord(c) == 127 for c in remote_url):
+        raise ValueError("remote_url contains invalid characters")
+    try:
+        parts = urlsplit(remote_url)
+        port = parts.port
+    except ValueError as e:
+        raise ValueError("remote_url must be an https URL") from e
+    host = (parts.hostname or "").lower()
+    if (parts.scheme != "https" or not host or parts.username is not None or parts.password is not None
+            or parts.query or parts.fragment or port not in (None, 443) or not parts.path or parts.path == "/"):
+        raise ValueError("remote_url must be a plain https repository URL")
+    # Secret host bindings are plain DNS names. Reject IP literals and exotic
+    # URL host syntax instead of creating an ambiguous binding rule.
+    try:
+        host = host.encode("idna").decode("ascii")
+    except UnicodeError as e:
+        raise ValueError("remote_url has an invalid host") from e
+    if not re.fullmatch(r"[a-z0-9](?:[a-z0-9.-]{0,251}[a-z0-9])?", host):
+        raise ValueError("remote_url has an invalid host")
+    if any(x in parts.path.lower() for x in ("%00", "%0a", "%0d")):
+        raise ValueError("remote_url contains invalid characters")
+    # An explicit :443 is harmless, but omit it in the value shown in logs and
+    # passed to Git so equivalent remotes have one representation.
+    return urlunsplit(("https", host, parts.path, "", "")), host
+
+
+def git_push_branch(branch: str) -> str:
+    """Validate a target branch name; the runner always writes refs/heads/<branch>."""
+    if not isinstance(branch, str) or not _GIT_BRANCH_CHARS.fullmatch(branch):
+        raise ValueError("branch must be a simple branch name")
+    if (branch.startswith((".", "/", "refs/")) or branch.endswith((".", "/"))
+            or ".." in branch or "//" in branch or "@{" in branch
+            or any(part.endswith(".lock") for part in branch.split("/"))):
+        raise ValueError("branch must be a simple branch name")
+    return branch
+
+
+def git_push_path(path: str | None) -> str:
+    """Validate a repository directory relative to the project workspace."""
+    if path in (None, "", "."):
+        return "."
+    if not isinstance(path, str) or len(path) > 512 or "\\" in path or "\x00" in path:
+        raise ValueError("path must be relative to the workspace")
+    if path.startswith("/") or any(part in ("", ".", "..") for part in path.split("/")):
+        raise ValueError("path must be relative to the workspace")
+    return path
+
+
+def git_push_username(username: str | None) -> str:
+    username = "x-access-token" if username in (None, "") else username
+    if not isinstance(username, str) or not _GIT_USERNAME_CHARS.fullmatch(username):
+        raise ValueError("username contains invalid characters")
+    return username
+
+
+def _git_push_token(token: str) -> str:
+    if (not isinstance(token, str) or not token or len(token) > 4096
+            or any(c in token for c in ("\x00", "\n", "\r"))):
+        raise ValueError("token must be a single line")
+    return token
 
 
 def _safe_key(key: str) -> str:
@@ -115,6 +194,118 @@ async def docker_exec_direct(name: str, argv: list[str], env: dict, stdin: bytes
     return await _proc(cmd + [name] + argv, stdin, timeout)
 
 
+# This program only runs in a short-lived, dedicated container.  The shared
+# project sandbox never receives the token: it is mounted read-only as /source,
+# copied to a fresh bare repository in tmpfs, and the token arrives on stdin
+# only after that copy has finished.  Keep this static rather than accepting a
+# caller-provided command through sandboxd.
+_GIT_PUSH_SCRIPT = r'''set -eu
+remote_url=$1
+branch=$2
+repo_path=$3
+username=$4
+
+export HOME=/work/home
+export TMPDIR=/work/tmp
+mkdir -p "$HOME" "$TMPDIR"
+
+source=/source
+if [ "$repo_path" != . ]; then
+    source="/source/$repo_path"
+fi
+source=$(readlink -f -- "$source")
+case "$source" in
+    /source|/source/*) ;;
+    *) echo "error: repository path escapes the workspace" >&2; exit 2 ;;
+esac
+if [ ! -d "$source" ]; then
+    echo "error: repository path does not exist" >&2
+    exit 2
+fi
+
+# Never run a project hook or use its Git configuration.  `clone --no-local`
+# reads objects through Git's file transport, then the freshly created bare
+# clone is the only repository that sees the credential.
+repo=/work/repo.git
+GIT_ALLOW_PROTOCOL=file GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null \
+    git -c protocol.allow=never -c protocol.file.allow=always \
+    clone --bare --no-local --no-tags -- "$source" "$repo" </dev/null
+rm -rf "$repo/hooks"
+sha=$(GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null \
+    git --git-dir="$repo" rev-parse --verify 'HEAD^{commit}' </dev/null)
+
+# Docker supplied the token through stdin, not an environment variable or a
+# command argument.  None of the source-repository operations above inherit it.
+TB_GIT_TOKEN=""
+IFS= read -r TB_GIT_TOKEN || [ -n "$TB_GIT_TOKEN" ] || {
+    echo "error: missing token" >&2
+    exit 2
+}
+export TB_GIT_TOKEN
+export TB_GIT_USERNAME=$username
+umask 077
+askpass=$(mktemp "$TMPDIR/askpass.XXXXXX")
+cleanup() {
+    rm -f -- "${askpass:-}"
+    unset TB_GIT_TOKEN TB_GIT_USERNAME
+}
+trap cleanup EXIT HUP INT TERM
+cat > "$askpass" <<'EOF'
+#!/bin/sh
+case "$1" in
+  *Username*) printf '%s\n' "$TB_GIT_USERNAME" ;;
+  *Password*) printf '%s\n' "$TB_GIT_TOKEN" ;;
+  *) exit 1 ;;
+esac
+EOF
+chmod 700 "$askpass"
+
+GIT_ASKPASS="$askpass" GIT_TERMINAL_PROMPT=0 GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null \
+    git --git-dir="$repo" \
+    -c core.hooksPath=/dev/null \
+    -c credential.helper= \
+    -c http.followRedirects=false \
+    -c http.sslVerify=true \
+    -c http.proxy= \
+    -c https.proxy= \
+    -c protocol.allow=never \
+    -c protocol.https.allow=always \
+    push --porcelain "$remote_url" "$sha:refs/heads/$branch"
+printf 'Pushed %s to refs/heads/%s\n' "$sha" "$branch"
+'''
+
+
+def _git_push_runner_args(name: str, remote_url: str, branch: str, path: str, username: str) -> list[str]:
+    """Fixed, one-shot Docker invocation for a credentialed Git push."""
+    args = [
+        "docker", "run", "--rm", "-i", "--read-only",
+        "--memory", "2g", "--cpus", "2", "--pids-limit", "512", "--shm-size", "512m",
+        "--cap-drop", "ALL", "--security-opt", "no-new-privileges",
+        "--network", config.SANDBOX_NETWORK,
+        "--tmpfs", "/work:rw,noexec,nosuid,size=768m,mode=1777",
+        "--tmpfs", "/tmp:rw,noexec,nosuid,size=64m,mode=1777",
+        "-v", f"{name}:/source:ro",
+    ]
+    if config.SANDBOX_RUNTIME:
+        args += ["--runtime", config.SANDBOX_RUNTIME]
+    if config.SANDBOX_RESOLV_CONF:
+        args += ["-v", f"{config.SANDBOX_RESOLV_CONF}:/etc/resolv.conf:ro"]
+    return args + [config.SANDBOX_IMAGE, "sh", "-ceu", _GIT_PUSH_SCRIPT,
+                   "git-push", remote_url, branch, path, username]
+
+
+async def docker_git_push_direct(name: str, remote_url: str, branch: str, path: str, username: str,
+                                 token: str, timeout: float) -> tuple[int, bytes, bool]:
+    """Run the fixed ephemeral Git worker. Called by sandboxd, never by a generic exec route."""
+    if not re.fullmatch(r"tb-[a-z0-9]+(?:-[a-z0-9]+)*", name):
+        raise RuntimeError("bad sandbox name")
+    remote_url, _ = git_push_remote(remote_url)
+    branch, path, username, token = (git_push_branch(branch), git_push_path(path),
+                                     git_push_username(username), _git_push_token(token))
+    return await _proc(_git_push_runner_args(name, remote_url, branch, path, username),
+                       (token + "\n").encode(), timeout)
+
+
 async def docker_addr_direct(name: str) -> str:
     await _ensure_container(name)
     code, out = await _run([
@@ -159,6 +350,19 @@ async def _docker_exec(name: str, argv: list[str], env: dict, stdin: bytes | Non
         "name": name, "argv": argv, "env": env, "timeout": timeout, "detach": detach,
         "stdin": base64.b64encode(stdin).decode() if stdin is not None else None,
     }, timeout + 150)  # room for a first container start
+    return int(res["code"]), base64.b64decode(res["output"]), bool(res["timed_out"])
+
+
+async def _docker_git_push(name: str, remote_url: str, branch: str, path: str, username: str,
+                           token: str, timeout: float) -> tuple[int, bytes, bool]:
+    """Ask sandboxd for its fixed Git worker; never tunnel this through /exec."""
+    if not config.SANDBOXD_SOCKET:
+        return await docker_git_push_direct(name, remote_url, branch, path, username, token, timeout)
+    import base64
+    res = await _sandboxd("/git-push", {
+        "name": name, "remote_url": remote_url, "branch": branch, "path": path,
+        "username": username, "token": base64.b64encode(token.encode()).decode(), "timeout": timeout,
+    }, timeout + 60)
     return int(res["code"]), base64.b64decode(res["output"]), bool(res["timed_out"])
 
 
@@ -236,6 +440,28 @@ def _check_path(path: str) -> str:
 async def run_command(key: str, command: str, env: dict | None = None, timeout: float = 60) -> str:
     code, out = await sb_exec(key, ["sh", "-c", command], env=env, timeout=min(max(timeout, 1), 300))
     return f"exit code {code}\n{out}"
+
+
+async def git_push(key: str, remote_url: str, branch: str, token: str, path: str | None = ".",
+                   username: str | None = None) -> str:
+    """Push the current committed HEAD with a one-shot worker outside the shared sandbox.
+
+    Local mode deliberately has no implementation: a local "sandbox" is the same
+    host and workspace as all project processes, so it cannot offer the promise
+    that this credential never reaches the shared computer.
+    """
+    key = _safe_key(key)
+    remote_url, _ = git_push_remote(remote_url)
+    branch, path, username, token = (git_push_branch(branch), git_push_path(path),
+                                     git_push_username(username), _git_push_token(token))
+    if config.SANDBOX_BACKEND != "docker":
+        return "error: git_push requires the Docker sandbox to keep the token out of the shared workspace"
+    timeout = 180.0
+    async with _key_lock(key):
+        code, out, timed_out = await _docker_git_push(f"tb-{key}", remote_url, branch, path, username,
+                                                       token, timeout)
+    _, text = _format(code, out, timed_out, timeout, raw=False)
+    return f"exit code {code}\n{text}"
 
 
 async def write_file(key: str, path: str, content: str) -> str:

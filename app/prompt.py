@@ -174,10 +174,12 @@ def _tool_guidance(names: set[str], bot: Bot, ctx) -> str:
                      "left out of this chat, use `search_history` before asking them to repeat it.")
     if "use_skill" in names:
         parts.append(MENTIONS)
-    if "http_request" in names:
-        parts.append("## Secrets\nYou never see stored secret values. Use them only through `http_request`, by "
-                     "writing the placeholder {{secret:NAME}}; each works only for its bound hosts. If the person "
-                     "gives you a new secret, store it with `set_secret` (bound to hosts); you cannot read it back.")
+    if names & {"http_request", "git_push"}:
+        parts.append("## Secrets\nYou never see stored secret values. Use them only through `http_request` or "
+                     "`git_push`, by writing the placeholder {{secret:NAME}}; each works only for its bound hosts. "
+                     "For git_push, token must be exactly that placeholder and its binding must exactly match the "
+                     "HTTPS remote host. If the person gives you a new secret, store it with `set_secret` (bound "
+                     "to hosts); you cannot read it back.")
     if any(n.startswith("screen_") for n in names):
         parts.append(f"## Your screen\nYou have your own {screen.WIDTH}x{screen.HEIGHT} screen with a browser. Use it "
                      "for sites that have no API or tool. Take a screenshot, act with one screen tool, take a "
@@ -242,7 +244,7 @@ async def build(bot: Bot, conv: Conversation, user: User, ctx, tool_names: set[s
     team_mem, _ = memory.render_team(key)
     profile = "" if ctx.is_channel else memory.render_user(key, user)
     index = memory.render_index(key) if names & {"knowledge_read"} else ""
-    secret_rows = secrets_http.load(bot.id) if "http_request" in names else {}
+    secret_rows = secrets_http.load(bot.id) if names & {"http_request", "git_push"} else {}
     context_text, context_hash = project_context(bot)
 
     p = PromptParts()

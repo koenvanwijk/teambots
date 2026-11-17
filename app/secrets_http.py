@@ -1,9 +1,9 @@
 """Secrets stay outside the sandbox and out of the model's context.
 
 The model only knows a secret's name. It writes the placeholder {{secret:NAME}} into an
-`http_request` call; this module, running in the app, swaps in the real value just before the
-request leaves, and only when the destination host is one the secret is bound to. Everything
-that flows back to the model is masked.
+`http_request` or `git_push` call; this module, running in the app, swaps in the real value just
+before the request leaves, and only when the destination host is one the secret is bound to.
+Everything that flows back to the model is masked.
 """
 import ipaddress
 import re
@@ -12,7 +12,7 @@ from urllib.parse import urlsplit
 
 import httpx
 
-from . import config
+from . import config, sandbox
 from .db import Secret, select, session
 
 PLACEHOLDER = re.compile(r"\{\{secret:([A-Z_][A-Z0-9_]*)\}\}")
@@ -39,7 +39,7 @@ def mask(text: str, bot_id: int) -> str:
 # When a pattern has a group, the group is the value; otherwise the whole match is.
 LEAKS = [(kind, name, host, re.compile(rx)) for kind, name, host, rx in [
     ("private key", "PRIVATE_KEY", "", r"-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?(?:-----END [A-Z ]*PRIVATE KEY-----|\Z)"),
-    ("GitHub token", "GITHUB_TOKEN", "api.github.com", r"\b(?:gh[pousr]_[A-Za-z0-9]{30,}|github_pat_[A-Za-z0-9_]{30,})"),
+    ("GitHub token", "GITHUB_TOKEN", "github.com,api.github.com", r"\b(?:gh[pousr]_[A-Za-z0-9]{30,}|github_pat_[A-Za-z0-9_]{30,})"),
     ("GitLab token", "GITLAB_TOKEN", "gitlab.com", r"\bglpat-[A-Za-z0-9_-]{20,}"),
     ("Slack token", "SLACK_TOKEN", "slack.com", r"\bxox[abeprs]-[A-Za-z0-9-]{10,}"),
     ("AWS access key", "AWS_ACCESS_KEY_ID", "", r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b"),
@@ -127,3 +127,40 @@ async def http_request(bot_id: int, method: str, url: str, headers: dict | None 
         text = text[:MAX_BODY] + "\n[... truncated ...]"
     location = f"\nLocation: {r.headers['location']}" if "location" in r.headers else ""
     return mask(f"HTTP {r.status_code}{location}\n{text}", bot_id)
+
+
+async def git_push(bot_id: int, sandbox_key: str, remote_url: str, branch: str, token: str,
+                   path: str | None = ".", username: str | None = None) -> str:
+    """Resolve one stored token and send it only to the dedicated Git worker.
+
+    Unlike HTTP placeholders, `token` must be exactly one placeholder.  This
+    keeps a credential from being mixed into a URL/refspec and lets the approval
+    card show only its stored name.
+    """
+    try:
+        remote_url, host = sandbox.git_push_remote(remote_url)
+        branch = sandbox.git_push_branch(branch)
+        path = sandbox.git_push_path(path)
+        username = sandbox.git_push_username(username)
+    except ValueError as e:
+        return f"error: {e}; nothing was pushed"
+    if not config.GIT_PUSH_ALLOW_PRIVATE and not _is_public(host):
+        return "error: this Git host is not a public address; nothing was pushed"
+    if not isinstance(token, str) or not (match := PLACEHOLDER.fullmatch(token)):
+        return "error: token must be exactly one {{secret:NAME}} placeholder; nothing was pushed"
+    name = match.group(1)
+    secrets = load(bot_id)
+    if name not in secrets:
+        return f"error: unknown secret {name}; nothing was pushed"
+    value, bound = secrets[name]
+    # A git write credential is deliberately stricter than a generic HTTP
+    # secret: a binding for example.com does not authorize every subdomain.
+    if host not in bound:
+        return f"error: secret {name} is not bound exactly to Git host {host}; nothing was pushed"
+    if config.SANDBOX_BACKEND != "docker":
+        return "error: git_push requires the Docker sandbox to keep the token out of the shared workspace"
+    try:
+        result = await sandbox.git_push(sandbox_key, remote_url, branch, value, path, username)
+    except ValueError as e:
+        return f"error: {e}; nothing was pushed"
+    return mask(result, bot_id)

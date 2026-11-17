@@ -38,8 +38,11 @@ class FakeDocker:
                 return 0, b"172.20.0.5 ", False
             return 0, f"true {self.containers[name]}\n".encode(), False
         if argv[:2] == ["docker", "run"]:
-            name = argv[argv.index("--name") + 1]
-            self.containers[name] = argv[argv.index("--runtime") + 1] if "--runtime" in argv else "runc"
+            # Persistent project sandboxes have a name; the protected Git
+            # runner intentionally does not, because it is one-shot and --rm.
+            if "--name" in argv:
+                name = argv[argv.index("--name") + 1]
+                self.containers[name] = argv[argv.index("--runtime") + 1] if "--runtime" in argv else "runc"
             return 0, b"cid\n", False
         if argv[:3] == ["docker", "rm", "-f"]:
             self.containers.pop(argv[3], None)
@@ -142,6 +145,37 @@ def test_sandboxd_rejects_bad_requests(sandboxd):
         assert c.post("/destroy", json={"name": "teambots-app-1"}).status_code == 400
         for path in ("/docs", "/openapi.json"):
             assert c.get(path).status_code == 404
+
+
+def test_git_push_uses_a_fixed_ephemeral_worker_and_stdin_token(sandboxd):
+    fake, _ = sandboxd
+    token = "very-secret-git-token"
+    out = asyncio.run(sandbox.git_push(
+        "p9", "https://github.com/acme/repo.git", "main", token, "repo", "x-access-token"))
+    assert out.startswith("exit code 0")
+    run = next(c for c in fake.calls if c[:2] == ["docker", "run"] and "--read-only" in c)
+    assert "--name" not in run and "--rm" in run and "-i" in run
+    assert "--cap-drop" in run and run[run.index("--cap-drop") + 1] == "ALL"
+    assert "--security-opt" in run and "no-new-privileges" in run
+    assert run[run.index("-v") + 1] == "tb-p9:/source:ro"
+    assert "--tmpfs" in run and "/work:rw,noexec,nosuid,size=768m,mode=1777" in run
+    assert "--runtime" in run and run[run.index("--runtime") + 1] == "runsc"
+    assert token not in " ".join(run)
+    assert all(token not in " ".join(call) for call in fake.calls)
+    assert fake.stdin[-1] == (token + "\n").encode()
+
+
+def test_sandboxd_rejects_invalid_git_push_inputs(sandboxd):
+    _, sock = sandboxd
+    import base64
+    good_token = base64.b64encode(b"token").decode()
+    with httpx.Client(transport=httpx.HTTPTransport(uds=sock), base_url="http://s") as c:
+        bad_url = {"name": "tb-p1", "remote_url": "ssh://git@example.com/repo", "branch": "main",
+                   "token": good_token}
+        bad_branch = {"name": "tb-p1", "remote_url": "https://example.com/repo.git", "branch": "main:evil",
+                      "token": good_token}
+        assert c.post("/git-push", json=bad_url).status_code == 400
+        assert c.post("/git-push", json=bad_branch).status_code == 400
 
 
 def test_interrupted_turn_stops_the_command(sandboxd):
