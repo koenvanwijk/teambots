@@ -28,7 +28,7 @@ TIMEZONE = os.environ.get("TB_TIMEZONE", "Europe/Amsterdam")
 SANDBOX_BROWSER = os.environ.get("TB_BROWSER", "google-chrome")
 # http_request may only reach public addresses unless this is set (development, internal APIs).
 HTTP_ALLOW_PRIVATE = os.environ.get("TB_HTTP_ALLOW_PRIVATE", "0") == "1"
-MAX_STEPS = int(os.environ.get("TB_MAX_STEPS", "12"))
+MAX_STEPS = int(os.environ.get("TB_MAX_STEPS", "40"))
 # Background learning: after some turns a cheap side call (Spark when available) saves memory and
 # skills, and long chats get a rolling summary of what fell out of the history. "0" turns both off.
 LEARNING = os.environ.get("TB_LEARNING", "1") != "0"
