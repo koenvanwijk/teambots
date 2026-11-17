@@ -1170,6 +1170,30 @@ def patch_coding_bot(bot_id: int, body: CodingBotPatch, user: User = Depends(cur
         return coding.bot_out(b, conv)
 
 
+def _coding_bot(s, bot_id: int, user: User) -> Bot:
+    b = s.get(Bot, bot_id)
+    _need(b and b.runner == "claude_code" and b.owner_id == user.id, 404, "bot not found")
+    return b
+
+
+@router.get("/coding-bots/{bot_id}/login")
+async def coding_login_status(bot_id: int, user: User = Depends(current_user)):
+    _coding_on()
+    with session() as s:
+        b = _coding_bot(s, bot_id, user)
+    return {"logged_in": await coding.logged_in(b)}
+
+
+@router.post("/coding-bots/{bot_id}/login")
+async def coding_login(bot_id: int, user: User = Depends(current_user)):
+    """Opens a terminal with `claude` on the bot's screen; the person signs in there."""
+    _coding_on()
+    with session() as s:
+        b = _coding_bot(s, bot_id, user)
+    await coding.open_login(b)
+    return {"screen": f"/api/bots/{bot_id}/screen/vnc"}
+
+
 @router.delete("/bots/{bot_id}")
 async def delete_bot(bot_id: int, user: User = Depends(current_user)):
     """Owner only. Removes the bot for everyone, with its chats and routines. The project's knowledge base

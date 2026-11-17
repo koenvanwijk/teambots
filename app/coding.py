@@ -11,7 +11,7 @@ import re
 import time
 from datetime import datetime, timezone
 
-from . import config, sandbox, secrets_http, usage
+from . import config, sandbox, screen, secrets_http, usage
 from .db import Bot, CodingRun, Conversation, Message, Session, User, select, session
 
 RUNNER = "claude_code"
@@ -150,6 +150,18 @@ async def logged_in(bot: Bot) -> bool:
     from .home import sandbox_key
     code, _ = await sandbox.sb_exec(sandbox_key(bot), ["test", "-s", ".config/claude/.credentials.json"])
     return code == 0
+
+
+LOGIN_SCRIPT = ('export CLAUDE_CONFIG_DIR="$PWD/.config/claude"; mkdir -p "$CLAUDE_CONFIG_DIR"; '
+                'exec xfce4-terminal --geometry 160x45 -x "$1"')
+
+
+async def open_login(bot: Bot) -> None:
+    """Open a terminal running `claude` on the bot's screen, so the person can sign in there."""
+    from .home import sandbox_key
+    key = sandbox_key(bot)
+    await sandbox.sb_spawn(key, ["sh", "-c", LOGIN_SCRIPT, "sh", config.CODING_CLAUDE_BIN],
+                           env=await screen._env(key, bot.id))
 
 
 def _post_msg(conv_id: int, **fields):

@@ -486,3 +486,38 @@ def test_run_script_does_not_start_claude_after_stop_marker(client, fake_claude)
     subprocess.run(["sh", "-c", coding.RUN_SCRIPT, "sh", ".coding/run-x", "", "opus", "", config.CODING_CLAUDE_BIN],
                    cwd=ws, check=True, timeout=10)
     assert not os.path.exists(os.path.join(ws, ".coding", "run-x.pid"))
+
+
+def test_login_status(client, bot_without_login):
+    from app.db import Bot, session
+    bid, _, h = bot_without_login
+    assert client.get(f"/api/coding-bots/{bid}/login", headers=h).json() == {"logged_in": False}
+    with session() as s:
+        _login(s.get(Bot, bid).owner_id)
+    assert client.get(f"/api/coding-bots/{bid}/login", headers=h).json() == {"logged_in": True}
+
+
+def test_login_routes_are_owner_only(client, logged_in_bot):
+    bid, _, _ = logged_in_bot
+    other = _register(client, _uniq("lo"))
+    assert client.get(f"/api/coding-bots/{bid}/login", headers=other).status_code == 404
+    assert client.post(f"/api/coding-bots/{bid}/login", headers=other).status_code == 404
+
+
+def test_open_login_spawns_terminal(client, bot_without_login, monkeypatch):
+    from app import coding
+    bid, _, h = bot_without_login
+    calls = []
+
+    async def fake_spawn(key, argv, env=None):
+        calls.append((key, argv, env))
+
+    async def fake_env(key, bot_id, **kw):
+        return {"DISPLAY": f":{100 + bot_id}"}
+
+    monkeypatch.setattr(coding.sandbox, "sb_spawn", fake_spawn)
+    monkeypatch.setattr(coding.screen, "_env", fake_env)
+    r = client.post(f"/api/coding-bots/{bid}/login", headers=h)
+    assert r.json() == {"screen": f"/api/bots/{bid}/screen/vnc"}
+    key, argv, env = calls[0]
+    assert key.startswith("home-u") and "xfce4-terminal" in argv[2] and env["DISPLAY"] == f":{100 + bid}"
