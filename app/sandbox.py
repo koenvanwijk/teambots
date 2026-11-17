@@ -81,12 +81,20 @@ async def _ensure_container(name: str) -> None:
     async with _lock:
         if name in _started:
             return
-        code, out = await _run(["docker", "inspect", "-f", "{{.State.Running}} {{.HostConfig.Runtime}}", name],
-                               None, 20)
-        running, _, runtime = out.strip().partition(" ") if code == 0 else ("", "", "")
-        if code == 0 and config.SANDBOX_RUNTIME and runtime != config.SANDBOX_RUNTIME:
-            # Created under another runtime (e.g. before gVisor): recreate it. The named volume,
-            # and so the workspace, is kept; only running processes are lost.
+        code, out = await _run([
+            "docker", "inspect", "-f", "{{.State.Running}}|{{.HostConfig.Runtime}}|{{.Image}}", name
+        ], None, 20)
+        fields = out.strip().split("|", maxsplit=2) if code == 0 else []
+        running, runtime, container_image = fields if len(fields) == 3 else ("", "", "")
+        image_changed = False
+        if code == 0:
+            image_code, image_id = await _run(["docker", "image", "inspect", "-f", "{{.Id}}",
+                                               config.SANDBOX_IMAGE], None, 20)
+            image_changed = image_code == 0 and container_image != image_id.strip()
+        runtime_changed = bool(config.SANDBOX_RUNTIME and runtime != config.SANDBOX_RUNTIME)
+        if code == 0 and (runtime_changed or image_changed):
+            # Recreate for a new image or runtime. The named volume, and so the workspace, is kept;
+            # only running processes are lost.
             await _run(["docker", "rm", "-f", name], None, 60)
             code = 1
         if code != 0:

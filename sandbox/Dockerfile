@@ -1,5 +1,5 @@
-# The project computer. One container per project; every bot gets its own virtual screen in it.
-# People can also open that same screen interactively (x11vnc + noVNC) through the TeamBots UI.
+# The project computer. One container per project; every bot gets its own lightweight XFCE desktop.
+# People can also open that desktop interactively (x11vnc + noVNC) through the TeamBots UI.
 # Default browser is official Google Chrome stable; Debian Chromium stays installed as a fallback
 # (set TB_BROWSER=chromium). Chrome runs as the unprivileged user `bot` and needs --no-sandbox
 # in this image (capabilities are dropped). The profile lives on the project volume:
@@ -13,6 +13,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     nodejs npm \
     xvfb xdotool imagemagick chromium fonts-liberation fonts-dejavu-core \
     x11vnc novnc websockify \
+    xfce4-session xfce4-panel xfdesktop4 xfwm4 xfce4-terminal xfce4-appfinder \
+    thunar mousepad dbus-x11 x11-utils \
     && curl -fsSL https://dl.google.com/linux/linux_signing_key.pub \
          | gpg --dearmor -o /usr/share/keyrings/google-linux.gpg \
     && echo "deb [arch=amd64 signed-by=/usr/share/keyrings/google-linux.gpg] http://dl.google.com/linux/chrome/deb/ stable main" \

@@ -1,10 +1,10 @@
-"""A screen per bot: a virtual X display inside the project's sandbox, with a browser.
+"""A lightweight desktop per bot: a virtual X display inside the project's sandbox.
 
 The model looks with `screen_screenshot` and acts with mouse and keyboard tools. People watch
-the same screen in the web UI, and can take over with mouse and keyboard through noVNC
-(x11vnc attached to this Xvfb, proxied by TeamBots). Needs Xvfb, xdotool, ImageMagick and a
-Chromium in the sandbox image (sandbox/Dockerfile installs them, plus x11vnc/noVNC) and a
-model that accepts image input.
+the same desktop in the web UI, and can take over with mouse and keyboard through noVNC
+(x11vnc attached to this Xvfb, proxied by TeamBots). Needs XFCE, Xvfb, xdotool, ImageMagick and a
+browser in the sandbox image (sandbox/Dockerfile installs them, plus x11vnc/noVNC) and a model
+that accepts image input.
 """
 import asyncio
 import logging
@@ -15,6 +15,8 @@ from .sandbox import sandbox_addr, sb_exec, sb_spawn
 log = logging.getLogger("teambots.screen")
 
 WIDTH, HEIGHT = 1280, 800
+_desktop_started: set[tuple[str, int]] = set()
+_desktop_locks: dict[tuple[str, int], asyncio.Lock] = {}
 
 
 def _display(bot_id: int) -> int:
@@ -43,6 +45,33 @@ async def _port_open(key: str, port: int) -> bool:
 async def _has_vnc_tools(key: str) -> bool:
     code, _ = await sb_exec(key, ["sh", "-c", "command -v x11vnc && command -v websockify"], timeout=10)
     return code == 0
+
+
+async def _ensure_desktop(key: str, bot_id: int, env: dict) -> None:
+    """Start a lightweight XFCE desktop on this bot's display when the image supports it."""
+    screen_key = (key, bot_id)
+    lock = _desktop_locks.setdefault(screen_key, asyncio.Lock())
+    async with lock:
+        if screen_key in _desktop_started:
+            return
+        code, _ = await sb_exec(
+            key, ["sh", "-c", "command -v dbus-launch && command -v xfce4-session && command -v xprop"],
+            env=env, timeout=10,
+        )
+        if code != 0:
+            return
+        code, out = await sb_exec(key, ["xprop", "-root", "_NET_SUPPORTING_WM_CHECK"], env=env, timeout=10)
+        if code == 0 and "window id #" in out:
+            _desktop_started.add(screen_key)
+            return
+        await sb_spawn(key, ["dbus-launch", "--exit-with-session", "xfce4-session"], env=env)
+        for _ in range(40):
+            await asyncio.sleep(0.25)
+            code, out = await sb_exec(key, ["xprop", "-root", "_NET_SUPPORTING_WM_CHECK"], env=env, timeout=10)
+            if code == 0 and "window id #" in out:
+                _desktop_started.add(screen_key)
+                return
+        raise RuntimeError("XFCE did not start; check the sandbox desktop packages")
 
 
 async def _ensure_vnc(key: str, bot_id: int, env: dict) -> None:
@@ -82,6 +111,7 @@ async def _env(key: str, bot_id: int, *, start_vnc: bool = True) -> dict:
     env = {"DISPLAY": f":{n}"}
     code, _ = await sb_exec(key, ["xdotool", "getdisplaygeometry"], env=env, timeout=10)
     if code != 0:
+        _desktop_started.discard((key, bot_id))
         await sb_exec(key, ["sh", "-c", f"rm -f /tmp/.X{n}-lock /tmp/.X11-unix/X{n}"])  # stale after a restart
         await sb_spawn(key, ["Xvfb", f":{n}", "-screen", "0", f"{WIDTH}x{HEIGHT}x24", "-nolisten", "tcp"])
         for _ in range(40):
@@ -91,6 +121,7 @@ async def _env(key: str, bot_id: int, *, start_vnc: bool = True) -> dict:
                 break
         else:
             raise RuntimeError("the screen did not start; does the sandbox image contain Xvfb and xdotool?")
+    await _ensure_desktop(key, bot_id, env)
     if start_vnc:
         try:
             await _ensure_vnc(key, bot_id, env)

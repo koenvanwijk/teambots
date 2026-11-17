@@ -54,3 +54,35 @@ def test_read_file_returns_note_for_png_not_bytes():
     assert text == "hello-from-file"
     missing = asyncio.run(sandbox.read_file("p1", "nope.txt"))
     assert missing.startswith("error:")
+
+
+def test_screen_starts_xfce_once_when_available(monkeypatch):
+    import importlib
+
+    screen = importlib.import_module("app.screen")
+
+    screen_key = ("p1", 7)
+    screen._desktop_started.discard(screen_key)
+    calls = {"wm": 0, "spawn": []}
+
+    async def fake_exec(key, argv, env=None, timeout=60, raw=False):
+        if argv[0] == "sh":
+            return 0, ""
+        calls["wm"] += 1
+        if calls["wm"] == 1:
+            return 1, ""
+        return 0, "_NET_SUPPORTING_WM_CHECK(WINDOW): window id # 0x1"
+
+    async def fake_spawn(key, argv, env=None):
+        calls["spawn"].append((argv, env))
+
+    monkeypatch.setattr(screen, "sb_exec", fake_exec)
+    monkeypatch.setattr(screen, "sb_spawn", fake_spawn)
+
+    async def check():
+        await screen._ensure_desktop("p1", 7, {"DISPLAY": ":107"})
+        await screen._ensure_desktop("p1", 7, {"DISPLAY": ":107"})
+
+    asyncio.run(check())
+    assert calls["spawn"] == [(["dbus-launch", "--exit-with-session", "xfce4-session"], {"DISPLAY": ":107"})]
+    assert screen_key in screen._desktop_started
