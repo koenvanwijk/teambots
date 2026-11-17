@@ -135,7 +135,7 @@ def me(user: User = Depends(current_user)):
     with session() as s:
         can_costs = usage.user_can_view_costs(s, user.id)
     return {"id": user.id, "username": user.username, "display_name": user.display_name,
-            "can_view_costs": can_costs}
+            "can_view_costs": can_costs, "coding_bots": config.CODING_BOTS}
 
 
 # ---------------------------------------------------------------- sign in with GitHub or Google

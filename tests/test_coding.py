@@ -521,3 +521,11 @@ def test_open_login_spawns_terminal(client, bot_without_login, monkeypatch):
     assert r.json() == {"screen": f"/api/bots/{bid}/screen/vnc"}
     key, argv, env = calls[0]
     assert key.startswith("home-u") and "xfce4-terminal" in argv[2] and env["DISPLAY"] == f":{100 + bid}"
+
+
+def test_me_reports_coding_bots_on(client):
+    assert client.get("/api/me", headers=_register(client, "coding_me_on")).json()["coding_bots"] is True
+
+
+def test_me_reports_coding_bots_off(client_off):
+    assert client_off.get("/api/me", headers=_register(client_off, "coding_me_off")).json()["coding_bots"] is False
