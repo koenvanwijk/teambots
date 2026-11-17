@@ -1076,6 +1076,10 @@ def patch_bot(bot_id: int, body: BotPatch, user: User = Depends(current_user)):
         if "endpoint_id" in data:
             _need(not b.runner, 400, "a coding bot is personal and cannot be shared")
             _usable_endpoint(s, data["endpoint_id"], b.team_id, user)
+        if b.runner:
+            _need("model" not in data or coding.MODEL_RE.fullmatch(data["model"]), 400,
+                  "model: letters, digits and . _ : - only")
+            _need(data.get("computer_use", True), 400, "a coding bot always has its computer")
         _need(data.get("approval_mode", "ask") in ("ask", "auto"), 400, "approval_mode: ask | auto")
         _need(data.get("name", "x").strip(), 400, "the bot needs a name")
         if data.get("handle", b.handle) != b.handle:

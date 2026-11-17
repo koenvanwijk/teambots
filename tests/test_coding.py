@@ -100,3 +100,13 @@ def test_coding_bot_cannot_be_shared_or_used_by_others(client):
     other = _register(client, "coding_other")
     assert client.patch(f"/api/coding-bots/{bid}", headers=other, json={"name": "mine"}).status_code == 404
     assert client.get("/api/coding-bots", headers=other).json() == []
+
+
+def test_generic_bot_patch_keeps_coding_bot_invariants(client):
+    h = _register(client, "coding_generic_patch")
+    bid = client.post("/api/coding-bots", headers=h, json={"name": "Coder"}).json()["id"]
+    assert client.patch(f"/api/bots/{bid}", headers=h, json={"model": "opus; rm -rf /"}).status_code == 400
+    assert client.patch(f"/api/bots/{bid}", headers=h, json={"computer_use": False}).status_code == 400
+    r = client.patch(f"/api/bots/{bid}", headers=h, json={"model": "sonnet"})
+    assert r.status_code == 200, r.text
+    assert r.json()["model"] == "sonnet"
