@@ -49,12 +49,14 @@ def mock_server():
 def copilot(mock_server):
     from app import copilot as mod
     mod.clear_cache()
-    orig_token_url, orig_fallback = mod.token_url, mod.fallback_base
+    orig = mod.token_url, mod.fallback_base, mod.login_base, mod.DEVICE_CLIENT_ID
     mod.token_url = lambda domain: f"{MOCK}/copilot_internal/v2/token"
     mod.fallback_base = lambda domain: MOCK
+    mod.login_base = lambda domain: MOCK
+    mod.DEVICE_CLIENT_ID = mock_copilot.CLIENT_ID
     httpx.post(MOCK + "/__reset", timeout=2)
     yield mod
-    mod.token_url, mod.fallback_base = orig_token_url, orig_fallback
+    mod.token_url, mod.fallback_base, mod.login_base, mod.DEVICE_CLIENT_ID = orig
     mod.clear_cache()
 
 
@@ -244,3 +246,90 @@ def test_vision_header_required_for_images(copilot):
         assert "HTTP 400" in err and "Bad Request" in err
         assert sess["token"] not in err
     asyncio.run(go())
+
+
+def _register(c, username):
+    r = c.post("/api/register", json={"username": username, "password": "password123", "display_name": username})
+    assert r.status_code == 200, r.text
+    return {"Authorization": f"Bearer {r.json()['token']}"}
+
+
+def _device_login(c, h):
+    start = c.post("/api/copilot/device/start", headers=h, json={"github_domain": "ictgroup.ghe.com"})
+    assert start.status_code == 200, start.text
+    body = start.json()
+    assert body["user_code"] == mock_copilot.USER_CODE
+    assert body["verification_uri"] == "https://ictgroup.ghe.com/login/device"
+    assert mock_copilot.DEVICE_CODE not in start.text
+    login = body["login_id"]
+    first = c.post("/api/copilot/device/poll", headers=h, json={"login_id": login})
+    assert first.status_code == 200, first.text
+    assert first.json()["status"] == "pending"
+    done = c.post("/api/copilot/device/poll", headers=h, json={"login_id": login})
+    assert done.json()["status"] == "done"
+    assert mock_copilot.GITHUB_TOKEN not in done.text
+    return login
+
+
+def test_device_login_creates_copilot_endpoint(copilot):
+    """Sign in with a device code instead of pasting a token; the token never reaches the browser."""
+    from fastapi.testclient import TestClient
+    from app.main import app
+    from app import config
+    from app.db import session, Endpoint
+
+    with TestClient(app) as c:
+        h = _register(c, "copilot_device_tester")
+        team_id = c.post("/api/teams", headers=h, json={"name": "Device Project"}).json()["id"]
+        login = _device_login(c, h)
+
+        r = c.post(f"/api/teams/{team_id}/endpoints", headers=h, json={
+            "name": "My Copilot", "provider": "github_copilot", "github_domain": "ictgroup.ghe.com",
+            "device_login": login, "default_model": "claude-sonnet-5"})
+        assert r.status_code == 200, r.text
+        assert r.json()["has_key"] is True
+        assert mock_copilot.GITHUB_TOKEN not in r.text
+        ep_id = r.json()["id"]
+        with session() as s:
+            assert config.decrypt(s.get(Endpoint, ep_id).api_key_enc) == mock_copilot.GITHUB_TOKEN
+        assert c.post(f"/api/endpoints/{ep_id}/test", headers=h).json()["reachable"] is True
+
+        again = c.post(f"/api/teams/{team_id}/endpoints", headers=h, json={
+            "name": "Twice", "provider": "github_copilot", "github_domain": "ictgroup.ghe.com",
+            "device_login": login, "default_model": "claude-sonnet-5"})
+        assert again.status_code == 400
+
+
+def test_device_login_is_bound_to_its_user(copilot):
+    from fastapi.testclient import TestClient
+    from app.main import app
+
+    with TestClient(app) as c:
+        h = _register(c, "copilot_device_owner")
+        login = _device_login(c, h)
+        other = _register(c, "copilot_device_other")
+        team_id = c.post("/api/teams", headers=other, json={"name": "Other Project"}).json()["id"]
+        assert c.post("/api/copilot/device/poll", headers=other, json={"login_id": login}).status_code == 404
+        r = c.post(f"/api/teams/{team_id}/endpoints", headers=other, json={
+            "name": "Stolen", "provider": "github_copilot", "github_domain": "ictgroup.ghe.com",
+            "device_login": login, "default_model": "claude-sonnet-5"})
+        assert r.status_code == 400
+
+
+def test_device_login_replaces_token_on_edit(copilot):
+    from fastapi.testclient import TestClient
+    from app.main import app
+    from app import config
+    from app.db import session, Endpoint
+
+    with TestClient(app) as c:
+        h = _register(c, "copilot_device_editor")
+        team_id = c.post("/api/teams", headers=h, json={"name": "Edit Project"}).json()["id"]
+        ep_id = c.post(f"/api/teams/{team_id}/endpoints", headers=h, json={
+            "name": "Old token", "provider": "github_copilot", "github_domain": "ictgroup.ghe.com",
+            "api_key": "ghu_oldtoken_notreal_000000000000", "default_model": "claude-sonnet-5"}).json()["id"]
+        login = _device_login(c, h)
+        r = c.patch(f"/api/endpoints/{ep_id}", headers=h, json={"device_login": login})
+        assert r.status_code == 200, r.text
+        with session() as s:
+            assert config.decrypt(s.get(Endpoint, ep_id).api_key_enc) == mock_copilot.GITHUB_TOKEN

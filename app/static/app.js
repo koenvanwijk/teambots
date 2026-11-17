@@ -93,6 +93,12 @@ function form({ title, intro, fields, ok = 'Save', onSubmit }) {
     const rows = fields.map(f => {
       let input;
       if (f.type === 'note') { inputs[f.name] = { value: '', focus() {} }; return $('p', { className: 'intro', textContent: f.hint }); }
+      if (f.type === 'action') {  // a button that fills inputs[f.name].value itself (e.g. a device login id)
+        const status = $('small', { textContent: f.hint || '' }), button = $('button', { className: 'btn', type: 'button', textContent: f.button });
+        inputs[f.name] = { value: '', focus() {} };
+        button.onclick = () => f.onclick({ inputs, status, button });
+        return $('div', { className: 'field' }, $('span', { textContent: f.label }), button, status);
+      }
       if (f.type === 'textarea') input = $('textarea', { rows: f.rows || 4, value: f.value || '', placeholder: f.placeholder || '' });
       else if (f.type === 'select') input = $('select', {}, f.options.map(o => $('option', { value: o.value, textContent: o.label, selected: o.value === f.value })));
       else if (f.type === 'checkbox') input = $('input', { type: 'checkbox', checked: !!f.value });
@@ -438,8 +444,10 @@ function endpointFields(e) {
       hint: 'github.com, or a data-residency tenant such as org.ghe.com.', when: isCopilot },
     { name: 'default_model', label: 'Default model', required: v => !isRouter(v), value: e ? (e.default_model || (isRouter(e) ? 'auto' : '')) : '', mono: true, placeholder: 'claude-sonnet-5',
       hint: 'For Claude CLI, an alias like fable, haiku, sonnet or opus. For a Router, auto (rules decide) or a route name.' },
-    { name: 'api_key', label: e ? 'New token / API key' : 'Token / API key', type: 'password', required: v => !e && isCopilot(v), when: v => !isClaudeCli(v) && !isRouter(v),
-      hint: e && e.has_key ? 'Leave empty to keep the stored key.' : 'For Copilot, a GitHub OAuth token (ghu_…). Otherwise optional. Stored encrypted, never shown again.' },
+    { name: 'device_login', label: 'Sign in with GitHub', type: 'action', button: e && e.has_key ? 'Sign in again' : 'Sign in', when: isCopilot,
+      hint: 'Get a token for your own Copilot account with a device code, instead of pasting one below.', onclick: copilotDeviceLogin },
+    { name: 'api_key', label: e ? 'New token / API key' : 'Token / API key', type: 'password', required: v => !e && isCopilot(v) && !v.device_login, when: v => !isClaudeCli(v) && !isRouter(v),
+      hint: e && e.has_key ? 'Leave empty to keep the stored key.' : 'For Copilot, a GitHub OAuth token (ghu_…), or use Sign in above. Otherwise optional. Stored encrypted, never shown again.' },
     { name: 'cli_note', label: 'Claude CLI', type: 'note', when: isClaudeCli,
       hint: 'Runs the local claude binary with its own Claude Code login. TeamBots tools are sent through a JSON protocol (the CLI itself is not given host tools). Every bot shares that one account and its limits.' },
     { name: 'router_note', label: 'Router', type: 'note', when: isRouter,
@@ -447,8 +455,33 @@ function endpointFields(e) {
     { name: 'shared', label: 'Share with the project', type: 'checkbox', value: e && e.shared, hint: 'Other members can use this endpoint for their bots.' },
   ];
 }
+/** GitHub device login for a Copilot endpoint: show the code, poll until approved. The token stays on the server. */
+async function copilotDeviceLogin({ inputs, status, button }) {
+  button.disabled = true; status.textContent = 'Starting…';
+  try {
+    const st = await api('POST', '/copilot/device/start', { github_domain: inputs.github_domain.value.trim() || 'github.com' });
+    status.replaceChildren('Open ', $('a', { href: st.verification_uri, target: '_blank', rel: 'noopener', textContent: st.verification_uri }),
+      ' and enter ', $('b', { className: 'mono', textContent: st.user_code }), '. Waiting…');
+    let wait = st.interval;
+    const end = Date.now() + st.expires_in * 1000;
+    while (Date.now() < end) {
+      await new Promise(r => setTimeout(r, wait * 1000));
+      if (!button.isConnected) return;  // the dialog was closed
+      const r = await api('POST', '/copilot/device/poll', { login_id: st.login_id });
+      if (r.status === 'done') {
+        inputs.device_login.value = st.login_id; inputs.api_key.required = false;
+        status.textContent = 'Signed in. Save to store the token.';
+        return;
+      }
+      if (r.status === 'slow_down') wait += 5;
+      else if (r.status !== 'pending') throw new Error(r.status === 'denied' ? 'Sign-in was cancelled.' : 'The code expired. Try again.');
+    }
+    throw new Error('The code expired. Try again.');
+  } catch (x) { status.textContent = x.message; button.disabled = false; }
+}
 function endpointPayload(v) {
   delete v.cli_note; delete v.router_note;
+  if (!isCopilot(v) || !v.device_login) delete v.device_login;
   if (isClaudeCli(v) || isRouter(v)) { delete v.base_url; delete v.github_domain; delete v.api_key; if (isRouter(v) && !v.default_model) v.default_model = 'auto'; return v; }
   if (!v.api_key) delete v.api_key;
   if (isCopilot(v)) delete v.base_url; else delete v.github_domain;

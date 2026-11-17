@@ -87,6 +87,58 @@ def fallback_base(domain: str) -> str:
     return f"https://copilot-api.{domain}"
 
 
+DEVICE_CLIENT_ID = config.COPILOT_CLIENT_ID
+DEVICE_GRANT = "urn:ietf:params:oauth:grant-type:device_code"
+
+
+def login_base(domain: str) -> str:
+    """Web host for OAuth: https://github.com or https://org.ghe.com."""
+    return f"https://{normalize_domain(domain)}"
+
+
+async def _login_post(domain: str, path: str, data: dict) -> dict:
+    try:
+        async with httpx.AsyncClient(timeout=EXCHANGE_TIMEOUT_S) as client:
+            r = await client.post(f"{login_base(domain)}/{path}", data=data,
+                                  headers={"Accept": "application/json", **ide_headers()})
+    except httpx.HTTPError as e:
+        raise LLMError(f"cannot reach GitHub sign-in: {e.__class__.__name__}") from e
+    try:
+        body = r.json()
+    except Exception as e:  # noqa: BLE001
+        raise LLMError(f"GitHub sign-in returned HTTP {r.status_code} without JSON") from e
+    if r.status_code >= 400 and not body.get("error"):
+        raise LLMError(f"GitHub sign-in failed: HTTP {r.status_code}: {redact(r.text)}")
+    return body
+
+
+async def device_start(domain: str) -> dict:
+    """Start the OAuth device flow. Returns device_code (keep server side), user_code,
+    verification_uri, interval and expires_in."""
+    body = await _login_post(domain, "login/device/code", {"client_id": DEVICE_CLIENT_ID, "scope": "read:user"})
+    if body.get("error") or not body.get("device_code"):
+        raise LLMError(f"GitHub refused the device login: {body.get('error_description') or body.get('error')}")
+    return {"device_code": body["device_code"], "user_code": body["user_code"],
+            "verification_uri": body.get("verification_uri") or f"{login_base(domain)}/login/device",
+            "interval": int(body.get("interval") or 5), "expires_in": int(body.get("expires_in") or 900)}
+
+
+async def device_poll(domain: str, device_code: str) -> dict:
+    """One poll. Returns {status: pending | slow_down | done | expired | denied, token?}."""
+    body = await _login_post(domain, "login/oauth/access_token",
+                             {"client_id": DEVICE_CLIENT_ID, "device_code": device_code, "grant_type": DEVICE_GRANT})
+    if body.get("access_token"):
+        return {"status": "done", "token": body["access_token"]}
+    error = body.get("error") or ""
+    if error in ("authorization_pending", "slow_down"):
+        return {"status": "pending" if error == "authorization_pending" else "slow_down"}
+    if error == "expired_token":
+        return {"status": "expired"}
+    if error == "access_denied":
+        return {"status": "denied"}
+    raise LLMError(f"GitHub sign-in failed: {body.get('error_description') or error or 'no token'}")
+
+
 def _fingerprint(github_token: str) -> str:
     return hashlib.sha256(github_token.encode()).hexdigest()[:16]
 

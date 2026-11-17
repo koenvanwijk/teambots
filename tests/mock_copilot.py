@@ -11,7 +11,10 @@ COPILOT_TOKEN = "tid=test-copilot-session;proxy-ep=copilot.test"
 BASE = os.environ.get("TB_MOCK_COPILOT", "http://127.0.0.1:18793")
 
 app = FastAPI()
-stats = {"exchange": 0, "chat": 0, "models": 0}
+stats = {"exchange": 0, "chat": 0, "models": 0, "device_polls": 0}
+CLIENT_ID = "Iv1.testclient"
+DEVICE_CODE = "device-code-notreal"
+USER_CODE = "ABCD-1234"
 
 
 @app.get("/__stats")
@@ -21,8 +24,31 @@ async def get_stats():
 
 @app.post("/__reset")
 async def reset():
-    stats.update(exchange=0, chat=0, models=0)
+    stats.update(exchange=0, chat=0, models=0, device_polls=0)
     return stats
+
+
+@app.post("/login/device/code")
+async def device_code(request: Request):
+    form = await request.form()
+    if form.get("client_id") != CLIENT_ID:
+        return JSONResponse({"error": "invalid_client"}, status_code=400)
+    return {"device_code": DEVICE_CODE, "user_code": USER_CODE,
+            "verification_uri": "https://ictgroup.ghe.com/login/device", "expires_in": 900, "interval": 5}
+
+
+@app.post("/login/oauth/access_token")
+async def device_token(request: Request):
+    """Pending on the first poll, a token on the next: the person approves in between."""
+    form = await request.form()
+    if form.get("client_id") != CLIENT_ID or form.get("device_code") != DEVICE_CODE:
+        return {"error": "incorrect_device_code"}
+    if form.get("grant_type") != "urn:ietf:params:oauth:grant-type:device_code":
+        return {"error": "unsupported_grant_type"}
+    stats["device_polls"] += 1
+    if stats["device_polls"] == 1:
+        return {"error": "authorization_pending"}
+    return {"access_token": GITHUB_TOKEN, "token_type": "bearer", "scope": "read:user"}
 
 
 @app.get("/copilot_internal/v2/token")
