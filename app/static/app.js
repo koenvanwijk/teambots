@@ -953,7 +953,11 @@ async function loadCtx(conv) {
     const lists = await Promise.all(ctx.mem.bots.map(b => quiet(api('GET', `/bots/${b.id}/skills`))));
     ctx.mem.bots.forEach((b, i) => lists[i].forEach(k => ctx.skills.push({ ...k, of: b.handle })));
   } else if ((conv.kind === 'dm' || conv.kind === 'handoff') && S.bot) {
-    [ctx.skills, ctx.secrets] = await Promise.all([quiet(api('GET', `/bots/${S.bot.id}/skills`)), quiet(api('GET', `/bots/${S.bot.id}/secrets`))]);
+    const proj = S.bot.team_id && !S.bot.is_home ? S.bot.team_id : 0;
+    let own, shared;
+    [ctx.skills, own, shared] = await Promise.all([quiet(api('GET', `/bots/${S.bot.id}/skills`)), quiet(api('GET', `/bots/${S.bot.id}/secrets`)), proj ? quiet(api('GET', `/teams/${proj}/secrets`)) : []]);
+    const names = new Set(own.map(x => x.name));
+    ctx.secrets = [...shared.filter(x => !names.has(x.name)), ...own];
   }
   if (S.conv === conv) S.ctx = ctx;
 }
@@ -1577,13 +1581,23 @@ async function openDrawer(bot, tab = 'setup') {
         return li(r.name, sub, $('label', { className: 'switch', title: r.enabled ? 'Enabled' : 'Paused' }, on), ib('play', 'Run now', guard(async () => { await api('POST', `/routines/${r.id}/run`); toast('Started'); }), 15), ib('edit', 'Edit', guard(() => editRoutine(r, again)), 15), del(`/routines/${r.id}`, 'this routine')); }) : none('No routines yet.'));
   }
   if (tab === 'connections') {
-    const mcp = await get('mcp');
+    const proj = bot.team_id && !bot.is_home ? bot.team_id : 0, quiet = p => p.catch(() => []);
+    const [mcp, pmcp, psecrets] = await Promise.all([get('mcp'), proj ? quiet(api('GET', `/teams/${proj}/mcp`)) : [], proj ? quiet(api('GET', `/teams/${proj}/secrets`)) : []]);
     const parts = [];
+    const secretForm = (where, path) => async () => { if (await form({ title: where === 'project' ? 'New project secret' : 'New secret for this bot', intro: 'The value never enters the shared sandbox or the model. A bot uses it by name in an HTTP request or a protected Git push, and it is filled in outside the sandbox.', ok: 'Save secret', fields: [{ name: 'name', label: 'Name', required: true, mono: true, placeholder: 'API_TOKEN', hint: 'Capitals, digits and underscores.' }, { name: 'value', label: 'Value', type: 'password', required: true, hint: 'Stored encrypted. It is never shown again.' }, { name: 'hosts', label: 'Hosts it may be sent to', mono: true, placeholder: 'github.com,api.github.com', hint: 'Comma-separated. Without a host the secret cannot be used.' }], onSubmit: v => api('POST', path, { ...v, name: v.name.toUpperCase() }) })) { await loadCtx(S.conv); again(); } };
+    const secretRow = (s, overridden) => li(s.name, (s.hosts ? 'Only sent to ' + s.hosts : 'No host bound yet') + (overridden ? ' · this bot uses its own version' : ''), del(`/secrets/${s.id}`, 'this secret'));
+    let own = [];
+    if (manage) own = await get('secrets');
+    if (proj) {
+      const mine = new Set(own.map(s => s.name));
+      parts.push(head('Project secrets', 'Add', secretForm('project', `/teams/${proj}/secrets`)),
+        hint('Every bot in this project can use these, and every project member can change them.'),
+        psecrets.length ? psecrets.map(s => secretRow(s, mine.has(s.name))) : none('No project secrets.'));
+    }
     if (manage) {
-      const secrets = await get('secrets');
-      parts.push(head('Secrets', 'Add', async () => { if (await form({ title: 'New secret', intro: 'The value never enters the shared sandbox or the model. The bot uses it by name in an HTTP request or a protected Git push, and it is filled in outside the sandbox.', ok: 'Save secret', fields: [{ name: 'name', label: 'Name', required: true, mono: true, placeholder: 'API_TOKEN', hint: 'Capitals, digits and underscores.' }, { name: 'value', label: 'Value', type: 'password', required: true, hint: 'Stored encrypted. It is never shown again.' }, { name: 'hosts', label: 'Hosts it may be sent to', mono: true, placeholder: 'github.com,api.github.com', hint: 'Comma-separated. Without a host the secret cannot be used.' }], onSubmit: v => api('POST', `/bots/${bot.id}/secrets`, { ...v, name: v.name.toUpperCase() }) })) { await loadCtx(S.conv); again(); } }),
-        hint('Everyone who can use the bot can make requests with its secrets to the bound hosts.'),
-        secrets.length ? secrets.map(s => li(s.name, s.hosts ? 'Only sent to ' + s.hosts : 'No host bound yet', del(`/secrets/${s.id}`, 'this secret'))) : none('No secrets.'));
+      parts.push(head(proj ? 'Only this bot' : 'Secrets', 'Add', secretForm('bot', `/bots/${bot.id}/secrets`)),
+        hint(proj ? 'A secret here overrides a project secret with the same name, for this bot only.' : 'Everyone who can use the bot can make requests with its secrets to the bound hosts.'),
+        own.length ? own.map(s => li(s.name, s.hosts ? 'Only sent to ' + s.hosts : 'No host bound yet', ...(proj ? [ib('users', 'Move to project', guard(async () => { await api('POST', `/secrets/${s.id}/share`); toast('Now a project secret'); again(); }), 15)] : []), del(`/secrets/${s.id}`, 'this secret'))) : none('No secrets.'));
     }
     const mcpFields = (srv) => {
       const oauth = srv && srv.auth_mode === 'oauth';
@@ -1604,9 +1618,9 @@ async function openDrawer(bot, tab = 'setup') {
         { name: 'oauth_scopes', label: 'Scopes', mono: true, when: v => v.auth_mode === 'oauth', hint: 'Space-separated, if the provider needs them.', value: oauth ? (srv.oauth_scopes || '') : '' },
       ];
     };
-    const addMcp = async () => { const r = await form({ title: 'New MCP server', intro: 'A streamable-HTTP MCP server. Its tools become tools of this bot.', ok: 'Add', fields: mcpFields(), onSubmit: v => api('POST', `/bots/${bot.id}/mcp`, v) }); if (r) { toast(r.error || (r.tools.length ? 'Tools: ' + r.tools.join(', ') : 'Saved. Members can connect their own account below.'), r.error ? 'bad' : ''); again(); } };
+    const addMcp = (path, intro) => async () => { const r = await form({ title: 'New MCP server', intro, ok: 'Add', fields: mcpFields(), onSubmit: v => api('POST', path, v) }); if (r) { toast(r.error || (r.tools.length ? 'Tools: ' + r.tools.join(', ') : 'Saved. Members can connect their own account below.'), r.error ? 'bad' : ''); again(); } };
     const editMcp = async (srv) => { const r = await form({ title: 'Edit MCP server', intro: 'Change this server, including its OAuth client id, secret and scopes. The client secret is never shown.', ok: 'Save', fields: mcpFields(srv), onSubmit: v => api('PATCH', `/mcp/${srv.id}`, v) }); if (r) { toast(r.error || 'Saved', r.error ? 'bad' : ''); again(); } };
-    const mcpRow = srv => {
+    const mcpRow = (srv, overridden) => {
       const isOauth = srv.auth_mode === 'oauth';
       const perUser = srv.auth_mode === 'token' && srv.auth_scope === 'user';
       const tail = [$('span', { className: 'tag', textContent: srv.trusted ? 'trusted' : 'asks first' })];
@@ -1622,12 +1636,18 @@ async function openDrawer(bot, tab = 'setup') {
           if (v) { toast('Connected'); again(); } }) }));
         if (srv.connected) tail.push(ib('x', 'Disconnect', guard(async () => { await api('DELETE', `/mcp/${srv.id}/credential`); toast('Disconnected'); again(); }), 15));
       }
-      if (manage) { tail.push(ib('edit', 'Edit', guard(() => editMcp(srv)), 15)); tail.push(del(`/mcp/${srv.id}`, 'this server')); }
-      return li(srv.name, srv.url, ...tail);
+      if (manage || srv.scope === 'project') { tail.push(ib('edit', 'Edit', guard(() => editMcp(srv)), 15)); tail.push(del(`/mcp/${srv.id}`, 'this server')); }
+      return li(srv.name, srv.url + (overridden ? ' · this bot uses its own server with this name' : ''), ...tail);
     };
-    parts.push(head('MCP servers', manage && 'Add', manage ? addMcp : null),
-      hint(manage ? 'Each MCP server adds its tools to this bot. For a per-user server, every member connects their own token.' : 'Connect your own token to use these tools with your account.'),
-      mcp.length ? mcp.map(mcpRow) : none(manage ? 'No MCP servers.' : 'No tools to connect.'));
+    if (proj) {
+      const mine = new Set(mcp.map(m => m.name));
+      parts.push(head('Project MCP servers', 'Add', addMcp(`/teams/${proj}/mcp`, 'A streamable-HTTP MCP server. Its tools become tools of every bot in this project.')),
+        hint('Every bot in this project gets these tools, and every project member can change them. For a per-user server, each member connects their own account once for the whole project.'),
+        pmcp.length ? pmcp.map(srv => mcpRow(srv, mine.has(srv.name))) : none('No project MCP servers.'));
+    }
+    parts.push(head(proj ? 'MCP servers of this bot only' : 'MCP servers', manage && 'Add', manage ? addMcp(`/bots/${bot.id}/mcp`, 'A streamable-HTTP MCP server. Its tools become tools of this bot.') : null),
+      hint(manage ? (proj ? 'A server here overrides a project server with the same name, for this bot only.' : 'Each MCP server adds its tools to this bot. For a per-user server, every member connects their own token.') : 'Connect your own token to use these tools with your account.'),
+      mcp.length ? mcp.map(srv => mcpRow(srv)) : none(manage ? 'No MCP servers.' : 'No tools to connect.'));
     put(body, ...parts);
   }
 }

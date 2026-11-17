@@ -83,8 +83,12 @@ def collect(cur, team_id: int, include_usage: bool) -> dict:
     data["routine"] = rows(cur, f"SELECT * FROM routine WHERE bot_id IN {bp} OR conversation_id IN {cp}", bpar + cpar)
     data["approval"] = rows(cur, f"SELECT * FROM approval WHERE conversation_id IN {cp} OR bot_id IN {bp}", cpar + bpar)
     data["approvalrule"] = rows(cur, f"SELECT * FROM approvalrule WHERE bot_id IN {bp}", bpar)
-    data["secret"] = rows(cur, f"SELECT * FROM secret WHERE bot_id IN {bp}", bpar)       # value_enc stays encrypted
-    data["mcpserver"] = rows(cur, f"SELECT * FROM mcpserver WHERE bot_id IN {bp}", bpar)  # headers_enc stays encrypted
+    # Bot secrets and servers, plus the project-wide ones (team_id set, bot_id 0); values stay encrypted.
+    scope_cols = {r[1] for r in cur.execute("PRAGMA table_info(secret)").fetchall()}
+    scope = " OR (team_id=? AND bot_id=0)" if "team_id" in scope_cols else ""
+    spar = list(bpar) + ([team_id] if scope else [])
+    data["secret"] = rows(cur, f"SELECT * FROM secret WHERE bot_id IN {bp}{scope}", spar)
+    data["mcpserver"] = rows(cur, f"SELECT * FROM mcpserver WHERE bot_id IN {bp}{scope}", spar)
     if include_usage:
         data["llmusage"] = rows(cur, "SELECT * FROM llmusage WHERE team_id=?", (team_id,))
 

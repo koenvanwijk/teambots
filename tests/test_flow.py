@@ -500,7 +500,7 @@ def test_mcp_tools(c):
 def test_secrets_stay_outside_sandbox_and_model(c):
     r = c.post(f"/api/bots/{S['bot']}/secrets", headers=H("alice"),
                json={"name": "API_TOKEN", "value": "s3cret-value", "hosts": "127.0.0.1"})
-    assert r.json() == {"id": 1, "name": "API_TOKEN", "hosts": "127.0.0.1"}
+    assert r.json() == {"id": 1, "name": "API_TOKEN", "hosts": "127.0.0.1", "scope": "bot"}
     assert "s3cret" not in c.get(f"/api/bots/{S['bot']}/secrets", headers=H("alice")).text
     # the model knows the name and the bound host, never the value
     assert say(c, "bob", S["dm_bob"], "RECALL API_TOKEN (hosts: 127.0.0.1)")[-1]["content"] == "yes"
@@ -525,6 +525,71 @@ def test_secrets_stay_outside_sandbox_and_model(c):
     assert "not bound to host localhost; nothing was sent" in approve(c, "bob", S["dm_bob"])[-1]["content"]
     from app import secrets_http
     assert not secrets_http._is_public("127.0.0.1") and not secrets_http._is_public("169.254.169.254")
+
+
+def test_project_secrets_and_tools_are_shared_by_every_bot(c):
+    from app import secrets_http
+    from app.agent import mcp_servers_for
+    from app.db import Bot, session
+    team = S["team"]
+    second = c.post(f"/api/teams/{team}/bots", headers=H("alice"), json={
+        "name": "Second", "handle": "second", "endpoint_id": S["ep"], "is_team": True}).json()
+    c.put(f"/api/bots/{second['id']}/share", headers=H("alice"), json={"published": True, "access": "team"})
+    # any project member may add a project secret (carol owns neither bot); outsiders may not
+    r = c.post(f"/api/teams/{team}/secrets", headers=H("carol"),
+               json={"name": "PROJ_TOKEN", "value": "proj-value-123", "hosts": "127.0.0.1"})
+    assert r.status_code == 200 and r.json()["scope"] == "project", r.text
+    S["proj_outsider"] = c.post("/api/register", json={"username": "proj_outsider", "password": "password123"}).json()
+    assert c.get(f"/api/teams/{team}/secrets", headers=H("proj_outsider")).status_code in (403, 404)
+    assert c.post(f"/api/teams/{team}/secrets", headers=H("proj_outsider"),
+                  json={"name": "X", "value": "y", "hosts": "a.test"}).status_code in (403, 404)
+    assert c.delete(f"/api/secrets/{r.json()['id']}", headers=H("proj_outsider")).status_code in (403, 404)
+    listed = c.get(f"/api/teams/{team}/secrets", headers=H("bob")).json()
+    assert [x["name"] for x in listed] == ["PROJ_TOKEN"] and "proj-value" not in json.dumps(listed)
+    # both bots can use it, and the bot list of its own secrets does not show it
+    assert "PROJ_TOKEN" in secrets_http.load(S["bot"]) and "PROJ_TOKEN" in secrets_http.load(second["id"])
+    assert "PROJ_TOKEN" not in c.get(f"/api/bots/{S['bot']}/secrets", headers=H("alice")).text
+    assert say(c, "bob", S["dm_bob"], "RECALL PROJ_TOKEN (hosts: 127.0.0.1)")[-1]["content"] == "yes"
+    say(c, "bob", S["dm_bob"], tool("http_request", method="POST", url=f"http://127.0.0.1:{LLM_PORT}/echo",
+                                    headers={"Authorization": "Bearer {{secret:PROJ_TOKEN}}"}))
+    out = approve(c, "bob", S["dm_bob"])[-1]["content"]
+    assert "HTTP 200" in out and "Bearer [secret:PROJ_TOKEN]" in out and "proj-value" not in out
+    # typing the value is caught as a leak in a chat with any bot of the project
+    r = c.post(f"/api/conversations/{S['dm_bob']}/messages", json={"content": "it is proj-value-123"}, headers=H("bob"))
+    assert r.status_code == 409 and r.json()["detail"]["found"][0]["name"] == "PROJ_TOKEN"
+    # a bot secret with the same name overrides the project one, for that bot only
+    own = c.post(f"/api/bots/{second['id']}/secrets", headers=H("alice"),
+                 json={"name": "PROJ_TOKEN", "value": "own-value-456", "hosts": "x.test"}).json()
+    assert secrets_http.load(second["id"])["PROJ_TOKEN"] == ("own-value-456", ["x.test"])
+    assert secrets_http.load(S["bot"])["PROJ_TOKEN"] == ("proj-value-123", ["127.0.0.1"])
+    # moving a bot secret to the project replaces the project version
+    moved = c.post(f"/api/secrets/{own['id']}/share", headers=H("bob")).json()
+    assert moved["scope"] == "project"
+    assert secrets_http.load(S["bot"])["PROJ_TOKEN"] == ("own-value-456", ["x.test"])
+    assert len(c.get(f"/api/teams/{team}/secrets", headers=H("bob")).json()) == 1
+    # an overview (home) bot belongs to no project and gets nothing from it
+    with session() as s:
+        home_bot = Bot(id=10_000, team_id=0, owner_id=S["alice"]["user"]["id"], name="h", handle="h",
+                       endpoint_id=S["ep"], is_home=True)
+        assert secrets_http.rows_for(s, home_bot) == [] and mcp_servers_for(s, home_bot) == []
+
+    # project MCP server: added by a member, its tools reach every bot of the project
+    r = c.post(f"/api/teams/{team}/mcp", headers=H("carol"), json={"name": "pcalc", "url": MCP_URL, "trusted": True})
+    assert r.status_code == 200 and r.json()["tools"] == ["add"], r.text
+    srv_id = r.json()["id"]
+    assert c.post(f"/api/teams/{team}/mcp", headers=H("bob"),
+                  json={"name": "pcalc", "url": MCP_URL}).status_code == 409
+    assert c.post(f"/api/teams/{team}/mcp", headers=H("proj_outsider"), json={"name": "z", "url": MCP_URL}).status_code in (403, 404)
+    assert c.patch(f"/api/mcp/{srv_id}", headers=H("proj_outsider"), json={"trusted": False}).status_code in (403, 404)
+    with session() as s:
+        for bot_id in (S["bot"], second["id"]):
+            assert "pcalc" in [m.name for m in mcp_servers_for(s, s.get(Bot, bot_id))]
+    assert "5" in say(c, "bob", S["dm_bob"], tool("mcp_pcalc_add", a=2, b=3))[-1]["content"]
+    assert [m["scope"] for m in c.get(f"/api/teams/{team}/mcp", headers=H("bob")).json()] == ["project"]
+    assert c.patch(f"/api/mcp/{srv_id}", headers=H("bob"), json={"trusted": False}).json()["trusted"] is False
+    assert c.delete(f"/api/mcp/{srv_id}", headers=H("bob")).status_code == 200
+    assert c.delete(f"/api/secrets/{moved['id']}", headers=H("carol")).status_code == 200
+    assert c.get(f"/api/teams/{team}/secrets", headers=H("bob")).json() == []
 
 
 def test_activity_feed_and_overview(c):

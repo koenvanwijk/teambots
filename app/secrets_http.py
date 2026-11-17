@@ -13,16 +13,29 @@ from urllib.parse import urlsplit
 import httpx
 
 from . import config, sandbox
-from .db import Secret, select, session
+from .db import Bot, Secret, select, session
 
 PLACEHOLDER = re.compile(r"\{\{secret:([A-Z_][A-Z0-9_]*)\}\}")
 MAX_BODY = 6000
 
 
+def rows_for(s, bot: Bot | None) -> list[Secret]:
+    """The secrets a bot can use: its project's secrets, then its own (a bot secret of the same
+    name wins). Home bots belong to no project and only have their own."""
+    if not bot:
+        return []
+    own = s.exec(select(Secret).where(Secret.bot_id == bot.id)).all()
+    shared = [] if bot.is_home or not bot.team_id else s.exec(
+        select(Secret).where(Secret.team_id == bot.team_id, Secret.bot_id == 0)).all()
+    names = {r.name for r in own}
+    return [r for r in shared if r.name not in names] + list(own)
+
+
 def load(bot_id: int) -> dict[str, tuple[str, list[str]]]:
     """name -> (value, bound hosts)"""
     with session() as s:
-        rows = s.exec(select(Secret).where(Secret.bot_id == bot_id)).all()
+        bot = s.get(Bot, bot_id)
+        rows = rows_for(s, bot) if bot else s.exec(select(Secret).where(Secret.bot_id == bot_id)).all()
     return {r.name: (config.decrypt(r.value_enc), [h.strip().lower() for h in r.hosts.split(",") if h.strip()])
             for r in rows}
 

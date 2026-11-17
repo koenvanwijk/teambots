@@ -654,7 +654,8 @@ def delete_team(team_id: int, confirm: str = Query(default=""), user: User = Dep
     with session() as s:
         bot_ids = [b.id for b in s.exec(select(Bot).where(Bot.team_id == team_id)).all()]
         conv_ids = [c.id for c in s.exec(select(Conversation).where(Conversation.team_id == team_id)).all()]
-        mcp_ids = [m.id for m in s.exec(select(McpServer).where(McpServer.bot_id.in_(bot_ids))).all()] if bot_ids else []
+        mcp_ids = [m.id for m in s.exec(select(McpServer).where(
+            (McpServer.team_id == team_id) | (McpServer.bot_id.in_(bot_ids or [-1])))).all()]
         for r in (s.exec(select(Routine).where(Routine.bot_id.in_(bot_ids))).all() if bot_ids else []):
             routines.remove(r.id)
 
@@ -676,6 +677,8 @@ def delete_team(team_id: int, confirm: str = Query(default=""), user: User = Dep
             wipe(BotAccess, BotAccess.bot_id.in_(bot_ids))
             wipe(Secret, Secret.bot_id.in_(bot_ids))
             wipe(McpServer, McpServer.bot_id.in_(bot_ids))
+        wipe(Secret, Secret.team_id == team_id)
+        wipe(McpServer, McpServer.team_id == team_id)
         wipe(Memory, Memory.team_id == team_id)
         wipe(Conversation, Conversation.team_id == team_id)
         wipe(Bot, Bot.team_id == team_id)
@@ -1326,28 +1329,88 @@ class SecretIn(BaseModel):
     hosts: str = ""  # comma-separated hosts this secret may be sent to, e.g. "api.github.com"
 
 
+def _project(s, team_id: int, user: User) -> None:
+    """Project-wide secrets and MCP servers: every member of the project may see and change them."""
+    _need(team_id and team_role(s, user.id, team_id), 404, "project not found")
+
+
+def _scoped(s, row, user: User, manage: bool = True) -> None:
+    """Access check for a secret or MCP server, whether it belongs to one bot or to a project."""
+    if row.bot_id:
+        _bot(s, row.bot_id, user, manage=manage)
+    else:
+        _project(s, row.team_id, user)
+
+
+def _publish_scope(s, row, kind: str, **data) -> None:
+    """Tell open settings panels: of the one bot, or of every bot in the project."""
+    ids = [row.bot_id] if row.bot_id else [b.id for b in s.exec(select(Bot).where(Bot.team_id == row.team_id)).all()]
+    for bot_id in ids:
+        events.publish_bot(bot_id, kind, **data)
+
+
+def _secret_out(r: Secret) -> dict:
+    return {"id": r.id, "name": r.name, "hosts": r.hosts, "scope": "bot" if r.bot_id else "project"}
+
+
+def _save_secret(s, body: SecretIn, bot_id: int = 0, team_id: int = 0) -> Secret:
+    _need(re.fullmatch(r"[A-Z_][A-Z0-9_]{0,63}", body.name), 400, "name must look like AN_ENV_VAR")
+    hosts = ",".join(h.strip().lower() for h in body.hosts.split(",") if h.strip())
+    _need(all(re.fullmatch(r"[a-z0-9.-]+", h) for h in hosts.split(",") if h), 400,
+          "hosts: plain host names, comma-separated")
+    for r in s.exec(select(Secret).where(Secret.bot_id == bot_id, Secret.team_id == team_id,
+                                         Secret.name == body.name)).all():
+        s.delete(r)
+    r = Secret(bot_id=bot_id, team_id=team_id, name=body.name, value_enc=config.encrypt(body.value), hosts=hosts)
+    s.add(r)
+    s.commit()
+    return r
+
+
 @router.get("/bots/{bot_id}/secrets")
 def list_secrets(bot_id: int, user: User = Depends(current_user)):
     with session() as s:
         _bot(s, bot_id, user, manage=True)
-        return [{"id": r.id, "name": r.name, "hosts": r.hosts}
-                for r in s.exec(select(Secret).where(Secret.bot_id == bot_id)).all()]
+        return [_secret_out(r) for r in s.exec(select(Secret).where(Secret.bot_id == bot_id)).all()]
 
 
 @router.post("/bots/{bot_id}/secrets")
 def add_secret(bot_id: int, body: SecretIn, user: User = Depends(current_user)):
-    _need(re.fullmatch(r"[A-Z_][A-Z0-9_]{0,63}", body.name), 400, "name must look like AN_ENV_VAR")
     with session() as s:
         _bot(s, bot_id, user, manage=True)
-        for r in s.exec(select(Secret).where(Secret.bot_id == bot_id, Secret.name == body.name)).all():
-            s.delete(r)
-        hosts = ",".join(h.strip().lower() for h in body.hosts.split(",") if h.strip())
-        _need(all(re.fullmatch(r"[a-z0-9.-]+", h) for h in hosts.split(",") if h), 400,
-              "hosts: plain host names, comma-separated")
-        r = Secret(bot_id=bot_id, name=body.name, value_enc=config.encrypt(body.value), hosts=hosts)
+        return _secret_out(_save_secret(s, body, bot_id=bot_id))
+
+
+@router.get("/teams/{team_id}/secrets")
+def list_project_secrets(team_id: int, user: User = Depends(current_user)):
+    with session() as s:
+        _project(s, team_id, user)
+        return [_secret_out(r) for r in s.exec(select(Secret).where(
+            Secret.team_id == team_id, Secret.bot_id == 0)).all()]
+
+
+@router.post("/teams/{team_id}/secrets")
+def add_project_secret(team_id: int, body: SecretIn, user: User = Depends(current_user)):
+    with session() as s:
+        _project(s, team_id, user)
+        return _secret_out(_save_secret(s, body, team_id=team_id))
+
+
+@router.post("/secrets/{secret_id}/share")
+def share_secret(secret_id: int, user: User = Depends(current_user)):
+    """Move a bot secret to its project, so every bot there can use it."""
+    with session() as s:
+        r = s.get(Secret, secret_id)
+        _need(r, 404, "secret not found")
+        bot = _bot(s, r.bot_id, user, manage=True) if r.bot_id else None
+        _need(bot and bot.team_id and not bot.is_home, 400, "only a bot secret of a project can be shared")
+        for old in s.exec(select(Secret).where(Secret.team_id == bot.team_id, Secret.bot_id == 0,
+                                               Secret.name == r.name)).all():
+            s.delete(old)
+        r.team_id, r.bot_id = bot.team_id, 0
         s.add(r)
         s.commit()
-    return {"id": r.id, "name": r.name, "hosts": r.hosts}
+        return _secret_out(r)
 
 
 @router.delete("/secrets/{secret_id}")
@@ -1355,7 +1418,7 @@ def delete_secret(secret_id: int, user: User = Depends(current_user)):
     with session() as s:
         r = s.get(Secret, secret_id)
         _need(r, 404, "secret not found")
-        _bot(s, r.bot_id, user, manage=True)
+        _scoped(s, r, user)
         s.delete(r)
         s.commit()
     return {"ok": True}
@@ -1385,7 +1448,7 @@ def _mcp_out(r: McpServer, user_id: int, s) -> dict:
     per_user = mode == "oauth" or (mode == "token" and r.auth_scope == "user")
     connected = bool(s.exec(select(McpCredential).where(
         McpCredential.mcp_server_id == r.id, McpCredential.user_id == user_id)).first()) if per_user else None
-    return {"id": r.id, "name": r.name, "url": r.url, "trusted": r.trusted,
+    return {"id": r.id, "name": r.name, "url": r.url, "trusted": r.trusted, "scope": "bot" if r.bot_id else "project",
             "auth_mode": mode, "auth_scope": getattr(r, "auth_scope", "shared"),
             "auth_header": getattr(r, "auth_header", "Authorization"), "auth_prefix": getattr(r, "auth_prefix", ""),
             "has_shared_token": bool(getattr(r, "token_enc", "")),
@@ -1408,8 +1471,25 @@ def list_mcp(bot_id: int, user: User = Depends(current_user)):
         return [_mcp_out(r, user.id, s) for r in rows]
 
 
+@router.get("/teams/{team_id}/mcp")
+def list_project_mcp(team_id: int, user: User = Depends(current_user)):
+    with session() as s:
+        _project(s, team_id, user)
+        rows = s.exec(select(McpServer).where(McpServer.team_id == team_id, McpServer.bot_id == 0)).all()
+        return [_mcp_out(r, user.id, s) for r in rows]
+
+
+@router.post("/teams/{team_id}/mcp")
+async def add_project_mcp(team_id: int, body: McpIn, user: User = Depends(current_user)):
+    return await _add_mcp(body, user, team_id=team_id)
+
+
 @router.post("/bots/{bot_id}/mcp")
 async def add_mcp(bot_id: int, body: McpIn, user: User = Depends(current_user)):
+    return await _add_mcp(body, user, bot_id=bot_id)
+
+
+async def _add_mcp(body: McpIn, user: User, bot_id: int = 0, team_id: int = 0) -> dict:
     _need(re.fullmatch(r"[a-z0-9_-]{1,24}", body.name), 400, "name: 1-24 chars of a-z 0-9 _ -")
     _need(body.auth_mode in ("none", "token", "oauth"), 400, "auth_mode: none | token | oauth")
     _need(body.auth_scope in ("shared", "user"), 400, "auth_scope: shared | user")
@@ -1427,8 +1507,14 @@ async def add_mcp(bot_id: int, body: McpIn, user: User = Depends(current_user)):
         oauth_secret_enc = config.encrypt(body.oauth_client_secret.strip()) if body.oauth_client_secret.strip() else ""
         scope = "user"  # OAuth is always per user
     with session() as s:
-        _bot(s, bot_id, user, manage=True)
-        r = McpServer(bot_id=bot_id, name=body.name, url=body.url, trusted=body.trusted,
+        if bot_id:
+            _bot(s, bot_id, user, manage=True)
+        else:
+            _project(s, team_id, user)
+            _need(not s.exec(select(McpServer).where(McpServer.team_id == team_id, McpServer.bot_id == 0,
+                                                     McpServer.name == body.name)).first(),
+                  409, "this project already has an MCP server with that name")
+        r = McpServer(bot_id=bot_id, team_id=team_id, name=body.name, url=body.url, trusted=body.trusted,
                       headers_enc=config.encrypt(json.dumps(body.headers)) if body.headers else "",
                       auth_mode=body.auth_mode, auth_scope=scope,
                       auth_header=(body.auth_header or "Authorization").strip(),
@@ -1440,7 +1526,7 @@ async def add_mcp(bot_id: int, body: McpIn, user: User = Depends(current_user)):
         s.add(r)
         s.commit()
         r_id = r.id
-    events.publish_bot(bot_id, "mcp", action="add", id=r_id)
+        _publish_scope(s, r, "mcp", action="add", id=r_id)
     # A per-user or OAuth server has no credentials yet, so don't probe it as the adder.
     try:
         probe_user = user.id if scope != "user" else None
@@ -1485,7 +1571,7 @@ async def patch_mcp(server_id: int, body: McpPatch, user: User = Depends(current
     with session() as s:
         r = s.get(McpServer, server_id)
         _need(r, 404, "server not found")
-        _bot(s, r.bot_id, user, manage=True)
+        _scoped(s, r, user)
         mode = data.get("auth_mode", getattr(r, "auth_mode", "none") or "none")
         scope = data.get("auth_scope", getattr(r, "auth_scope", "shared") or "shared")
         if mode == "oauth":
@@ -1533,8 +1619,8 @@ async def patch_mcp(server_id: int, body: McpPatch, user: User = Depends(current
         s.add(r)
         s.commit()
         out = _mcp_out(r, user.id, s)
-        bot_id = r.bot_id
-    events.publish_bot(bot_id, "mcp", action="update", id=server_id)
+        _publish_scope(s, r, "mcp", action="update", id=server_id)
+    mcp_client.invalidate(server_id)
     return out
 
 
@@ -1549,7 +1635,7 @@ def set_mcp_credential(server_id: int, body: McpCredIn, user: User = Depends(cur
     with session() as s:
         r = s.get(McpServer, server_id)
         _need(r, 404, "server not found")
-        _bot(s, r.bot_id, user)
+        _scoped(s, r, user, manage=False)
         _need(r.auth_mode == "token" and r.auth_scope == "user", 400,
               "this server does not use per-user tokens")
         cred = s.exec(select(McpCredential).where(
@@ -1562,9 +1648,8 @@ def set_mcp_credential(server_id: int, body: McpCredIn, user: User = Depends(cur
                                  value_enc=config.encrypt(body.value.strip()))
         s.add(cred)
         s.commit()
-        bot_id = r.bot_id
+        _publish_scope(s, r, "mcp", action="update", id=server_id)
     mcp_client.invalidate(server_id)
-    events.publish_bot(bot_id, "mcp", action="update", id=server_id)
     return {"ok": True, "connected": True}
 
 
@@ -1573,15 +1658,14 @@ def clear_mcp_credential(server_id: int, user: User = Depends(current_user)):
     with session() as s:
         r = s.get(McpServer, server_id)
         _need(r, 404, "server not found")
-        _bot(s, r.bot_id, user)
+        _scoped(s, r, user, manage=False)
         cred = s.exec(select(McpCredential).where(
             McpCredential.mcp_server_id == server_id, McpCredential.user_id == user.id)).first()
-        bot_id = r.bot_id
         if cred:
             s.delete(cred)
             s.commit()
+        _publish_scope(s, r, "mcp", action="update", id=server_id)
     mcp_client.invalidate(server_id)
-    events.publish_bot(bot_id, "mcp", action="update", id=server_id)
     return {"ok": True, "connected": False}
 
 
@@ -1592,7 +1676,7 @@ def mcp_oauth_start(server_id: int, user: User = Depends(current_user)):
     with session() as s:
         r = s.get(McpServer, server_id)
         _need(r, 404, "server not found")
-        _bot(s, r.bot_id, user)
+        _scoped(s, r, user, manage=False)
         _need(getattr(r, "auth_mode", "") == "oauth", 400, "this server does not use OAuth")
         try:
             url = mcp_oauth.build_authorize_url(r, user.id)
@@ -1651,14 +1735,13 @@ def delete_mcp(server_id: int, user: User = Depends(current_user)):
     with session() as s:
         r = s.get(McpServer, server_id)
         _need(r, 404, "server not found")
-        _bot(s, r.bot_id, user, manage=True)
-        bot_id = r.bot_id
+        _scoped(s, r, user)
         for cred in s.exec(select(McpCredential).where(McpCredential.mcp_server_id == server_id)).all():
             s.delete(cred)
+        _publish_scope(s, r, "mcp", action="delete", id=server_id)
         s.delete(r)
         s.commit()
     mcp_client.invalidate(server_id)
-    events.publish_bot(bot_id, "mcp", action="delete", id=server_id)
     return {"ok": True}
 
 
