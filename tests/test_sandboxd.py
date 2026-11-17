@@ -30,13 +30,15 @@ class FakeDocker:
     async def __call__(self, argv, stdin, timeout, cwd=None, env=None):
         self.calls.append(list(argv))
         self.stdin.append(stdin)
+        if argv[:3] == ["docker", "image", "inspect"]:
+            return 0, b"sha256:test-image\n", False
         if argv[:2] == ["docker", "inspect"]:
             name = argv[-1]
             if name not in self.containers:
                 return 1, b"Error: No such object", False
             if "{{.IPAddress}}" in argv[3]:
                 return 0, b"172.20.0.5 ", False
-            return 0, f"true {self.containers[name]}\n".encode(), False
+            return 0, f"true|{self.containers[name]}|sha256:test-image\n".encode(), False
         if argv[:2] == ["docker", "run"]:
             # Persistent project sandboxes have a name; the protected Git
             # runner intentionally does not, because it is one-shot and --rm.
