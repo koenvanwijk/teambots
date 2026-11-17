@@ -98,6 +98,7 @@ def test_sections_in_tier_order_with_memory_skills_and_date(world):
     assert "Koen likes tables" in text and "Ruud secret pref" not in text
     assert "- month-close: Close the month" in text and "<available_skills>" in text
     assert "Answer in the language the person writes in" in text
+    assert "![description](images/result.png)" in text and "GIF and WebP" in text
     assert re.search(r"Today: \w+ \d{2} \w+ \d{4} \(Europe/Amsterdam, UTC[+-]\d\d:\d\d\)", text)
     assert not re.search(r"\b\d{2}:\d{2}\b(?!\))", text.replace("UTC+01:00", "").replace("UTC+02:00", ""))
 
