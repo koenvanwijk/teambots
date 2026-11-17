@@ -5,7 +5,7 @@ import time
 
 
 def emit(obj):
-    sys.stdout.write(json.dumps(obj) + "\n")
+    sys.stdout.write(json.dumps(obj, ensure_ascii=False) + "\n")
     sys.stdout.flush()
 
 

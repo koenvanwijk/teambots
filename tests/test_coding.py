@@ -334,3 +334,30 @@ def test_message_during_run_is_held_then_runs_next(client, logged_in_bot):
     os.kill(first.pid, 15)  # the fake takes 30 s to answer a "sleep" prompt: end it, the held message then runs
     wait_for(lambda: (r := _last_run(bid)) and r.id != first.id and r.status != "running", timeout=20)
     assert _assistant_texts(conv)[-1] == "echo:tweede|resume:sess-1|system:"
+
+
+def test_lines_split_on_newline_only():
+    from app import coding
+    data = '{"a":"x y\u0085z\x0bw"}\n{"b":1}\n'.encode()
+    assert coding._lines(data) == ['{"a":"x y\u0085z\x0bw"}', '{"b":1}']
+
+
+def test_unicode_line_separators_arrive_intact(client, logged_in_bot):
+    bid, conv, h = logged_in_bot
+    _say(client, h, conv, "a b\u0085c")
+    run = wait_for(lambda: _finished_run(bid))
+    assert run.status == "done"
+    assert _assistant_texts(conv)[-1] == "echo:a b\u0085c|resume:|system:"
+
+
+def test_bad_workdir_posts_start_error(client, fake_claude):
+    from app.db import Bot, session
+    bid, conv, h = _make_bot(client, _uniq("cw"))
+    with session() as s:
+        b = s.get(Bot, bid)
+        b.workdir = "../etc"
+        s.add(b)
+        s.commit()
+    _say(client, h, conv, "hoi")
+    wait_for(lambda: any("De run kon niet starten" in t for t in _assistant_texts(conv)))
+    assert _last_run(bid) is None

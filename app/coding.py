@@ -140,6 +140,11 @@ def _complete(data: bytes) -> tuple[bytes, int]:
     return data[:n], n
 
 
+def _lines(data: bytes) -> list[str]:
+    """Log lines split on newline bytes only (str.splitlines would also cut at U+2028 and friends)."""
+    return [raw.decode("utf-8", "replace") for raw in data.split(b"\n") if raw.strip()]
+
+
 async def logged_in(bot: Bot) -> bool:
     from .home import sandbox_key
     code, _ = await sandbox.sb_exec(sandbox_key(bot), ["test", "-s", ".config/claude/.credentials.json"])
@@ -179,17 +184,26 @@ async def run_turn(conv_id: int, bot_id: int, requester_id: int) -> None:
 async def _start(bot: Bot, conv_id: int, requester_id: int, prompt: str, after_message_id: int):
     from .home import sandbox_key
     key = sandbox_key(bot)
-    if not await logged_in(bot):
+    def fail(why) -> None:
+        _post_msg(conv_id, role="assistant", content=f"De run kon niet starten: {why}"[:500],
+                  author_bot_id=bot.id, requester_id=requester_id)
+
+    try:
+        ok = await logged_in(bot)
+        workdir = clean_workdir(bot.workdir)
+    except Exception as e:  # the sandbox is down or the workdir is invalid
+        fail(e)
+        return None
+    if not ok:
         _post_msg(conv_id, role="assistant", content=NOT_LOGGED_IN, author_bot_id=bot.id, requester_id=requester_id)
         return None
     with session() as s:
         last = s.exec(select(CodingRun).where(CodingRun.bot_id == bot.id, CodingRun.conversation_id == conv_id,
                                               CodingRun.session_id != "").order_by(CodingRun.id.desc())).first()
         resume = last.session_id if last else ""
-    model, workdir = bot.model, clean_workdir(bot.workdir)
+    model = bot.model
     if not MODEL_RE.match(model or "") or (resume and not MODEL_RE.match(resume)):
-        _post_msg(conv_id, role="assistant", content="De run kon niet starten: ongeldig model of sessie.",
-                  author_bot_id=bot.id, requester_id=requester_id)
+        fail("ongeldig model of sessie.")
         return None
     with session() as s:
         run = CodingRun(bot_id=bot.id, conversation_id=conv_id, requester_id=requester_id,
@@ -209,8 +223,7 @@ async def _start(bot: Bot, conv_id: int, requester_id: int, prompt: str, after_m
                                      config.CODING_CLAUDE_BIN])
     except Exception as e:  # the sandbox is down or the files could not be stored
         _end(run.id, "failed")
-        _post_msg(conv_id, role="assistant", content=f"De run kon niet starten: {e}"[:500],
-                  author_bot_id=bot.id, requester_id=requester_id)
+        fail(e)
         return None
     pid = 0
     deadline = time.monotonic() + 10
@@ -263,15 +276,18 @@ async def _follow(run_id: int) -> None:
         code, _ = await sandbox.sb_exec(key, ["sh", "-c", 'test -e "$1.exit" || ! { [ "$2" -gt 0 ] && kill -0 "$2"; } 2>/dev/null',
                                               "sh", base, str(pid)])
         dead = code == 0
-        _, chunk = await sandbox.sb_exec(key, ["sh", "-c", 'tail -c +"$1" "$2" 2>/dev/null | head -c 262144',
+        code, chunk = await sandbox.sb_exec(key, ["sh", "-c", 'tail -c +"$1" "$2" 2>/dev/null | head -c 262144',
                                                "sh", str(offset + 1), base + ".jsonl"], raw=True)
+        if code != 0:  # the read itself failed: not log bytes, try again next tick
+            await asyncio.sleep(config.CODING_POLL_S)
+            continue
         data, n = _complete(chunk)
         if n == 0 and len(chunk) >= CHUNK_MAX:
             n = len(chunk)  # one line longer than a batch: skip it rather than stall
         if n:
             state = {"text_posted": text_posted}
             finished = False
-            for line in data.decode("utf-8", "replace").splitlines():
+            for line in _lines(data):
                 if _handle(line, run_id, bot, conv_id, requester_id, common, state):
                     finished = True
                     break
