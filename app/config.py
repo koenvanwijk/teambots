@@ -54,6 +54,9 @@ GOOGLE_CLIENT_ID = os.environ.get("TB_GOOGLE_CLIENT_ID", "")
 GOOGLE_CLIENT_SECRET = os.environ.get("TB_GOOGLE_CLIENT_SECRET", "")
 GITHUB_CLIENT_ID = os.environ.get("TB_GITHUB_CLIENT_ID", "")
 GITHUB_CLIENT_SECRET = os.environ.get("TB_GITHUB_CLIENT_SECRET", "")
+# OAuth client for the Copilot device login. The default is the client id public Copilot editor
+# plugins use; Copilot's token exchange only accepts tokens issued to a Copilot client.
+COPILOT_CLIENT_ID = os.environ.get("TB_COPILOT_CLIENT_ID", "Iv1.b507a08c87ecfe98")
 # Only these emails or @domains may create a new account through OAuth. Existing users and
 # already-linked identities can always sign in. Empty list = no automatic account creation.
 OAUTH_ALLOWLIST = [x.strip().lower() for x in os.environ.get("TB_OAUTH_ALLOWLIST", "").split(",") if x.strip()]

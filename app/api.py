@@ -682,6 +682,7 @@ class EndpointIn(BaseModel):
     base_url: str = ""
     github_domain: str = ""
     api_key: str = ""
+    device_login: str = ""  # login_id of a finished Copilot device login, used instead of api_key
     default_model: str
     shared: bool = False
     rules_json: str = ""
@@ -722,6 +723,72 @@ def _github_domain_or_400(raw: str) -> str:
         raise HTTPException(400, str(e)) from e
 
 
+# Copilot device logins in progress: login_id -> user, domain, device_code, expiry and, once the
+# person approved, the GitHub token. In memory only; the token leaves it when an endpoint uses it.
+_device_logins: dict[str, dict] = {}
+
+
+class DeviceStartIn(BaseModel):
+    github_domain: str = "github.com"
+
+
+class DevicePollIn(BaseModel):
+    login_id: str
+
+
+def _device_login_or_404(login_id: str, user: User) -> dict:
+    now = datetime.now(timezone.utc).timestamp()
+    for k in [k for k, v in _device_logins.items() if v["expires"] < now]:
+        del _device_logins[k]
+    row = _device_logins.get(login_id)
+    _need(row and row["user_id"] == user.id, 404, "device login not found or expired")
+    return row
+
+
+def _take_device_token(login_id: str, user: User, domain: str) -> str:
+    """The GitHub token of a finished device login, for one endpoint only."""
+    try:
+        row = _device_login_or_404(login_id, user)
+    except HTTPException:
+        raise HTTPException(400, "device login not found or expired; sign in again") from None
+    _need(row.get("token"), 400, "the device login is not finished yet")
+    _need(row["domain"] == domain, 400, "the device login was for another GitHub domain")
+    del _device_logins[login_id]
+    return row["token"]
+
+
+@router.post("/copilot/device/start")
+async def copilot_device_start(body: DeviceStartIn, user: User = Depends(current_user)):
+    """Start a GitHub device login for a Copilot endpoint. The person opens verification_uri and
+    enters user_code; the browser then polls. The device code and the token stay on the server."""
+    domain = _github_domain_or_400(body.github_domain)
+    try:
+        flow = await copilot.device_start(domain)
+    except llm.LLMError as e:
+        raise HTTPException(502, str(e)) from e
+    login_id = secrets.token_urlsafe(24)
+    _device_logins[login_id] = {"user_id": user.id, "domain": domain, "device_code": flow["device_code"],
+                                "expires": datetime.now(timezone.utc).timestamp() + flow["expires_in"]}
+    return {"login_id": login_id, "user_code": flow["user_code"], "verification_uri": flow["verification_uri"],
+            "interval": flow["interval"], "expires_in": flow["expires_in"]}
+
+
+@router.post("/copilot/device/poll")
+async def copilot_device_poll(body: DevicePollIn, user: User = Depends(current_user)):
+    row = _device_login_or_404(body.login_id, user)
+    if row.get("token"):
+        return {"status": "done"}
+    try:
+        result = await copilot.device_poll(row["domain"], row["device_code"])
+    except llm.LLMError as e:
+        raise HTTPException(502, str(e)) from e
+    if result["status"] == "done":
+        row["token"] = result["token"]
+    elif result["status"] in ("expired", "denied"):
+        _device_logins.pop(body.login_id, None)
+    return {"status": result["status"]}
+
+
 @router.get("/teams/{team_id}/endpoints")
 def list_endpoints(team_id: int, user: User = Depends(current_user)):
     with session() as s:
@@ -760,6 +827,8 @@ def create_endpoint(team_id: int, body: EndpointIn, user: User = Depends(current
             body = body.model_copy(update={"default_model": "auto"})
     elif provider == "github_copilot":
         domain = _github_domain_or_400(body.github_domain or "github.com")
+        if body.device_login:
+            body = body.model_copy(update={"api_key": _take_device_token(body.device_login, user, domain)})
         _need(body.api_key.strip(), 400, "a GitHub token is required")
         base = body.base_url.strip().rstrip("/")
         if base:
@@ -787,6 +856,7 @@ class EndpointPatch(BaseModel):
     base_url: Optional[str] = None
     github_domain: Optional[str] = None
     api_key: Optional[str] = None  # left out = keep the stored key
+    device_login: Optional[str] = None  # finished Copilot device login, replaces the stored key
     default_model: Optional[str] = None
     shared: Optional[bool] = None
     rules_json: Optional[str] = None
@@ -795,6 +865,7 @@ class EndpointPatch(BaseModel):
 @router.patch("/endpoints/{endpoint_id}")
 def patch_endpoint(endpoint_id: int, body: EndpointPatch, user: User = Depends(current_user)):
     data = body.model_dump(exclude_none=True)
+    device_login = data.pop("device_login", None)
     _need(all(str(data[k]).strip() for k in ("name", "default_model") if k in data), 400,
           "name and default model cannot be empty")
     with session() as s:
@@ -826,6 +897,8 @@ def patch_endpoint(endpoint_id: int, body: EndpointPatch, user: User = Depends(c
             raw_domain = data["github_domain"] if "github_domain" in data else (e.github_domain or "github.com")
             domain = _github_domain_or_400(raw_domain)
             data["github_domain"] = domain
+            if device_login:
+                data["api_key"] = _take_device_token(device_login, user, domain)
             if "api_key" in data:
                 _need(str(data["api_key"]).strip(), 400, "GitHub token cannot be empty")
             elif not e.api_key_enc:
