@@ -2,6 +2,7 @@
 
 Does not import app at collection time, so test_flow can set TB_DATA_DIR first.
 """
+import json
 import os
 import sys
 import tempfile
@@ -110,3 +111,39 @@ def test_generic_bot_patch_keeps_coding_bot_invariants(client):
     r = client.patch(f"/api/bots/{bid}", headers=h, json={"model": "sonnet"})
     assert r.status_code == 200, r.text
     assert r.json()["model"] == "sonnet"
+
+
+def test_parse_init():
+    from app import coding
+    assert coding.parse_event('{"type":"system","subtype":"init","session_id":"s1"}') == [{"kind": "session", "session_id": "s1"}]
+
+
+def test_parse_assistant_text_and_tool_use():
+    from app import coding
+    line = json.dumps({"type": "assistant", "message": {"content": [
+        {"type": "text", "text": "Ik kijk even"},
+        {"type": "tool_use", "id": "toolu_1", "name": "Bash", "input": {"command": "ls"}}]}})
+    assert coding.parse_event(line) == [
+        {"kind": "text", "text": "Ik kijk even"},
+        {"kind": "tool_call", "id": "toolu_1", "name": "Bash", "arguments": '{"command": "ls"}'}]
+
+
+def test_parse_tool_result_list_and_truncate():
+    from app import coding
+    line = json.dumps({"type": "user", "message": {"content": [
+        {"type": "tool_result", "tool_use_id": "toolu_1", "content": [{"type": "text", "text": "x" * 7000}]}]}})
+    [item] = coding.parse_event(line)
+    assert item["id"] == "toolu_1" and item["content"].endswith("[... truncated ...]") and len(item["content"]) < 6100
+
+
+def test_parse_result():
+    from app import coding
+    line = json.dumps({"type": "result", "subtype": "success", "is_error": False, "result": "Klaar",
+                       "total_cost_usd": 0.42, "usage": {"input_tokens": 10, "output_tokens": 3}})
+    assert coding.parse_event(line) == [{"kind": "result", "text": "Klaar", "is_error": False,
+                                         "cost_usd": 0.42, "usage": {"input_tokens": 10, "output_tokens": 3}}]
+
+
+def test_parse_garbage():
+    from app import coding
+    assert coding.parse_event("not json") == [] and coding.parse_event('{"type":"other"}') == []
