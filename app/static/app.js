@@ -884,7 +884,7 @@ function endpointDialog(e) {
     popmenu(ev.currentTarget, [{ head: 'Copy to' }, ...targets.map(t => ({ icon: 'grid', label: (t.client ? t.client + ' / ' : '') + t.name,
       onclick: guard(async () => { await api('POST', `/endpoints/${e.id}/copy`, { team_id: t.id }); toast(`Copied "${e.name}" to ${t.name}`); }) }))], d);
   } });
-  const d = openDialog('', $('div', { className: 'pad' }, $('h2', { textContent: e.name }),
+  const d = openDialog('endpoint', $('div', { className: 'pad' }, $('h2', { textContent: e.name }),
     $('dl', { className: 'kv', style: 'margin-top:14px' },
       $('dt', { textContent: 'Provider' }), $('dd', { textContent: router ? 'Router' : cli ? 'Claude CLI (local)' : copilot ? 'GitHub Copilot' : 'OpenAI-compatible' }),
       cli || router ? [] : copilot ? [$('dt', { textContent: 'GitHub domain' }), $('dd', { className: 'mono', textContent: e.github_domain || 'github.com' })]
