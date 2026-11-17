@@ -156,8 +156,60 @@ def _post_msg(conv_id: int, **fields):
     return agent._post(conv_id, **fields)
 
 
+_stop_requested: set[tuple[int, int]] = set()
+TAIL_FAILURES_MAX = 30
+
+
+def request_stop(conv_id: int, bot_id: int) -> None:
+    """Mark that the next cancellation of this bot's turn is the person's stop, not an app shutdown."""
+    _stop_requested.add((conv_id, bot_id))
+
+
 async def run_turn(conv_id: int, bot_id: int, requester_id: int) -> None:
-    """Follow the running run of this bot and chat, or start one for the messages said since the last run."""
+    """Follow the running run of this bot and chat, or start one for the messages said since the last run.
+
+    A cancellation after request_stop kills the process and ends the run as stopped; any other
+    cancellation (the app shuts down) leaves process and run alone so resume_all can pick it up."""
+    _stop_requested.discard((conv_id, bot_id))
+    try:
+        await _run_turn(conv_id, bot_id, requester_id)
+    except asyncio.CancelledError:
+        if (conv_id, bot_id) in _stop_requested:
+            _stop_requested.discard((conv_id, bot_id))
+            await _stop_run(conv_id, bot_id, requester_id)
+        raise
+
+
+async def _stop_run(conv_id: int, bot_id: int, requester_id: int) -> None:
+    from .home import sandbox_key
+    with session() as s:
+        bot = s.get(Bot, bot_id)
+        run = s.exec(select(CodingRun).where(CodingRun.bot_id == bot_id, CodingRun.conversation_id == conv_id,
+                                             CodingRun.status == "running").order_by(CodingRun.id.desc())).first()
+        run_id, pid = (run.id, run.pid) if run else (None, 0)
+    if run_id is None or bot is None:
+        return
+    if pid > 0:
+        try:
+            await sandbox.sb_exec(sandbox_key(bot), ["kill", str(pid)])
+        except Exception:  # noqa: BLE001 - the sandbox is gone, so is the process
+            pass
+    _end(run_id, "stopped")
+    _post_msg(conv_id, role="assistant", content="Gestopt.", author_bot_id=bot_id, requester_id=requester_id)
+
+
+def resume_all() -> int:
+    """Follow every run that was still running when the app went down. Needs a running event loop."""
+    from . import agent
+    with session() as s:
+        runs = s.exec(select(CodingRun).where(CodingRun.status == "running")).all()
+        found = [(r.conversation_id, r.bot_id, r.requester_id) for r in runs]
+    for conv_id, bot_id, requester_id in found:
+        agent.start_run(conv_id, bot_id, requester_id)
+    return len(found)
+
+
+async def _run_turn(conv_id: int, bot_id: int, requester_id: int) -> None:
     with session() as s:
         bot = s.get(Bot, bot_id)
         run = s.exec(select(CodingRun).where(CodingRun.bot_id == bot_id, CodingRun.conversation_id == conv_id,
@@ -268,6 +320,7 @@ async def _follow(run_id: int) -> None:
         conv_id, requester_id, base, pid = run.conversation_id, run.requester_id, run.base, run.pid
     key = sandbox_key(bot)
     common = dict(author_bot_id=bot.id, requester_id=requester_id)
+    tail_failures = 0
     while True:
         with session() as s:
             run = s.get(CodingRun, run_id)
@@ -279,8 +332,15 @@ async def _follow(run_id: int) -> None:
         code, chunk = await sandbox.sb_exec(key, ["sh", "-c", 'tail -c +"$1" "$2" 2>/dev/null | head -c 262144',
                                                "sh", str(offset + 1), base + ".jsonl"], raw=True)
         if code != 0:  # the read itself failed: not log bytes, try again next tick
+            tail_failures += 1
+            if tail_failures >= TAIL_FAILURES_MAX and await _gone(key, base, pid):
+                await _fail_run(run_id, key, base, bot.id, conv_id, common)
+                return
+            if tail_failures >= TAIL_FAILURES_MAX:
+                tail_failures = 0
             await asyncio.sleep(config.CODING_POLL_S)
             continue
+        tail_failures = 0
         data, n = _complete(chunk)
         if n == 0 and len(chunk) >= CHUNK_MAX:
             n = len(chunk)  # one line longer than a batch: skip it rather than stall
@@ -295,13 +355,30 @@ async def _follow(run_id: int) -> None:
             if finished:
                 return
         elif dead:
-            _, err = await sandbox.sb_exec(key, ["sh", "-c", 'tail -n 20 "$1" 2>/dev/null', "sh", base + ".err"])
-            err = secrets_http.mask(err.strip(), bot.id)
-            _end(run_id, "failed")
-            _post_msg(conv_id, role="assistant", content="De run stopte zonder resultaat."
-                      + (f"\n\n{err}" if err else ""), **common)
+            await _fail_run(run_id, key, base, bot.id, conv_id, common)
             return
         await asyncio.sleep(config.CODING_POLL_S)
+
+
+async def _gone(key: str, base: str, pid: int) -> bool:
+    """The dead check again, for when the log cannot be read: True when the process is gone or the check fails."""
+    try:
+        code, _ = await sandbox.sb_exec(key, ["sh", "-c", 'test -e "$1.exit" || ! { [ "$2" -gt 0 ] && kill -0 "$2"; } 2>/dev/null',
+                                              "sh", base, str(pid)])
+    except Exception:  # noqa: BLE001 - the sandbox is gone
+        return True
+    return code != 1  # 1 means the process is alive
+
+
+async def _fail_run(run_id: int, key: str, base: str, bot_id: int, conv_id: int, common: dict) -> None:
+    try:
+        _, err = await sandbox.sb_exec(key, ["sh", "-c", 'tail -n 20 "$1" 2>/dev/null', "sh", base + ".err"])
+    except Exception:  # noqa: BLE001 - no stderr to show
+        err = ""
+    err = secrets_http.mask(err.strip(), bot_id)
+    _end(run_id, "failed")
+    _post_msg(conv_id, role="assistant", content="De run stopte zonder resultaat."
+              + (f"\n\n{err}" if err else ""), **common)
 
 
 def _handle(line: str, run_id: int, bot: Bot, conv_id: int, requester_id: int, common: dict, state: dict) -> bool:

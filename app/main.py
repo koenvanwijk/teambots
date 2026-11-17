@@ -30,6 +30,9 @@ async def lifespan(_: FastAPI):
     except Exception:  # noqa: BLE001 - e.g. git missing: knowledge bases are then created on first use
         logging.getLogger("teambots").exception("knowledge base migration failed")
     routines.start()
+    if config.CODING_BOTS:
+        from . import coding
+        coding.resume_all()
     yield
     routines.stop()
 

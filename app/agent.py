@@ -756,6 +756,7 @@ def interrupt(conv_id: int, bot_id: int) -> bool:
     key = (conv_id, bot_id)
     run = _runs.pop(key, None)
     if run and run.task:
+        coding.request_stop(conv_id, bot_id)
         run.task.cancel()
     publish(conv_id, "run")
     return run is not None

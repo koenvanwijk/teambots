@@ -361,3 +361,81 @@ def test_bad_workdir_posts_start_error(client, fake_claude):
     _say(client, h, conv, "hoi")
     wait_for(lambda: any("De run kon niet starten" in t for t in _assistant_texts(conv)))
     assert _last_run(bid) is None
+
+
+# ---------------------------------------------------------------- stop, queue, restart
+
+def _pid_alive(pid):
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    return True
+
+
+def _stop(client, h, conv):
+    client.post(f"/api/conversations/{conv}/stop", headers=h)
+
+
+def test_queued_message_shows_in_state(client, logged_in_bot):
+    bid, conv, h = logged_in_bot
+    try:
+        _say(client, h, conv, "sleep lang")
+        wait_for(lambda: (r := _last_run(bid)) and r.pid)
+        _say(client, h, conv, "daarna")
+        st = client.get(f"/api/conversations/{conv}/state", headers=h).json()
+        assert len(st["queued"]) == 1
+    finally:
+        _stop(client, h, conv)
+
+
+def test_stop_kills_process(client, logged_in_bot):
+    bid, conv, h = logged_in_bot
+    try:
+        _say(client, h, conv, "sleep lang")
+        run = wait_for(lambda: (r := _last_run(bid)) and r.pid and r)
+        _stop(client, h, conv)
+        wait_for(lambda: _last_run(bid).status == "stopped")
+        wait_for(lambda: not _pid_alive(run.pid))
+        assert _assistant_texts(conv)[-1] == "Gestopt."
+    finally:
+        _stop(client, h, conv)
+
+
+def test_cancel_without_stop_leaves_run_running_and_resume_all_picks_it_up(client, logged_in_bot):
+    from app import agent, coding
+    bid, conv, h = logged_in_bot
+    try:
+        _say(client, h, conv, "sleep lang")
+        wait_for(lambda: (r := _last_run(bid)) and r.pid)
+        agent._runs[(conv, bid)].task.cancel()  # simulates the app shutting down
+        wait_for(lambda: (conv, bid) not in agent._runs)
+        run = _last_run(bid)
+        assert run.status == "running" and _pid_alive(run.pid)
+        assert not [t for t in _assistant_texts(conv) if t == "Gestopt."]
+
+        async def go():  # resume_all needs the running loop of the app
+            return coding.resume_all(), (conv, bid) in agent._runs
+
+        n, started = client.portal.call(go)
+        assert n >= 1 and started
+    finally:
+        _stop(client, h, conv)
+        wait_for(lambda: (conv, bid) not in agent._runs)
+
+
+def test_follow_gives_up_when_the_tail_keeps_failing(client, logged_in_bot, monkeypatch):
+    from app import coding, sandbox
+    bid, conv, h = logged_in_bot
+    real = sandbox.sb_exec
+
+    async def flaky(key, argv, *a, **kw):
+        if argv[:2] == ["sh", "-c"] and "tail -c" in argv[2]:
+            return 1, b""
+        return await real(key, argv, *a, **kw)
+
+    monkeypatch.setattr(sandbox, "sb_exec", flaky)
+    _say(client, h, conv, "die now")
+    run = wait_for(lambda: _finished_run(bid), timeout=20)
+    assert run.status == "failed"
+    assert "De run stopte zonder resultaat." in _assistant_texts(conv)[-1]
