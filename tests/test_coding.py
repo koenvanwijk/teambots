@@ -404,6 +404,12 @@ def test_stop_kills_process(client, logged_in_bot):
 
 def test_cancel_without_stop_leaves_run_running_and_resume_all_picks_it_up(client, logged_in_bot):
     from app import agent, coding
+    from app.db import CodingRun, session, select
+    with session() as s:  # other tests may have left rows behind: only this run may be running
+        for r in s.exec(select(CodingRun).where(CodingRun.status == "running")).all():
+            r.status = "failed"
+            s.add(r)
+        s.commit()
     bid, conv, h = logged_in_bot
     try:
         _say(client, h, conv, "sleep lang")
@@ -418,7 +424,7 @@ def test_cancel_without_stop_leaves_run_running_and_resume_all_picks_it_up(clien
             return coding.resume_all(), (conv, bid) in agent._runs
 
         n, started = client.portal.call(go)
-        assert n >= 1 and started
+        assert n == 1 and started
     finally:
         _stop(client, h, conv)
         wait_for(lambda: (conv, bid) not in agent._runs)
@@ -439,3 +445,44 @@ def test_follow_gives_up_when_the_tail_keeps_failing(client, logged_in_bot, monk
     run = wait_for(lambda: _finished_run(bid), timeout=20)
     assert run.status == "failed"
     assert "De run stopte zonder resultaat." in _assistant_texts(conv)[-1]
+
+
+def test_stop_before_pid_is_stored_leaves_no_process(client, logged_in_bot, monkeypatch):
+    import asyncio
+    from app import coding, config, sandbox
+    from app.db import Bot, session
+    bid, conv, h = logged_in_bot
+    real = sandbox.sb_spawn
+    spawned = []
+
+    async def slow_spawn(*a, **kw):
+        await real(*a, **kw)
+        spawned.append(True)
+        await asyncio.sleep(2)  # the pid is not stored yet while the process runs
+
+    monkeypatch.setattr(sandbox, "sb_spawn", slow_spawn)
+    try:
+        _say(client, h, conv, "sleep lang")
+        wait_for(lambda: spawned)
+        assert _last_run(bid).pid == 0
+        _stop(client, h, conv)
+        run = wait_for(lambda: (r := _last_run(bid)).status == "stopped" and r)
+        with session() as s:
+            owner = s.get(Bot, bid).owner_id
+        ws = os.path.join(config.DATA_DIR, "workspaces", f"home-u{owner}")
+        pid = int(open(os.path.join(ws, run.base + ".pid")).read())
+        wait_for(lambda: not _pid_alive(pid))
+        assert os.path.exists(os.path.join(ws, run.base + ".stop"))
+    finally:
+        _stop(client, h, conv)
+
+
+def test_run_script_does_not_start_claude_after_stop_marker(client, fake_claude):
+    import subprocess
+    from app import coding, config
+    ws = os.path.join(config.DATA_DIR, "stopmarker-ws")
+    os.makedirs(os.path.join(ws, ".coding"), exist_ok=True)
+    open(os.path.join(ws, ".coding", "run-x.stop"), "w").close()
+    subprocess.run(["sh", "-c", coding.RUN_SCRIPT, "sh", ".coding/run-x", "", "opus", "", config.CODING_CLAUDE_BIN],
+                   cwd=ws, check=True, timeout=10)
+    assert not os.path.exists(os.path.join(ws, ".coding", "run-x.pid"))

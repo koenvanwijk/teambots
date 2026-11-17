@@ -24,6 +24,7 @@ NOT_LOGGED_IN = "Je bent nog niet ingelogd bij Claude. Gebruik Log in bij Claude
 # Runs `claude -p` detached in the sandbox. Every input is a positional argument; prompt and
 # instructions come from files, so nothing the user typed is ever parsed by the shell.
 RUN_SCRIPT = '''root="$PWD"; base="$root/$1"
+[ -e "$base.stop" ] && exit 0
 export CLAUDE_CONFIG_DIR="$root/.config/claude"
 cd "$root/${2:-.}" || { echo "workdir not found: $2" > "$base.err"; echo 127 > "$base.exit"; exit 0; }
 "$5" -p --output-format stream-json --verbose --model "$3" --permission-mode bypassPermissions \\
@@ -158,6 +159,9 @@ def _post_msg(conv_id: int, **fields):
 
 _stop_requested: set[tuple[int, int]] = set()
 TAIL_FAILURES_MAX = 30
+# exit 0: the run is over (exit file written, or no live process); 1: the process is alive
+DEAD_CHECK = 'test -e "$1.exit" || ! { [ "$2" -gt 0 ] && kill -0 "$2"; } 2>/dev/null'
+STOP_PID_WAIT_S = 3.0
 
 
 def request_stop(conv_id: int, bot_id: int) -> None:
@@ -180,20 +184,35 @@ async def run_turn(conv_id: int, bot_id: int, requester_id: int) -> None:
         raise
 
 
+async def _read_pid(key: str, base: str) -> int:
+    code, out = await sandbox.sb_exec(key, ["cat", base + ".pid"])
+    return int(out.strip()) if code == 0 and out.strip().isdigit() else 0
+
+
 async def _stop_run(conv_id: int, bot_id: int, requester_id: int) -> None:
     from .home import sandbox_key
     with session() as s:
         bot = s.get(Bot, bot_id)
         run = s.exec(select(CodingRun).where(CodingRun.bot_id == bot_id, CodingRun.conversation_id == conv_id,
                                              CodingRun.status == "running").order_by(CodingRun.id.desc())).first()
-        run_id, pid = (run.id, run.pid) if run else (None, 0)
+        run_id, pid, base = (run.id, run.pid, run.base) if run else (None, 0, "")
     if run_id is None or bot is None:
         return
-    if pid > 0:
-        try:
-            await sandbox.sb_exec(sandbox_key(bot), ["kill", str(pid)])
-        except Exception:  # noqa: BLE001 - the sandbox is gone, so is the process
-            pass
+    key = sandbox_key(bot)
+    try:
+        if pid <= 0:
+            # the start was cut short before the pid was stored: keep a script that has not
+            # launched Claude yet from doing so, and catch one that launched anyway
+            await sandbox.put_bytes(key, base + ".stop", b"")
+            deadline = time.monotonic() + STOP_PID_WAIT_S
+            while pid <= 0 and time.monotonic() < deadline:
+                pid = await _read_pid(key, base)
+                if pid <= 0:
+                    await asyncio.sleep(min(0.1, config.CODING_POLL_S))
+        if pid > 0:
+            await sandbox.sb_exec(key, ["kill", str(pid)])
+    except Exception:  # noqa: BLE001 - the sandbox is gone, so is the process
+        pass
     _end(run_id, "stopped")
     _post_msg(conv_id, role="assistant", content="Gestopt.", author_bot_id=bot_id, requester_id=requester_id)
 
@@ -326,17 +345,23 @@ async def _follow(run_id: int) -> None:
             run = s.get(CodingRun, run_id)
             offset, text_posted = run.offset, run.text_posted
         # asked before reading, so output written just before the process ended is still read below
-        code, _ = await sandbox.sb_exec(key, ["sh", "-c", 'test -e "$1.exit" || ! { [ "$2" -gt 0 ] && kill -0 "$2"; } 2>/dev/null',
-                                              "sh", base, str(pid)])
-        dead = code == 0
-        code, chunk = await sandbox.sb_exec(key, ["sh", "-c", 'tail -c +"$1" "$2" 2>/dev/null | head -c 262144',
-                                               "sh", str(offset + 1), base + ".jsonl"], raw=True)
+        try:
+            if pid <= 0:  # a start cut short by a shutdown: the script may have written its pid since
+                pid = await _read_pid(key, base)
+                if pid > 0:
+                    _update(run_id, pid=pid)
+            code, _ = await sandbox.sb_exec(key, ["sh", "-c", DEAD_CHECK, "sh", base, str(pid)])
+            dead = code == 0
+            code, chunk = await sandbox.sb_exec(key, ["sh", "-c", 'tail -c +"$1" "$2" 2>/dev/null | head -c 262144',
+                                                   "sh", str(offset + 1), base + ".jsonl"], raw=True)
+        except Exception:  # noqa: BLE001 - the sandbox is not up (yet): counts as a failed read
+            code, chunk, dead = -1, b"", False
         if code != 0:  # the read itself failed: not log bytes, try again next tick
             tail_failures += 1
-            if tail_failures >= TAIL_FAILURES_MAX and await _gone(key, base, pid):
-                await _fail_run(run_id, key, base, bot.id, conv_id, common)
-                return
             if tail_failures >= TAIL_FAILURES_MAX:
+                if await _gone(key, base, pid):
+                    await _fail_run(run_id, key, base, bot.id, conv_id, common)
+                    return
                 tail_failures = 0
             await asyncio.sleep(config.CODING_POLL_S)
             continue
@@ -363,8 +388,7 @@ async def _follow(run_id: int) -> None:
 async def _gone(key: str, base: str, pid: int) -> bool:
     """The dead check again, for when the log cannot be read: True when the process is gone or the check fails."""
     try:
-        code, _ = await sandbox.sb_exec(key, ["sh", "-c", 'test -e "$1.exit" || ! { [ "$2" -gt 0 ] && kill -0 "$2"; } 2>/dev/null',
-                                              "sh", base, str(pid)])
+        code, _ = await sandbox.sb_exec(key, ["sh", "-c", DEAD_CHECK, "sh", base, str(pid)])
     except Exception:  # noqa: BLE001 - the sandbox is gone
         return True
     return code != 1  # 1 means the process is alive
