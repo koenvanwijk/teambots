@@ -15,7 +15,7 @@ from dataclasses import dataclass, field
 
 from sqlalchemy.exc import IntegrityError
 
-from . import config, llm, mcp_client, sandbox, screen, secrets_http
+from . import coding, config, llm, mcp_client, sandbox, screen, secrets_http
 from . import prompt as prompt_mod
 from .access import bot_role
 from .db import (Approval, ApprovalRule, Bot, ChannelMember, Conversation, Endpoint, McpServer,
@@ -716,7 +716,13 @@ async def run_agent(conv_id: int, bot_id: int, requester_id: int) -> None:
 async def _run_task(key: Key, run: Run) -> None:
     try:
         async with _locks[key]:
-            await _run_locked(key[0], key[1], run.requester_id, run)
+            with session() as s:
+                bot = s.get(Bot, key[1])
+                runner = bot.runner if bot else ""
+            if runner == coding.RUNNER:
+                await coding.run_turn(key[0], key[1], run.requester_id)
+            else:
+                await _run_locked(key[0], key[1], run.requester_id, run)
     finally:
         _finish(key, run)
 
@@ -1164,5 +1170,6 @@ def handle_user_message(conv_id: int, user_id: int, content: str, mode: str = "a
             start_run(conv_id, b.id, user_id)
         else:
             _held.setdefault(key, []).append((msg.id, user_id))
-            spawn(_route(key, run, msg.id, user_id, content, mode))
+            if not b.runner:  # a coding run reads these messages when it ends, nothing steers it
+                spawn(_route(key, run, msg.id, user_id, content, mode))
     return msg

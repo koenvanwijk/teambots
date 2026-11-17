@@ -165,3 +165,172 @@ def test_parse_garbage():
 def test_parse_malformed_shapes_do_not_raise(line, expected):
     from app import coding
     assert coding.parse_event(line) == expected
+
+
+# ---------------------------------------------------------------- run a turn (fake claude)
+
+import time  # noqa: E402
+
+
+def wait_for(fn, timeout=15):
+    end = time.time() + timeout
+    while time.time() < end:
+        v = fn()
+        if v:
+            return v
+        time.sleep(0.05)
+    raise AssertionError(f"timed out after {timeout}s waiting for a condition")
+
+
+def _uniq(prefix):
+    return f"{prefix}_{os.getpid()}_{time.time_ns() % 10**9}"
+
+
+@pytest.fixture
+def fake_claude(tmp_path):
+    from app import config
+    wrapper = tmp_path / "claude"
+    wrapper.write_text(f'#!/bin/sh\nexec "{sys.executable}" "{ROOT}/tests/fake_claude_code.py" "$@"\n')
+    wrapper.chmod(0o755)
+    old = (config.CODING_CLAUDE_BIN, config.CODING_POLL_S)
+    config.CODING_CLAUDE_BIN, config.CODING_POLL_S = str(wrapper), 0.05
+    try:
+        yield
+    finally:
+        config.CODING_CLAUDE_BIN, config.CODING_POLL_S = old
+
+
+def _login(owner_id):
+    from app import config
+    d = os.path.join(config.DATA_DIR, "workspaces", f"home-u{owner_id}", ".config", "claude")
+    os.makedirs(d, exist_ok=True)
+    with open(os.path.join(d, ".credentials.json"), "w") as f:
+        f.write("{}")
+
+
+def _make_bot(client, username, login=True, **body):
+    from app.db import Bot, session
+    h = _register(client, username)
+    b = client.post("/api/coding-bots", headers=h, json={"name": "Coder", **body}).json()
+    if login:
+        with session() as s:
+            _login(s.get(Bot, b["id"]).owner_id)
+    return b["id"], b["conversation"]["id"], h
+
+
+@pytest.fixture
+def logged_in_bot(client, fake_claude):
+    yield _make_bot(client, _uniq("cr"))
+
+
+@pytest.fixture
+def bot_without_login(client, fake_claude):
+    yield _make_bot(client, _uniq("cn"), login=False)
+
+
+def _say(client, h, conv, text):
+    r = client.post(f"/api/conversations/{conv}/messages", headers=h, json={"content": text})
+    assert r.status_code == 200, r.text
+
+
+def _messages(conv):
+    from app.db import Message, session, select
+    with session() as s:
+        return s.exec(select(Message).where(Message.conversation_id == conv).order_by(Message.id)).all()
+
+
+def _assistant_texts(conv):
+    return [m.content for m in _messages(conv) if m.role == "assistant" and m.content]
+
+
+def _last_run(bid):
+    from app.db import CodingRun, session, select
+    with session() as s:
+        return s.exec(select(CodingRun).where(CodingRun.bot_id == bid).order_by(CodingRun.id.desc())).first()
+
+
+def _finished_run(bid):
+    run = _last_run(bid)
+    return run if run and run.status != "running" else None
+
+
+def _usage_rows(bid):
+    from app.db import LlmUsage, session, select
+    with session() as s:
+        return s.exec(select(LlmUsage).where(LlmUsage.bot_id == bid).order_by(LlmUsage.id)).all()
+
+
+def test_run_posts_steps_and_reply(client, logged_in_bot):
+    bid, conv, h = logged_in_bot
+    _say(client, h, conv, "maak een test")
+    wait_for(lambda: _finished_run(bid))
+    texts = _assistant_texts(conv)
+    assert texts[-1] == "echo:maak een test|resume:|system:"
+    assert texts.count(texts[-1]) == 1  # the result text is not posted twice
+    calls = [json.loads(m.tool_calls)[0]["function"]["name"] for m in _messages(conv) if m.tool_calls]
+    assert calls == ["Bash"]
+    assert any(m.role == "tool" and m.tool_call_id == "toolu_1" and m.content == "ok" for m in _messages(conv))
+    run = _last_run(bid)
+    assert run.status == "done" and run.session_id == "sess-1" and run.ended_at
+    assert _usage_rows(bid)[-1].notes.endswith("claude_code")  # log_call prefixes its own note
+
+
+def test_second_message_resumes_session(client, logged_in_bot):
+    bid, conv, h = logged_in_bot
+    _say(client, h, conv, "een")
+    wait_for(lambda: _finished_run(bid))
+    first = _last_run(bid).id
+    _say(client, h, conv, "twee")
+    wait_for(lambda: (r := _last_run(bid)) and r.id != first and r.status != "running")
+    assert _assistant_texts(conv)[-1] == "echo:twee|resume:sess-1|system:"
+
+
+def test_prompt_with_shell_characters_arrives_literally(client, logged_in_bot):
+    bid, conv, h = logged_in_bot
+    nasty = 'a "b" $(touch /tmp/pwned-coding-test) `id` \n c'
+    _say(client, h, conv, nasty)
+    wait_for(lambda: _finished_run(bid))
+    assert _assistant_texts(conv)[-1].startswith("echo:" + nasty.strip())
+    assert not os.path.exists("/tmp/pwned-coding-test")
+
+
+def test_instructions_reach_the_process(client, fake_claude):
+    bid, conv, h = _make_bot(client, _uniq("ci"), instructions="be brief")
+    _say(client, h, conv, "hoi")
+    wait_for(lambda: _finished_run(bid))
+    assert _assistant_texts(conv)[-1] == "echo:hoi|resume:|system:be brief"
+
+
+def test_partial_line_is_not_parsed():
+    from app import coding
+    assert coding._complete(b'{"a":1}\n{"b"') == (b'{"a":1}\n', 8)
+    assert coding._complete(b'{"b"') == (b"", 0)
+
+
+def test_not_logged_in_posts_hint(client, bot_without_login):
+    bid, conv, h = bot_without_login
+    _say(client, h, conv, "hoi")
+    wait_for(lambda: any("niet ingelogd" in t for t in _assistant_texts(conv)))
+    assert _last_run(bid) is None
+
+
+def test_process_dying_fails_the_run_with_stderr(client, logged_in_bot):
+    bid, conv, h = logged_in_bot
+    _say(client, h, conv, "die now")
+    run = wait_for(lambda: _finished_run(bid))
+    assert run.status == "failed"
+    last = _assistant_texts(conv)[-1]
+    assert "De run stopte zonder resultaat." in last and "boom" in last
+
+
+def test_message_during_run_is_held_then_runs_next(client, logged_in_bot):
+    from app import agent
+    bid, conv, h = logged_in_bot
+    _say(client, h, conv, "sleep please")
+    wait_for(lambda: (r := _last_run(bid)) and r.pid)
+    _say(client, h, conv, "tweede")
+    assert agent._held.get((conv, bid))
+    first = _last_run(bid)
+    os.kill(first.pid, 15)  # the fake takes 30 s to answer a "sleep" prompt: end it, the held message then runs
+    wait_for(lambda: (r := _last_run(bid)) and r.id != first.id and r.status != "running", timeout=20)
+    assert _assistant_texts(conv)[-1] == "echo:tweede|resume:sess-1|system:"
