@@ -115,6 +115,25 @@ class Bot(SQLModel, table=True):
     computer_use: bool = False  # own screen + mouse/keyboard tools; needs a model with image input
     is_home: bool = False  # per-user overview bot; not tied to a project (team_id is 0)
     local_only: bool = False  # router must keep this bot on a local (Spark) route
+    runner: str = ""  # "" = normal LLM bot; claude_code = personal coding bot (Claude Code in the user's sandbox)
+    workdir: str = ""  # coding bot: working directory relative to the sandbox workspace
+
+
+class CodingRun(SQLModel, table=True):
+    """One Claude Code run for a coding bot, started by one chat message."""
+    id: Optional[int] = Field(default=None, primary_key=True)
+    bot_id: int = Field(index=True)
+    conversation_id: int = Field(index=True)
+    requester_id: int
+    after_message_id: int  # the user message that started this run
+    session_id: str = ""  # Claude Code session id, for --resume
+    base: str = ""  # sandbox path prefix of this run's output files
+    pid: int = 0
+    offset: int = 0  # bytes of the output file already processed
+    status: str = Field(default="running", index=True)
+    text_posted: bool = False
+    started_at: datetime = Field(default_factory=now)
+    ended_at: Optional[datetime] = None
 
 
 class BotAccess(SQLModel, table=True):
@@ -467,6 +486,10 @@ def _ensure_router_columns() -> None:
         bot_cols = [r[1] for r in conn.exec_driver_sql("PRAGMA table_info(bot)").fetchall()]
         if "local_only" not in bot_cols:
             conn.exec_driver_sql("ALTER TABLE bot ADD COLUMN local_only BOOLEAN NOT NULL DEFAULT 0")
+        if "runner" not in bot_cols:
+            conn.exec_driver_sql("ALTER TABLE bot ADD COLUMN runner VARCHAR DEFAULT ''")
+        if "workdir" not in bot_cols:
+            conn.exec_driver_sql("ALTER TABLE bot ADD COLUMN workdir VARCHAR DEFAULT ''")
         usage_cols = [r[1] for r in conn.exec_driver_sql("PRAGMA table_info(llmusage)").fetchall()]
         if "route" not in usage_cols:
             conn.exec_driver_sql("ALTER TABLE llmusage ADD COLUMN route VARCHAR DEFAULT ''")

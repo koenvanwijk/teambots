@@ -44,7 +44,7 @@ DEFAULT_INSTRUCTIONS = (
 
 def sandbox_key(bot: Bot) -> str:
     """Docker/local sandbox key for this bot. Container name is `tb-{key}`."""
-    if bot.is_home:
+    if bot.is_home or bot.runner:
         return f"home-u{bot.owner_id}"
     return f"p{bot.team_id}"
 

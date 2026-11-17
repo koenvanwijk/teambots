@@ -20,7 +20,7 @@ from pydantic import BaseModel
 import httpx
 import websockets
 
-from . import agent, config, copilot, events, home, llm, mcp_client, oauth, ratelimit, routines, sandbox, screen, secrets_http
+from . import agent, coding, config, copilot, events, home, llm, mcp_client, oauth, ratelimit, routines, sandbox, screen, secrets_http
 from .access import bot_role, can_manage, can_read_conversation, can_share, team_role
 from .db import (Approval, ApprovalRule, AuthToken, Bot, BotAccess, ChannelMember, Conversation, Endpoint, Identity,
                  LlmUsage, McpCredential, McpServer, Memory, Message, OAuthState, Routine, Secret, Skill, Team,
@@ -1074,6 +1074,7 @@ def patch_bot(bot_id: int, body: BotPatch, user: User = Depends(current_user)):
         b = _bot(s, bot_id, user, manage=True)
         data = body.model_dump(exclude_none=True)
         if "endpoint_id" in data:
+            _need(not b.runner, 400, "a coding bot is personal and cannot be shared")
             _usable_endpoint(s, data["endpoint_id"], b.team_id, user)
         _need(data.get("approval_mode", "ask") in ("ask", "auto"), 400, "approval_mode: ask | auto")
         _need(data.get("name", "x").strip(), 400, "the bot needs a name")
@@ -1092,6 +1093,77 @@ def patch_bot(bot_id: int, body: BotPatch, user: User = Depends(current_user)):
                     s.add(c)
         s.commit()
         return _bot_out(s, b, user)
+
+
+# ---------------------------------------------------------------- coding bots (Claude Code, personal)
+
+class CodingBotIn(BaseModel):
+    name: str
+    model: str = "opus"
+    workdir: str = ""
+    instructions: str = ""
+
+
+class CodingBotPatch(BaseModel):
+    name: Optional[str] = None
+    model: Optional[str] = None
+    workdir: Optional[str] = None
+    instructions: Optional[str] = None
+
+
+def _coding_on() -> None:
+    _need(config.CODING_BOTS, 404, "not found")
+
+
+def _coding_settings(name: Optional[str], model: Optional[str], workdir: Optional[str]) -> None:
+    _need(name is None or name.strip(), 400, "the bot needs a name")
+    _need(model is None or coding.MODEL_RE.fullmatch(model), 400, "model: letters, digits and . _ : - only")
+    if workdir is not None:
+        try:
+            coding.clean_workdir(workdir)
+        except ValueError as e:
+            raise HTTPException(400, str(e))
+
+
+@router.get("/coding-bots")
+def list_coding_bots(user: User = Depends(current_user)):
+    _coding_on()
+    with session() as s:
+        bots = s.exec(select(Bot).where(Bot.owner_id == user.id, Bot.runner == "claude_code").order_by(Bot.id)).all()
+        return [coding.bot_out(b, coding.bot_conv(s, b)) for b in bots]
+
+
+@router.post("/coding-bots")
+def create_coding_bot(body: CodingBotIn, user: User = Depends(current_user)):
+    _coding_on()
+    _coding_settings(body.name, body.model, body.workdir)
+    with session() as s:
+        bot, conv = coding.create_bot(s, user, body.name, body.model, body.workdir, body.instructions)
+        s.commit()
+        return coding.bot_out(bot, conv)
+
+
+@router.patch("/coding-bots/{bot_id}")
+def patch_coding_bot(bot_id: int, body: CodingBotPatch, user: User = Depends(current_user)):
+    _coding_on()
+    _coding_settings(body.name, body.model, body.workdir)
+    with session() as s:
+        b = s.get(Bot, bot_id)
+        _need(b and b.runner == "claude_code" and b.owner_id == user.id, 404, "bot not found")
+        data = body.model_dump(exclude_none=True)
+        if "name" in data:
+            data["name"] = data["name"].strip()
+        if "workdir" in data:
+            data["workdir"] = coding.clean_workdir(data["workdir"])
+        for k, v in data.items():
+            setattr(b, k, v)
+        s.add(b)
+        conv = coding.bot_conv(s, b)
+        if "name" in data:
+            conv.name = b.name
+            s.add(conv)
+        s.commit()
+        return coding.bot_out(b, conv)
 
 
 @router.delete("/bots/{bot_id}")
@@ -1147,6 +1219,7 @@ def share_bot(bot_id: int, body: ShareIn, user: User = Depends(current_user)):
     _need(body.access in ("team", "selected"), 400, "access: team | selected")
     with session() as s:
         b = _bot(s, bot_id, user, share=True)
+        _need(not b.runner, 400, "a coding bot is personal and cannot be shared")
         _need(b.is_team, 400, "only a Team Bot can be shared")
         team = s.get(Team, b.team_id)
         _need(team.bot_sharing == "everyone" or team_role(s, user.id, b.team_id) == "admin",
