@@ -4,7 +4,7 @@
 
 **Goal:** Een persoonlijke coding bot die Claude Code (`claude -p`) als los proces in de persoonlijke sandbox draait, de run live in de chat toont en een herstart van de app overleeft.
 
-**Architecture:** Een nieuwe module `app/coding.py` start Claude met `sandbox.sb_spawn` via een vast shell-script, laat stream-json naar `.coding/run-<id>.jsonl` op het volume schrijven en leest dat bestand elke `CODING_POLL_S` seconden bij met `sandbox.sb_exec`. Events worden gewone `Message`-rijen. De bestaande run-machinerie van `app/agent.py` (`_runs`, `_held`, `stop`) blijft de baas; `_run_task` stuurt coding bots door naar `coding.run_turn`. Inloggen gebeurt met `/login` van Claude Code in een `xterm` op het scherm van de bot.
+**Architecture:** Een nieuwe module `app/coding.py` start Claude met `sandbox.sb_spawn` via een vast shell-script, laat stream-json naar `.coding/run-<id>.jsonl` op het volume schrijven en leest dat bestand elke `CODING_POLL_S` seconden bij met `sandbox.sb_exec`. Events worden gewone `Message`-rijen. De bestaande run-machinerie van `app/agent.py` (`_runs`, `_held`, `stop`) blijft de baas; `_run_task` stuurt coding bots door naar `coding.run_turn`. Inloggen gebeurt met `/login` van Claude Code in een `xfce4-terminal` op het scherm van de bot.
 
 **Tech Stack:** Python 3.12, FastAPI, SQLModel/SQLite, pytest, vanilla JS (`app/static/app.js`), Docker sandbox-image.
 
@@ -321,7 +321,7 @@ def test_process_dies_without_result(client, logged_in_bot):
 **Interfaces:**
 - Consumes: Task 1, `screen._env(key, bot_id)` (start Xvfb en geeft `DISPLAY`-env).
 - Produces:
-  - `async def coding.open_login(bot: Bot) -> None`: `sb_spawn(key, ["sh", "-c", 'export CLAUDE_CONFIG_DIR="$PWD/.config/claude"; mkdir -p "$CLAUDE_CONFIG_DIR"; exec xterm -geometry 160x45+0+0 -e "$1"', "sh", config.CODING_CLAUDE_BIN], env=await screen._env(key, bot.id))`
+  - `async def coding.open_login(bot: Bot) -> None`: `sb_spawn(key, ["sh", "-c", 'export CLAUDE_CONFIG_DIR="$PWD/.config/claude"; mkdir -p "$CLAUDE_CONFIG_DIR"; exec xfce4-terminal --geometry 160x45 -x "$1"', "sh", config.CODING_CLAUDE_BIN], env=await screen._env(key, bot.id))`
   - `GET /api/coding-bots/{id}/login` geeft `{"logged_in": bool}`; `POST /api/coding-bots/{id}/login` start de terminal en geeft `{"screen": f"/api/bots/{id}/screen/vnc"}`. Alleen de eigenaar, anders 404.
 
 - [ ] **Step 1: Write the failing tests**
@@ -342,11 +342,11 @@ def test_open_login_spawns_terminal(client, coding_bot, monkeypatch):
     r = client.post(f"/api/coding-bots/{coding_bot}/login", headers=h)
     assert r.json() == {"screen": f"/api/bots/{coding_bot}/screen/vnc"}
     key, argv, env = calls[0]
-    assert key.startswith("home-u") and "xterm" in argv[2] and env["DISPLAY"] == f":{100 + coding_bot}"
+    assert key.startswith("home-u") and "xfce4-terminal" in argv[2] and env["DISPLAY"] == f":{100 + coding_bot}"
 ```
 
 - [ ] **Step 2: Run** `.venv/bin/python -m pytest -q tests/test_coding.py -k login` . Expected: FAIL.
-- [ ] **Step 3: Implement** `open_login` en de twee routes. In `sandbox/Dockerfile`: `xterm` aan de eerste `apt-get install` toevoegen; Claude Code installeren (npm-pakket `@anthropic-ai/claude-code` of de officiele installer, met een Node-versie die het pakket ondersteunt); `ENV CLAUDE_CONFIG_DIR=/workspace/.config/claude`; een `command -v claude` en `command -v xterm` controle zoals de bestaande.
+- [ ] **Step 3: Implement** `open_login` en de twee routes. In `sandbox/Dockerfile` (heeft al `xfce4-terminal` sinds de XFCE-desktop op main): Claude Code installeren (npm-pakket `@anthropic-ai/claude-code` of de officiele installer, met een Node-versie die het pakket ondersteunt); `ENV CLAUDE_CONFIG_DIR=/workspace/.config/claude`; een `command -v claude` controle zoals de bestaande.
 - [ ] **Step 4: Run** `.venv/bin/python -m pytest -q tests/test_coding.py` en `docker build -t teambots-sandbox:test ./sandbox` . Expected: PASS en een geslaagde build.
 - [ ] **Step 5: Commit** `git commit -am "Sign in to Claude Code from the sandbox screen"`
 

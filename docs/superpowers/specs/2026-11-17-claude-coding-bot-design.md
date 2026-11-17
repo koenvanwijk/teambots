@@ -73,7 +73,7 @@ Ralf koos B.
 - De gebruiker logt in met de gewone login van Claude Code, in zijn eigen persoonlijke sandbox.
   TeamBots slaat geen token op en geeft er ook geen door.
 - Bij de coding bot staat de knop **Log in bij Claude**. Die start op het scherm van de
-  persoonlijke sandbox een `xterm` met `claude` (de gebruiker typt daar `/login`), en opent het
+  persoonlijke sandbox een terminal (`xfce4-terminal`, zit al in het image) met `claude` (de gebruiker typt daar `/login`), en opent het
   interactieve scherm (noVNC, bestaat al). De gebruiker keurt de login goed in Chrome op hetzelfde
   scherm; de terugkoppeling naar `localhost` komt in dezelfde container aan. Lukt dat niet, dan
   plakt de gebruiker de code die Claude toont in de terminal.
@@ -158,7 +158,6 @@ afloop een nieuwe run met `--resume <session_id>`.
 
 - Claude Code installeren in `sandbox/Dockerfile` (keuze tussen npm-pakket en de officiele
   installer laat ik aan de builder; de Node-versie in het image moet passen).
-- `xterm` installeren voor de login.
 - `CLAUDE_CONFIG_DIR` op het volume (`/workspace/.config/claude`), zodat login en sessies
   (`--resume`) een herstart van de container overleven.
 
@@ -180,7 +179,7 @@ afloop een nieuwe run met `--resume <session_id>`.
 
 ## Wat ik zelf heb besloten (te controleren)
 
-- Login via `/login` van Claude Code in een `xterm` op het scherm van de sandbox (op voorstel van
+- Login via `/login` van Claude Code in een terminal op het scherm van de sandbox (op voorstel van
   Ralf), geen token in TeamBots.
 - Een aparte coding bot onder Overview, niet de Overview-bot zelf omzetten.
 - `bypassPermissions` als standaard, geen goedkeuringskaarten in v1.
