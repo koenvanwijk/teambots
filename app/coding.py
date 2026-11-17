@@ -26,7 +26,8 @@ def clean_workdir(raw: str) -> str:
 def _tool_result_text(content) -> str:
     """Tool output as plain text: list content joins its text parts, long output is cut short."""
     if isinstance(content, list):
-        content = "\n".join(p.get("text", "") for p in content if isinstance(p, dict) and p.get("type") == "text")
+        content = "\n".join(p["text"] for p in content
+                            if isinstance(p, dict) and p.get("type") == "text" and isinstance(p.get("text"), str))
     text = content if isinstance(content, str) else ""
     if len(text) > TOOL_RESULT_MAX:
         text = text[:TOOL_RESULT_MAX] + "\n[... truncated ...]"
@@ -43,8 +44,10 @@ def parse_event(line: str) -> list[dict]:
         return []
     kind = ev.get("type")
     if kind == "system" and ev.get("subtype") == "init":
-        return [{"kind": "session", "session_id": ev.get("session_id", "")}]
-    blocks = (ev.get("message") or {}).get("content") or []
+        sid = ev.get("session_id")
+        return [{"kind": "session", "session_id": sid if isinstance(sid, str) else ""}]
+    msg = ev.get("message")
+    blocks = msg.get("content") if isinstance(msg, dict) else None
     if not isinstance(blocks, list):
         blocks = []
     out = []
@@ -53,7 +56,8 @@ def parse_event(line: str) -> list[dict]:
             if not isinstance(b, dict):
                 continue
             if b.get("type") == "text":
-                out.append({"kind": "text", "text": b.get("text", "")})
+                text = b.get("text")
+                out.append({"kind": "text", "text": text if isinstance(text, str) else ""})
             elif b.get("type") == "tool_use":
                 out.append({"kind": "tool_call", "id": b.get("id", ""), "name": b.get("name", ""),
                             "arguments": json.dumps(b.get("input", {}))})
@@ -63,9 +67,15 @@ def parse_event(line: str) -> list[dict]:
                 out.append({"kind": "tool_result", "id": b.get("tool_use_id", ""),
                             "content": _tool_result_text(b.get("content"))})
     elif kind == "result":
-        cost = ev.get("total_cost_usd")
-        out.append({"kind": "result", "text": ev.get("result", ""), "is_error": bool(ev.get("is_error")),
-                    "cost_usd": float(cost) if cost is not None else None, "usage": ev.get("usage") or {}})
+        try:
+            cost = float(ev.get("total_cost_usd"))
+        except (TypeError, ValueError):
+            cost = None
+        text = ev.get("result")
+        usage = ev.get("usage")
+        out.append({"kind": "result", "text": text if isinstance(text, str) else "",
+                    "is_error": bool(ev.get("is_error")), "cost_usd": cost,
+                    "usage": usage if isinstance(usage, dict) else {}})
     return out
 
 

@@ -147,3 +147,21 @@ def test_parse_result():
 def test_parse_garbage():
     from app import coding
     assert coding.parse_event("not json") == [] and coding.parse_event('{"type":"other"}') == []
+
+
+@pytest.mark.parametrize("line, expected", [
+    ('{"type":"system","subtype":"x","message":"hi"}', []),
+    ('{"type":"result","message":[1]}', [{"kind": "result", "text": "", "is_error": False, "cost_usd": None, "usage": {}}]),
+    ('{"type":"assistant","message":"s"}', []),
+    ('{"type":"user","message":5}', []),
+    ('{"type":"assistant","message":{"content":[{"type":"text","text":null},{"type":"text","text":"ok"}]}}',
+     [{"kind": "text", "text": ""}, {"kind": "text", "text": "ok"}]),
+    ('{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t","content":[{"type":"text","text":null},{"type":"text","text":"a"}]}]}}',
+     [{"kind": "tool_result", "id": "t", "content": "a"}]),
+    ('{"type":"result","total_cost_usd":"abc","result":null,"usage":"x"}',
+     [{"kind": "result", "text": "", "is_error": False, "cost_usd": None, "usage": {}}]),
+    ('{"type":"system","subtype":"init","session_id":5}', [{"kind": "session", "session_id": ""}]),
+])
+def test_parse_malformed_shapes_do_not_raise(line, expected):
+    from app import coding
+    assert coding.parse_event(line) == expected
