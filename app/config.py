@@ -75,6 +75,10 @@ OPEN_REGISTRATION = os.environ.get("TB_OPEN_REGISTRATION", "0") == "1"
 ENABLE_DOCS = os.environ.get("TB_ENABLE_DOCS", "0") == "1"
 # Max /api/login and /api/register attempts per IP per minute. 0 disables.
 AUTH_RATE_LIMIT = int(os.environ.get("TB_AUTH_RATE_LIMIT", "10"))
+# Personal coding bots: Claude Code running in the user's own sandbox. Off by default.
+CODING_BOTS = os.environ.get("TB_CODING_BOTS", "0") == "1"
+CODING_CLAUDE_BIN = os.environ.get("TB_CODING_CLAUDE_BIN", "claude")
+CODING_POLL_S = float(os.environ.get("TB_CODING_POLL_S", "1.0"))
 
 _fernet = Fernet(base64.urlsafe_b64encode(hashlib.sha256(SECRET_KEY.encode()).digest()))
 

@@ -1,0 +1,488 @@
+"""Personal coding bots: Claude Code running in the user's own sandbox (`home-u{owner_id}`).
+
+This module holds the bot helpers. app.agent imports this module at its top, so anything here that
+needs app.agent must import it lazily inside the function.
+"""
+from __future__ import annotations
+
+import asyncio
+import json
+import os
+import re
+import time
+from datetime import datetime, timezone
+
+from . import config, sandbox, screen, secrets_http, usage
+from .db import Bot, CodingRun, Conversation, Message, Session, User, select, session
+
+RUNNER = "claude_code"
+DEFAULT_MODEL = "opus"
+MODEL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,99}$")
+INSTRUCTIONS_MAX = 20000
+TOOL_RESULT_MAX = 6000
+CHUNK_MAX = 262144
+NOT_LOGGED_IN = "Je bent nog niet ingelogd bij Claude. Gebruik Log in bij Claude bij de instellingen van deze bot."
+
+# Runs `claude -p` detached in the sandbox. Every input is a positional argument; prompt and
+# instructions come from files, so nothing the user typed is ever parsed by the shell.
+RUN_SCRIPT = '''root="$PWD"; base="$root/$1"
+[ -e "$base.stop" ] && exit 0
+export CLAUDE_CONFIG_DIR="$root/.config/claude"
+cd "$root/${2:-.}" || { echo "workdir not found: $2" > "$base.err"; echo 127 > "$base.exit"; exit 0; }
+"$5" -p --output-format stream-json --verbose --model "$3" --permission-mode bypassPermissions \\
+  --append-system-prompt "$(cat "$base.system")" ${4:+--resume "$4"} \\
+  < "$base.prompt" > "$base.jsonl" 2> "$base.err" &
+echo $! > "$base.pid"
+wait $!
+echo $? > "$base.exit"
+'''
+
+
+def clean_workdir(raw: str) -> str:
+    """Empty stays empty; otherwise a path relative to the workspace. Raises ValueError."""
+    raw = (raw or "").strip()
+    return sandbox._check_path(raw) if raw else ""
+
+
+def _tool_result_text(content) -> str:
+    """Tool output as plain text: list content joins its text parts, long output is cut short."""
+    if isinstance(content, list):
+        content = "\n".join(p["text"] for p in content
+                            if isinstance(p, dict) and p.get("type") == "text" and isinstance(p.get("text"), str))
+    text = content if isinstance(content, str) else ""
+    if len(text) > TOOL_RESULT_MAX:
+        text = text[:TOOL_RESULT_MAX] + "\n[... truncated ...]"
+    return text
+
+
+def parse_event(line: str) -> list[dict]:
+    """One stream-json line from `claude -p --output-format stream-json` as display items. Unknown lines give []."""
+    try:
+        ev = json.loads(line)
+    except (ValueError, TypeError):
+        return []
+    if not isinstance(ev, dict):
+        return []
+    kind = ev.get("type")
+    if kind == "system" and ev.get("subtype") == "init":
+        sid = ev.get("session_id")
+        return [{"kind": "session", "session_id": sid if isinstance(sid, str) else ""}]
+    msg = ev.get("message")
+    blocks = msg.get("content") if isinstance(msg, dict) else None
+    if not isinstance(blocks, list):
+        blocks = []
+    out = []
+    if kind == "assistant":
+        for b in blocks:
+            if not isinstance(b, dict):
+                continue
+            if b.get("type") == "text":
+                text = b.get("text")
+                out.append({"kind": "text", "text": text if isinstance(text, str) else ""})
+            elif b.get("type") == "tool_use":
+                out.append({"kind": "tool_call", "id": b.get("id", ""), "name": b.get("name", ""),
+                            "arguments": json.dumps(b.get("input", {}))})
+    elif kind == "user":
+        for b in blocks:
+            if isinstance(b, dict) and b.get("type") == "tool_result":
+                out.append({"kind": "tool_result", "id": b.get("tool_use_id", ""),
+                            "content": _tool_result_text(b.get("content"))})
+    elif kind == "result":
+        try:
+            cost = float(ev.get("total_cost_usd"))
+        except (TypeError, ValueError):
+            cost = None
+        text = ev.get("result")
+        usage = ev.get("usage")
+        out.append({"kind": "result", "text": text if isinstance(text, str) else "",
+                    "is_error": bool(ev.get("is_error")), "cost_usd": cost,
+                    "usage": usage if isinstance(usage, dict) else {}})
+    return out
+
+
+def create_bot(s: Session, user: User, name: str, model: str = DEFAULT_MODEL, workdir: str = "",
+               instructions: str = "") -> tuple[Bot, Conversation]:
+    """Create a personal coding bot with its private chat. The caller commits."""
+    bot = Bot(team_id=0, owner_id=user.id, name=name.strip(), handle="", instructions=instructions,
+              endpoint_id=0, model=model, is_team=False, published=False, is_home=False,
+              computer_use=True, runner=RUNNER, workdir=clean_workdir(workdir))
+    s.add(bot)
+    s.flush()
+    bot.handle = f"code-{bot.id}"
+    s.add(bot)
+    conv = Conversation(team_id=0, kind="dm", name=bot.name, share_activity=False,
+                        user_id=user.id, bot_id=bot.id)
+    s.add(conv)
+    s.flush()
+    return bot, conv
+
+
+def bot_conv(s: Session, bot: Bot) -> Conversation:
+    """The owner's private chat with this coding bot (created when missing)."""
+    conv = s.exec(select(Conversation).where(
+        Conversation.bot_id == bot.id, Conversation.kind == "dm", Conversation.user_id == bot.owner_id)).first()
+    if not conv:
+        conv = Conversation(team_id=0, kind="dm", name=bot.name, share_activity=False,
+                            user_id=bot.owner_id, bot_id=bot.id)
+        s.add(conv)
+        s.flush()
+    return conv
+
+
+def bot_out(bot: Bot, conv: Conversation) -> dict:
+    return {"id": bot.id, "name": bot.name, "handle": bot.handle, "model": bot.model, "workdir": bot.workdir,
+            "instructions": bot.instructions, "runner": bot.runner,
+            "conversation": {"id": conv.id, "kind": conv.kind, "team_id": conv.team_id, "name": conv.name}}
+
+
+# ---------------------------------------------------------------- running a turn
+
+def _complete(data: bytes) -> tuple[bytes, int]:
+    """The part of `data` up to and including the last newline, and its length in bytes."""
+    n = data.rfind(b"\n") + 1
+    return data[:n], n
+
+
+def _lines(data: bytes) -> list[str]:
+    """Log lines split on newline bytes only (str.splitlines would also cut at U+2028 and friends)."""
+    return [raw.decode("utf-8", "replace") for raw in data.split(b"\n") if raw.strip()]
+
+
+async def logged_in(bot: Bot) -> bool:
+    from .home import sandbox_key
+    code, _ = await sandbox.sb_exec(sandbox_key(bot), ["test", "-s", ".config/claude/.credentials.json"])
+    return code == 0
+
+
+LOGIN_SCRIPT = ('export CLAUDE_CONFIG_DIR="$PWD/.config/claude"; mkdir -p "$CLAUDE_CONFIG_DIR"; '
+                'exec xfce4-terminal --geometry 160x45 -x "$1"')
+
+
+async def open_login(bot: Bot) -> None:
+    """Open a terminal running `claude` on the bot's screen, so the person can sign in there."""
+    from .home import sandbox_key
+    key = sandbox_key(bot)
+    await sandbox.sb_spawn(key, ["sh", "-c", LOGIN_SCRIPT, "sh", config.CODING_CLAUDE_BIN],
+                           env=await screen._env(key, bot.id))
+
+
+def _post_msg(conv_id: int, **fields):
+    from . import agent
+    return agent._post(conv_id, **fields)
+
+
+_stop_requested: dict[tuple[int, int], int] = {}  # (conversation, bot) -> newest user message id at the stop
+TAIL_FAILURES_MAX = 30
+# True when `$1` is a live process whose command line names the Claude binary `$2`. A stored pid can
+# have been reused by another process (a recreated container), which must not count as ours.
+# /proc where it exists; `ps` on systems without it (macOS, the local test backend).
+ALIVE = ('{ [ "$1" -gt 0 ] 2>/dev/null && if [ -d /proc/self ]; '
+         'then tr "\\0" " " < "/proc/$1/cmdline" 2>/dev/null | grep -qF -- "$2"; '
+         'else ps -p "$1" -o command= 2>/dev/null | grep -qF -- "$2"; fi; }')
+# exit 0: the run is over (exit file written, or no live Claude process); 1: the process is alive
+DEAD_CHECK = 'test -e "$1.exit" || ! { set -- "$2" "$3"; ' + ALIVE + '; }'
+# kills pid `$1` only when it is the Claude process (name `$2`)
+KILL_SCRIPT = ALIVE + ' && kill "$1"'
+STOP_PID_WAIT_S = 3.0
+
+
+def _claude_name() -> str:
+    return os.path.basename(config.CODING_CLAUDE_BIN) or config.CODING_CLAUDE_BIN
+
+
+def request_stop(conv_id: int, bot_id: int) -> None:
+    """Mark that the next cancellation of this bot's turn is the person's stop, not an app shutdown."""
+    with session() as s:
+        newest = s.exec(select(Message.id).where(Message.conversation_id == conv_id, Message.role == "user")
+                        .order_by(Message.id.desc())).first()
+    _stop_requested[(conv_id, bot_id)] = newest or 0
+
+
+async def run_turn(conv_id: int, bot_id: int, requester_id: int) -> None:
+    """Follow the running run of this bot and chat, or start one for the messages said since the last run.
+
+    A cancellation after request_stop kills the process and ends the run as stopped; any other
+    cancellation (the app shuts down) leaves process and run alone so resume_all can pick it up."""
+    _stop_requested.pop((conv_id, bot_id), None)
+    try:
+        await _run_turn(conv_id, bot_id, requester_id)
+    except asyncio.CancelledError:
+        if (conv_id, bot_id) in _stop_requested:
+            await _stop_run(conv_id, bot_id, requester_id, _stop_requested.pop((conv_id, bot_id)))
+        raise
+
+
+async def _read_pid(key: str, base: str) -> int:
+    code, out = await sandbox.sb_exec(key, ["cat", base + ".pid"])
+    return int(out.strip()) if code == 0 and out.strip().isdigit() else 0
+
+
+async def _kill(key: str, base: str, pid: int) -> None:
+    """Kill the run's Claude process (never another process that got its pid). Errors mean it is gone."""
+    try:
+        if pid <= 0:
+            # the start was cut short before the pid was stored: keep a script that has not
+            # launched Claude yet from doing so, and catch one that launched anyway
+            await sandbox.put_bytes(key, base + ".stop", b"")
+            deadline = time.monotonic() + STOP_PID_WAIT_S
+            while pid <= 0 and time.monotonic() < deadline:
+                pid = await _read_pid(key, base)
+                if pid <= 0:
+                    await asyncio.sleep(min(0.1, config.CODING_POLL_S))
+        if pid > 0:
+            await sandbox.sb_exec(key, ["sh", "-c", KILL_SCRIPT, "sh", str(pid), _claude_name()])
+    except Exception:  # noqa: BLE001 - the sandbox is gone, so is the process
+        pass
+
+
+async def kill_bot_runs(bot: Bot) -> None:
+    """End every running run of this bot as stopped, killing its process. For deleting the bot."""
+    from .home import sandbox_key
+    with session() as s:
+        runs = [(r.id, r.pid, r.base) for r in s.exec(select(CodingRun).where(
+            CodingRun.bot_id == bot.id, CodingRun.status == "running")).all()]
+    key = sandbox_key(bot)
+    for run_id, pid, base in runs:
+        await _kill(key, base, pid)
+        _end(run_id, "stopped")
+
+
+async def _stop_run(conv_id: int, bot_id: int, requester_id: int, drop_through: int = 0) -> None:
+    from .home import sandbox_key
+    with session() as s:
+        bot = s.get(Bot, bot_id)
+        run = s.exec(select(CodingRun).where(CodingRun.bot_id == bot_id, CodingRun.conversation_id == conv_id,
+                                             CodingRun.status == "running").order_by(CodingRun.id.desc())).first()
+        run_id, pid, base = (run.id, run.pid, run.base) if run else (None, 0, "")
+    if run_id is None or bot is None:
+        return
+    key = sandbox_key(bot)
+    await _kill(key, base, pid)
+    _end(run_id, "stopped")
+    if drop_through:  # what was queued behind the stopped run is dropped: the next run starts after it
+        _update(run_id, after_message_id=drop_through)
+    _post_msg(conv_id, role="assistant", content="Gestopt.", author_bot_id=bot_id, requester_id=requester_id)
+
+
+def resume_all() -> int:
+    """Follow every run that was still running when the app went down. Needs a running event loop."""
+    from . import agent
+    with session() as s:
+        runs = s.exec(select(CodingRun).where(CodingRun.status == "running")).all()
+        found = []
+        for r in runs:
+            if s.get(Bot, r.bot_id) is None:  # the bot was deleted: nothing to follow
+                r.status, r.ended_at = "stopped", datetime.now(timezone.utc)
+                s.add(r)
+            else:
+                found.append((r.conversation_id, r.bot_id, r.requester_id))
+        s.commit()
+    for conv_id, bot_id, requester_id in found:
+        agent.start_run(conv_id, bot_id, requester_id)
+    return len(found)
+
+
+async def _run_turn(conv_id: int, bot_id: int, requester_id: int) -> None:
+    with session() as s:
+        bot = s.get(Bot, bot_id)
+        run = s.exec(select(CodingRun).where(CodingRun.bot_id == bot_id, CodingRun.conversation_id == conv_id,
+                                             CodingRun.status == "running").order_by(CodingRun.id.desc())).first()
+        if run is None:
+            last = s.exec(select(CodingRun).where(CodingRun.bot_id == bot_id, CodingRun.conversation_id == conv_id)
+                          .order_by(CodingRun.id.desc())).first()
+            after = last.after_message_id if last else 0
+            msgs = s.exec(select(Message).where(Message.conversation_id == conv_id, Message.role == "user",
+                                                Message.id > after).order_by(Message.id)).all()
+            run_id = None
+        else:
+            run_id = run.id
+    if run_id is None:
+        if not msgs:
+            return
+        prompt = "\n\n".join(m.content.strip() for m in msgs if m.content.strip())
+        run = await _start(bot, conv_id, requester_id, prompt, msgs[-1].id)
+        run_id = run.id if run else None
+    if run_id is not None:
+        await _follow(run_id)
+
+
+async def _start(bot: Bot, conv_id: int, requester_id: int, prompt: str, after_message_id: int):
+    from .home import sandbox_key
+    key = sandbox_key(bot)
+    def fail(why) -> None:
+        _post_msg(conv_id, role="assistant", content=f"De run kon niet starten: {why}"[:500],
+                  author_bot_id=bot.id, requester_id=requester_id)
+
+    try:
+        ok = await logged_in(bot)
+        workdir = clean_workdir(bot.workdir)
+    except Exception as e:  # the sandbox is down or the workdir is invalid
+        fail(e)
+        return None
+    if not ok:
+        _post_msg(conv_id, role="assistant", content=NOT_LOGGED_IN, author_bot_id=bot.id, requester_id=requester_id)
+        return None
+    with session() as s:
+        last = s.exec(select(CodingRun).where(CodingRun.bot_id == bot.id, CodingRun.conversation_id == conv_id,
+                                              CodingRun.session_id != "").order_by(CodingRun.id.desc())).first()
+        resume = last.session_id if last else ""
+    model = bot.model
+    if not MODEL_RE.match(model or "") or (resume and not MODEL_RE.match(resume)):
+        fail("ongeldig model of sessie.")
+        return None
+    with session() as s:
+        run = CodingRun(bot_id=bot.id, conversation_id=conv_id, requester_id=requester_id,
+                        after_message_id=after_message_id)
+        s.add(run)
+        s.commit()
+        s.refresh(run)
+        run.base = f".coding/run-{run.id}"
+        s.add(run)
+        s.commit()
+        s.refresh(run)
+    base = run.base
+    try:
+        await sandbox.put_bytes(key, base + ".prompt", prompt.encode())
+        await sandbox.put_bytes(key, base + ".system", (bot.instructions or "").encode())
+        await sandbox.sb_spawn(key, ["sh", "-c", RUN_SCRIPT, "sh", base, workdir, model, resume,
+                                     config.CODING_CLAUDE_BIN])
+    except Exception as e:  # the sandbox is down or the files could not be stored
+        _end(run.id, "failed")
+        fail(e)
+        return None
+    pid = 0
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+        code, out = await sandbox.sb_exec(key, ["cat", base + ".pid"])
+        if code == 0 and out.strip().isdigit():
+            pid = int(out.strip())
+            break
+        await asyncio.sleep(min(0.1, config.CODING_POLL_S))
+    with session() as s:
+        run = s.get(CodingRun, run.id)
+        run.pid = pid
+        s.add(run)
+        s.commit()
+        s.refresh(run)
+    return run
+
+
+def _end(run_id: int, status: str) -> None:
+    with session() as s:
+        run = s.get(CodingRun, run_id)
+        run.status, run.ended_at = status, datetime.now(timezone.utc)
+        s.add(run)
+        s.commit()
+
+
+def _update(run_id: int, **fields) -> None:
+    with session() as s:
+        run = s.get(CodingRun, run_id)
+        for k, v in fields.items():
+            setattr(run, k, v)
+        s.add(run)
+        s.commit()
+
+
+async def _follow(run_id: int) -> None:
+    """Read the run's log until it has a result, or its process is gone without one."""
+    from .home import sandbox_key
+    with session() as s:
+        run = s.get(CodingRun, run_id)
+        bot = s.get(Bot, run.bot_id)
+        conv_id, requester_id, base, pid = run.conversation_id, run.requester_id, run.base, run.pid
+    key = sandbox_key(bot)
+    common = dict(author_bot_id=bot.id, requester_id=requester_id)
+    tail_failures = 0
+    while True:
+        with session() as s:
+            run = s.get(CodingRun, run_id)
+            offset, text_posted = run.offset, run.text_posted
+        # asked before reading, so output written just before the process ended is still read below
+        try:
+            if pid <= 0:  # a start cut short by a shutdown: the script may have written its pid since
+                pid = await _read_pid(key, base)
+                if pid > 0:
+                    _update(run_id, pid=pid)
+            code, _ = await sandbox.sb_exec(key, ["sh", "-c", DEAD_CHECK, "sh", base, str(pid), _claude_name()])
+            dead = code == 0
+            code, chunk = await sandbox.sb_exec(key, ["sh", "-c", 'tail -c +"$1" "$2" 2>/dev/null | head -c 262144',
+                                                   "sh", str(offset + 1), base + ".jsonl"], raw=True)
+        except Exception:  # noqa: BLE001 - the sandbox is not up (yet): counts as a failed read
+            code, chunk, dead = -1, b"", False
+        if code != 0:  # the read itself failed: not log bytes, try again next tick
+            tail_failures += 1
+            if tail_failures >= TAIL_FAILURES_MAX:
+                if await _gone(key, base, pid):
+                    await _fail_run(run_id, key, base, bot.id, conv_id, common)
+                    return
+                tail_failures = 0
+            await asyncio.sleep(config.CODING_POLL_S)
+            continue
+        tail_failures = 0
+        data, n = _complete(chunk)
+        if n == 0 and len(chunk) >= CHUNK_MAX:
+            n = len(chunk)  # one line longer than a batch: skip it rather than stall
+        if n:
+            state = {"text_posted": text_posted}
+            finished = False
+            for line in _lines(data):
+                if _handle(line, run_id, bot, conv_id, requester_id, common, state):
+                    finished = True
+                    break
+            _update(run_id, offset=offset + n, text_posted=state["text_posted"])
+            if finished:
+                return
+        elif dead:
+            await _fail_run(run_id, key, base, bot.id, conv_id, common)
+            return
+        await asyncio.sleep(config.CODING_POLL_S)
+
+
+async def _gone(key: str, base: str, pid: int) -> bool:
+    """The dead check again, for when the log cannot be read: True when the process is gone or the check fails."""
+    try:
+        code, _ = await sandbox.sb_exec(key, ["sh", "-c", DEAD_CHECK, "sh", base, str(pid), _claude_name()])
+    except Exception:  # noqa: BLE001 - the sandbox is gone
+        return True
+    return code != 1  # 1 means the process is alive
+
+
+async def _fail_run(run_id: int, key: str, base: str, bot_id: int, conv_id: int, common: dict) -> None:
+    try:
+        _, err = await sandbox.sb_exec(key, ["sh", "-c", 'tail -n 20 "$1" 2>/dev/null', "sh", base + ".err"])
+    except Exception:  # noqa: BLE001 - no stderr to show
+        err = ""
+    err = secrets_http.mask(err.strip(), bot_id)
+    _end(run_id, "failed")
+    _post_msg(conv_id, role="assistant", content="De run stopte zonder resultaat."
+              + (f"\n\n{err}" if err else ""), **common)
+
+
+def _handle(line: str, run_id: int, bot: Bot, conv_id: int, requester_id: int, common: dict, state: dict) -> bool:
+    """Store one log line. Returns True when it held the result, which ends the run."""
+    from . import agent
+    for item in parse_event(line):
+        kind = item["kind"]
+        if kind == "session":
+            if MODEL_RE.match(item["session_id"]):
+                _update(run_id, session_id=item["session_id"])
+        elif kind == "text":
+            if item["text"].strip():
+                _post_msg(conv_id, role="assistant", content=secrets_http.mask(item["text"], bot.id), **common)
+                state["text_posted"] = True
+        elif kind == "tool_call":
+            call = {"id": item["id"], "type": "function", "function": {
+                "name": item["name"], "arguments": secrets_http.mask(item["arguments"], bot.id)}}
+            _post_msg(conv_id, role="assistant", content="", tool_calls=json.dumps([call]), **common)
+        elif kind == "tool_result":
+            agent._post_tool(conv_id, item["id"], secrets_http.mask(item["content"], bot.id), **common)
+        elif kind == "result":
+            with usage.bind(origin="coding", user_id=requester_id, bot_id=bot.id, conversation_id=conv_id):
+                usage.log_call(endpoint=None, model=bot.model, raw=item["usage"],
+                               reported_cost_usd=item["cost_usd"], notes="claude_code")
+            if item["text"].strip() and (not state["text_posted"] or item["is_error"]):
+                _post_msg(conv_id, role="assistant", content=secrets_http.mask(item["text"], bot.id), **common)
+            _end(run_id, "failed" if item["is_error"] else "done")
+            return True
+    return False

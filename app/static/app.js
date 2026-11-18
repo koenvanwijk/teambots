@@ -69,7 +69,7 @@ async function api(method, path, body) {
 const withToken = path => '/api' + path + (path.includes('?') ? '&' : '?') + 'token=' + encodeURIComponent(S.token);
 function toast(text, kind = '') {
   let box = el('toasts'); if (!box) document.body.append(box = $('div', { id: 'toasts' }));
-  const t = $('div', { className: 'toast ' + kind, textContent: text, role: 'status' }); box.append(t);
+  const t = $('div', { className: 'toast ' + kind, role: 'status' }, ...[].concat(text)); box.append(t);
   setTimeout(() => t.remove(), kind === 'bad' ? 6000 : 3200);
 }
 const guard = fn => async (...a) => { try { return await fn(...a); } catch (e) { toast(e.message, 'bad'); } };
@@ -85,7 +85,7 @@ function openDialog(cls, ...kids) {
   return d;
 }
 /** A form in a dialog. Resolves with the values (or what onSubmit returns), or null when cancelled. */
-function form({ title, intro, fields, ok = 'Save', onSubmit }) {
+function form({ title, intro, fields, ok = 'Save', onSubmit, extra }) {
   return new Promise(resolve => {
     let result = null; const inputs = {}, err = $('div', { className: 'err', role: 'alert' });
     const values = () => { const v = {}; for (const f of fields) v[f.name] = f.type === 'checkbox' ? inputs[f.name].checked : inputs[f.name].value.trim(); return v; };
@@ -123,7 +123,7 @@ function form({ title, intro, fields, ok = 'Save', onSubmit }) {
     applyWhen();
     const submit = $('button', { className: 'btn primary', type: 'submit', textContent: ok });
     const fm = $('form', { className: 'pad' }, $('h2', { textContent: title }), intro && $('p', { className: 'intro', textContent: intro }), rows, err,
-      $('div', { className: 'dfoot' }, $('button', { className: 'btn', type: 'button', textContent: 'Cancel', onclick: () => d.close() }), submit));
+      $('div', { className: 'dfoot' }, extra && extra(() => d.close()), $('button', { className: 'btn', type: 'button', textContent: 'Cancel', onclick: () => d.close() }), submit));
     fm.onsubmit = async e => {
       e.preventDefault();
       const v = values();
@@ -158,7 +158,7 @@ function popmenu(anchor, items, host) {
 }
 
 // ---------------------------------------------------------------- sign in
-function signOut() { stopConv(); store.set('tb_token', null); S.token = null; S.me = null; closePop(); showAuth(); }
+function signOut() { stopConv(); store.set('tb_token', null); S.token = null; S.me = null; S.codingBots = []; closePop(); showAuth(); }
 function showAuth() {
   const invite = (new URLSearchParams(location.search).get('invite') || '').trim();
   let create = !!invite;  // an invite link means a new person joining
@@ -214,6 +214,7 @@ async function boot() {
   // store the opposite intent, which then re-collapses the block on the next redraw (new line).
   el('col').addEventListener('click', e => { const s = e.target.closest('summary'); if (!s) return; const d = s.parentElement; requestAnimationFrame(() => { d.dataset.user = d.open ? '1' : '0'; }); });
   await loadTeam();
+  loadCodingBots();
   if (S.mcpNotice) {
     const n = S.mcpNotice; S.mcpNotice = null;
     setTimeout(() => toast(n === 'connected' ? 'MCP account connected' : 'Could not connect the MCP account', n === 'connected' ? '' : 'bad'), 0);
@@ -350,6 +351,7 @@ function renderSide() {
     $('div', { className: 'brand' }, logo(), $('strong', { textContent: 'TeamBots' }), ib('side', 'Hide sidebar', toggleSide)),
     $('button', { className: 'nav', onclick: openPalette }, icon('search'), $('span', { className: 'grow', textContent: 'Search' }), $('kbd', { textContent: 'Ctrl K' })),
     $('button', { className: 'nav' + (c && c.kind === 'home' ? ' on' : ''), onclick: guard(openOverview) }, icon('home'), $('span', { className: 'grow', textContent: 'Overview' })),
+    ...codingSide(c),
     $('button', { className: 'nav' + (!c && S.page === 'projects' ? ' on' : ''), onclick: guard(showHome) }, icon('grid'), $('span', { className: 'grow', textContent: 'Projects' })),
     t && $('button', { className: 'nav' + (!c && S.page === 'files' ? ' on' : ''), onclick: guard(showFiles) }, icon('folder'), $('span', { className: 'grow', textContent: 'Files' })),
     $('button', { className: 'nav' + (!c && S.page === 'routines' ? ' on' : ''), onclick: guard(showRoutines) }, icon('clock'), $('span', { className: 'grow', textContent: 'Routines' })),
@@ -357,6 +359,63 @@ function renderSide() {
     $('button', { className: 'project', title: 'Switch project', onclick: e => projectMenu(e.currentTarget) }, $('span', { className: 'pname' }, $('small', { textContent: t ? (t.client || 'Project') : 'No project yet' }), $('b', { textContent: t ? t.name : 'Create a project' })), icon('chev', 16)),
     list,
     $('button', { className: 'me', onclick: e => userMenu(e.currentTarget) }, avatar(S.me.display_name), $('span', { className: 'grow', textContent: S.me.display_name }), icon('dots', 16)));
+}
+/** Sidebar block of the personal coding bots (Claude Code). Empty when the server has the feature off. */
+function codingSide(c) {
+  if (!(S.me && S.me.coding_bots)) return [];
+  const rows = (S.codingBots || []).map(b => $('div', { className: 'item' + (c && c.id === b.conversation.id ? ' on' : ''), role: 'button', tabIndex: 0, onclick: guard(() => openConv(b.conversation, b)),
+    onkeydown: e => { if (e.key === 'Enter' && e.target === e.currentTarget) e.currentTarget.click(); } },
+    $('span', { className: 'lead' }, icon('term', 16)), $('span', { className: 'grow', textContent: b.name }), $('span', { className: 'tag', textContent: b.model })));
+  return [$('div', { className: 'sec' }, 'Coding bots', ib('plus', 'New coding bot', guard(newCodingBot), 15)), ...rows];
+}
+async function loadCodingBots() {
+  if (!(S.me && S.me.coding_bots)) { S.codingBots = []; return; }
+  try { S.codingBots = await api('GET', '/coding-bots'); } catch (e) { S.codingBots = []; console.warn(e); }
+  renderSide();
+}
+function codingFields(b) {
+  b = b || {};
+  return [{ name: 'name', label: 'Name', required: true, value: b.name || '' },
+    { name: 'model', label: 'Model', required: true, mono: true, value: b.model || 'opus', hint: 'Passed to Claude Code, for example opus, sonnet or a full model name.' },
+    { name: 'workdir', label: 'Working folder', mono: true, value: b.workdir || '', placeholder: 'empty = the sandbox workspace', hint: 'A folder inside your personal sandbox workspace, for example my-repo.' },
+    { name: 'instructions', label: 'Instructions', type: 'textarea', rows: 5, value: b.instructions || '', hint: 'Extra instructions for Claude Code in this bot.' }];
+}
+async function newCodingBot() {
+  const r = await form({ title: 'New coding bot', intro: 'Claude Code in your personal sandbox. After creating it, use Log in bij Claude once.', fields: codingFields(), ok: 'Create',
+    onSubmit: v => api('POST', '/coding-bots', v) });
+  if (!r) return;
+  await loadCodingBots(); toast('Coding bot created');
+  await openConv(r.conversation, (S.codingBots || []).find(x => x.id === r.id) || r);
+}
+async function editCodingBot(b) {
+  const r = await form({ title: 'Coding bot settings', fields: codingFields(b), onSubmit: v => api('PATCH', `/coding-bots/${b.id}`, v),
+    extra: close => $('button', { className: 'btn danger', type: 'button', textContent: 'Delete bot', onclick: guard(async () => { if (await deleteCodingBot(b)) close(); }) }) });
+  if (!r) return;
+  Object.assign(b, r); if (S.bot && S.bot.id === b.id) Object.assign(S.bot, r);
+  if (S.conv && S.conv.id === r.conversation.id) S.conv.name = r.name;
+  await loadCodingBots(); renderTop();
+}
+async function deleteCodingBot(b) {
+  if (!await confirmBox({ title: `Delete ${b.name}?`, text: 'The bot is removed with its chat, and a running Claude Code is stopped. This cannot be undone.', ok: 'Delete bot', danger: true })) return false;
+  await api('DELETE', `/bots/${b.id}`);
+  await boot();
+  return true;
+}
+/** Opens Claude on the bot's screen in a new tab, so the person can sign in, then shows the login status. */
+async function claudeLogin(b) {
+  const w = window.open('about:blank', '_blank');  // opened in the click itself: Safari blocks a window opened after an await
+  let r;
+  try { r = await api('POST', `/coding-bots/${b.id}/login`); } catch (e) { if (w) w.close(); throw e; }
+  const url = withToken(r.screen.replace(/^\/api/, '') + '/');
+  if (w) { w.opener = null; w.location.href = url; toast('Sign in to Claude in the new tab. The status is checked here.'); }
+  else toast(['Your browser blocked the new tab. Open the sign-in screen here: ', $('a', { href: url, target: '_blank', rel: 'noopener', textContent: 'open sign-in screen' })], 'bad');
+  for (let i = 0; i < 20; i++) {
+    await new Promise(res => setTimeout(res, 3000));
+    if (!S.bot || S.bot.id !== b.id) return;
+    const st = await api('GET', `/coding-bots/${b.id}/login`);
+    if (st.logged_in) { toast('Logged in to Claude'); return; }
+  }
+  toast('Not logged in yet. Run Log in bij Claude again if the sign-in did not finish.', 'bad');
 }
 function projectMenu(anchor) {
   popmenu(anchor, [
@@ -979,9 +1038,13 @@ function renderTop() {
     return fill(top, ...lead, icon('arrow'), $('span', { className: 'title', textContent: (S.bot ? S.bot.name : 'Bot') + ' · ' + peer }), $('span', { className: 'sub grow', textContent: 'Bot-to-bot thread. Tool approvals for this work appear here.' }));
   }
   if (c.kind === 'dm' || c.kind === 'home') {
-    const b = S.bot, shared = b && b.is_team && b.published && c.kind === 'dm';
+    const b = S.bot, coding = !!b && b.runner === 'claude_code', shared = b && b.is_team && b.published && c.kind === 'dm';
+    if (coding) return fill(top, ...lead, avatar(c.name, 'bot'), $('span', { className: 'title', textContent: c.name }), $('span', { className: 'sub', textContent: '@' + b.handle + ' · ' + b.model }),
+      $('span', { className: 'pill hidesm', title: 'Only you can read this chat.' }, icon('lock', 12), 'Private'), $('span', { className: 'grow' }),
+      $('button', { className: 'btn sm', title: 'Sign in to Claude on the bot screen', onclick: guard(() => claudeLogin(b)) }, icon('screen', 15), 'Log in bij Claude'),
+      $('button', { className: 'btn sm', onclick: guard(() => editCodingBot(b)) }, icon('sliders', 15), 'Settings'));
     const cb = $('input', { type: 'checkbox', checked: c.share_activity, onchange: guard(async () => { Object.assign(c, await api('PATCH', `/conversations/${c.id}`, { share_activity: cb.checked })); toast(cb.checked ? 'Task summaries go to the activity feed' : 'Nothing from this chat is shared'); }) });
-    const canRename = !!b;
+    const canRename = !!b && !coding;
     return fill(top, ...lead, avatar(c.name, 'bot'), $(canRename ? 'button' : 'span', { className: 'title', textContent: c.name, title: canRename ? 'Rename' : '', onclick: canRename ? guard(() => renameBot(b)) : null }), b && $('span', { className: 'sub', textContent: '@' + b.handle }),
       $('span', { className: 'pill hidesm', title: 'Only you can read this chat. Not even the owner of the bot can.' }, icon('lock', 12), 'Private'), $('span', { className: 'grow' }),
       shared && $('label', { className: 'switch hidesm', title: 'When on, a short summary of each finished task is posted to the shared activity feed. The chat itself is never shared.' }, cb, 'Share summaries'),
@@ -1023,7 +1086,8 @@ async function channelMembers() {
 
 // ---------- messages
 const TOOLS = { run_command: ['term', 'Run command'], write_file: ['file', 'Write file'], read_file: ['file', 'Read file'], http_request: ['globe', 'HTTP request'], git_push: ['up', 'Git push'], remember: ['book', 'Remember'], forget: ['book', 'Forget'], memory: ['book', 'Update memory'], skill_manage: ['zap', 'Update skill'], knowledge_list: ['book', 'List knowledge'], knowledge_read: ['book', 'Read knowledge'], knowledge_write: ['book', 'Write knowledge'], knowledge_patch: ['book', 'Edit knowledge'], knowledge_delete: ['book', 'Delete knowledge'], knowledge_history: ['book', 'Knowledge history'], search_history: ['search', 'Search history'],
-  save_skill: ['zap', 'Save skill'], use_skill: ['zap', 'Use skill'], ask_bot: ['bot', 'Ask another bot'], create_routine: ['clock', 'Create routine'], list_workspace: ['grid', 'List projects'], get_overview: ['home', 'Overview'], read_messages: ['book', 'Read messages'], post_to_channel: ['hash', 'Post to team chat'], list_routines: ['clock', 'List routines'], update_routine: ['edit', 'Update routine'], delete_routine: ['trash', 'Delete routine'], run_routine: ['play', 'Run routine'] };
+  save_skill: ['zap', 'Save skill'], use_skill: ['zap', 'Use skill'], ask_bot: ['bot', 'Ask another bot'], create_routine: ['clock', 'Create routine'], list_workspace: ['grid', 'List projects'], get_overview: ['home', 'Overview'], read_messages: ['book', 'Read messages'], post_to_channel: ['hash', 'Post to team chat'], list_routines: ['clock', 'List routines'], update_routine: ['edit', 'Update routine'], delete_routine: ['trash', 'Delete routine'], run_routine: ['play', 'Run routine'],
+  Bash: ['term', 'Bash'], Edit: ['edit', 'Edit file'], Read: ['file', 'Read file'], Write: ['file', 'Write file'], Grep: ['search', 'Grep'], Glob: ['search', 'Glob'] };
 function toolInfo(name) {
   if (TOOLS[name]) return TOOLS[name];
   if (name.startsWith('screen_')) return ['screen', 'Screen: ' + name.slice(7)];

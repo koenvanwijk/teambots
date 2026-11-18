@@ -42,6 +42,17 @@ RUN mkdir -p -m 755 /etc/apt/keyrings /etc/apt/sources.list.d \
     && command -v gh >/dev/null \
     && command -v git >/dev/null
 ENV GH_CONFIG_DIR=/workspace/.config/gh
+# Claude Code for the personal coding bots, from the official native installer (a single binary, so the
+# image's Debian Node 18 does not matter; the npm package wants Node 22). Installed as root into
+# /opt/claude and linked onto PATH so user `bot` can run it. Sign-in is per person, on the project
+# volume (CLAUDE_CONFIG_DIR); no credentials are baked in. Auto-update is off: /opt is read-only for `bot`.
+RUN HOME=/opt/claude bash -c 'curl -fsSL https://claude.ai/install.sh | bash' \
+    && ln -sf "$(readlink -f /opt/claude/.local/bin/claude)" /usr/local/bin/claude \
+    && chmod -R a+rX /opt/claude \
+    && command -v claude >/dev/null \
+    && claude --version
+ENV CLAUDE_CONFIG_DIR=/workspace/.config/claude \
+    DISABLE_AUTOUPDATER=1
 RUN useradd -m -u 1000 bot && mkdir /workspace && chown bot:bot /workspace
 USER bot
 WORKDIR /workspace
