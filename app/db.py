@@ -284,17 +284,24 @@ class ApprovalRule(SQLModel, table=True):
 class Secret(SQLModel, table=True):
     """Owner-provided secrets. The value never enters the sandbox or the model's context: the
     app fills it into outgoing http_request calls or the isolated git_push worker, and only for
-    the hosts it is bound to."""
+    the hosts it is bound to.
+
+    Scope: a project secret has team_id set and bot_id 0, and every bot of that project may use
+    it; a bot secret has bot_id set and team_id 0. A bot secret overrides a project secret of the
+    same name."""
     id: Optional[int] = Field(default=None, primary_key=True)
-    bot_id: int = Field(index=True)
+    bot_id: int = Field(default=0, index=True)
+    team_id: int = Field(default=0, index=True)
     name: str
     value_enc: str
     hosts: str = ""  # comma-separated host names this secret may be sent to
 
 
 class McpServer(SQLModel, table=True):
+    """Scope as for Secret: project-wide (team_id set, bot_id 0) or one bot (bot_id set, team_id 0)."""
     id: Optional[int] = Field(default=None, primary_key=True)
-    bot_id: int = Field(index=True)
+    bot_id: int = Field(default=0, index=True)
+    team_id: int = Field(default=0, index=True)
     name: str
     url: str  # streamable HTTP endpoint
     headers_enc: str = ""  # JSON object of extra static headers, encrypted
@@ -354,11 +361,13 @@ def init_db() -> None:
     _ensure_router_columns()
     _ensure_mcp_auth_columns()
     _ensure_memory_team_column()
+    _ensure_project_scope_columns()
     from .usage import seed_prices
     seed_prices()
     migrate_channel_bots()
     from .home import migrate_home_bots
     migrate_home_bots()
+    migrate_project_connections()
 
 
 def _ensure_project_activity_feed_index() -> None:
@@ -598,6 +607,115 @@ def migrate_channel_bots() -> dict:
         s.add(AppSetting(key="channel_bots_autojoin_v1", value="done"))
         s.commit()
         out["added"] = added
+    return out
+
+
+def _ensure_project_scope_columns() -> None:
+    """Secrets and MCP servers can belong to a whole project: add team_id (0 = bot scope)."""
+    if not config.DB_URL.startswith("sqlite"):
+        return
+    with engine.connect() as conn:
+        for table in ("secret", "mcpserver"):
+            cols = [r[1] for r in conn.exec_driver_sql(f"PRAGMA table_info({table})").fetchall()]
+            if "team_id" not in cols:
+                conn.exec_driver_sql(f"ALTER TABLE {table} ADD COLUMN team_id INTEGER NOT NULL DEFAULT 0")
+                conn.exec_driver_sql(f"CREATE INDEX IF NOT EXISTS ix_{table}_team_id ON {table} (team_id)")
+        conn.commit()
+
+
+def _hosts_key(hosts: str) -> str:
+    return ",".join(sorted({h.strip().lower() for h in hosts.split(",") if h.strip()}))
+
+
+def _mcp_key(r: "McpServer") -> tuple:
+    dec = lambda v: config.decrypt(v) if v else ""  # noqa: E731 - encryption is not deterministic
+    return (r.name, r.url.strip(), bool(r.trusted), dec(r.headers_enc), r.auth_mode or "none",
+            r.auth_scope or "shared", r.auth_header or "", r.auth_prefix or "", dec(r.token_enc),
+            r.oauth_authorize_url or "", r.oauth_token_url or "", r.oauth_client_id or "",
+            dec(r.oauth_client_secret_enc), r.oauth_scopes or "")
+
+
+def migrate_project_connections() -> dict:
+    """One-time: a secret or MCP server that two or more bots of a project have identically
+    becomes one project-wide item, and the bot copies are removed.
+
+    Identical means the same name and the same decrypted value and settings (hosts, URL, auth,
+    trust). When one name has several different versions, only the most common one moves; the
+    bots with another version keep theirs, and a bot item overrides the project item. Per-user
+    MCP credentials move along (the most recently updated one per person wins).
+    """
+    key = "project_connections_v1"
+    out = {"secrets": 0, "mcp": 0, "already": True}
+    with Session(engine) as s:
+        flag = s.get(AppSetting, key)
+        if flag and flag.value == "done":
+            return out
+        out["already"] = False
+        path = _sqlite_path()
+        if path and path.exists():
+            bak = path.with_name(path.name + ".bak-project-connections")
+            if not bak.exists():
+                import shutil
+                shutil.copy2(path, bak)
+        bots = {b.id: b for b in s.exec(select(Bot).where(Bot.team_id > 0, Bot.is_home == False)).all()}  # noqa: E712
+
+        def groups(rows, keyfn):
+            """team -> name -> the largest group of identical rows held by 2+ bots"""
+            by: dict[tuple, list] = {}
+            for r in rows:
+                if r.bot_id in bots and not r.team_id:
+                    by.setdefault((bots[r.bot_id].team_id, keyfn(r)), []).append(r)
+            best: dict[tuple, list] = {}
+            for (team_id, k), rs in by.items():
+                if len({r.bot_id for r in rs}) < 2:
+                    continue
+                slot = (team_id, k[0])
+                if slot not in best or len(rs) > len(best[slot]):
+                    best[slot] = rs
+            return best
+
+        def taken(model, team_id, name):
+            return s.exec(select(model).where(model.team_id == team_id, model.bot_id == 0, model.name == name)).first()
+
+        sec_groups = groups(s.exec(select(Secret)).all(),
+                            lambda r: (r.name, config.decrypt(r.value_enc), _hosts_key(r.hosts)))
+        for (team_id, name), rs in sec_groups.items():
+            if taken(Secret, team_id, name):
+                continue
+            s.add(Secret(team_id=team_id, bot_id=0, name=name, value_enc=rs[0].value_enc, hosts=_hosts_key(rs[0].hosts)))
+            for r in rs:
+                s.delete(r)
+            out["secrets"] += 1
+
+        mcp_groups = groups(s.exec(select(McpServer)).all(), _mcp_key)
+        for (team_id, name), rs in mcp_groups.items():
+            if taken(McpServer, team_id, name):
+                continue
+            src = rs[0]
+            new = McpServer(**{**src.model_dump(exclude={"id"}), "team_id": team_id, "bot_id": 0})
+            s.add(new)
+            s.flush()
+            old_ids = [r.id for r in rs]
+            newest: dict[int, McpCredential] = {}
+            for c in s.exec(select(McpCredential).where(McpCredential.mcp_server_id.in_(old_ids))).all():
+                keep = newest.get(c.user_id)
+                if keep is None or (c.updated_at.timestamp() if c.updated_at else 0) > (
+                        keep.updated_at.timestamp() if keep.updated_at else 0):
+                    newest[c.user_id] = c
+            for c in s.exec(select(McpCredential).where(McpCredential.mcp_server_id.in_(old_ids))).all():
+                if newest.get(c.user_id) is c:
+                    c.mcp_server_id = new.id
+                    s.add(c)
+                else:
+                    s.delete(c)
+            for st in s.exec(select(McpOAuthState).where(McpOAuthState.mcp_server_id.in_(old_ids))).all():
+                s.delete(st)
+            s.flush()
+            for r in rs:
+                s.delete(r)
+            out["mcp"] += 1
+        s.add(AppSetting(key=key, value="done"))
+        s.commit()
     return out
 
 

@@ -242,6 +242,15 @@ def rule_key(name: str) -> str:
     return "screen" if name.startswith("screen_") else name
 
 
+def mcp_servers_for(s, bot: Bot) -> list[McpServer]:
+    """The project's MCP servers plus the bot's own; a bot server of the same name wins."""
+    own = s.exec(select(McpServer).where(McpServer.bot_id == bot.id)).all()
+    shared = [] if bot.is_home or not bot.team_id else s.exec(
+        select(McpServer).where(McpServer.team_id == bot.team_id, McpServer.bot_id == 0)).all()
+    names = {r.name for r in own}
+    return [r for r in shared if r.name not in names] + list(own)
+
+
 async def build_tools(bot: Bot, ctx: Ctx) -> tuple[list[dict], dict[str, tuple[McpServer, str]]]:
     """Built-in tools plus the tools of every MCP server attached to the bot."""
     specs = [t for t in BUILTIN_TOOLS if not (ctx.depth > 0 and t["function"]["name"] in ("ask_bot", "create_routine"))]
@@ -251,7 +260,7 @@ async def build_tools(bot: Bot, ctx: Ctx) -> tuple[list[dict], dict[str, tuple[M
         specs = specs + SCREEN_TOOLS
     mcp_map: dict[str, tuple[McpServer, str]] = {}
     with session() as s:
-        servers = s.exec(select(McpServer).where(McpServer.bot_id == bot.id)).all()
+        servers = mcp_servers_for(s, bot)
     for srv in servers:
         try:
             tools = await asyncio.wait_for(mcp_client.list_tools(srv, ctx.requester_id), 20)
